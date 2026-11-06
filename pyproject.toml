@@ -1,0 +1,24 @@
+[project]
+name = "gfrl"
+version = "0.0.1"
+description = "Ataraxos-style transformer RL for God Field 1v1"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=2.0",
+    "torch>=2.5",
+]
+
+[dependency-groups]
+dev = [
+    "nanobind>=2.4",
+    "pytest>=8",
+    "cmake>=3.28",
+    "ninja",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+pythonpath = ["python"]
