@@ -73,3 +73,43 @@ def test_invalid_transaction_and_config():
         VecEnv(1, 1, 42, config=config)
     with pytest.raises(ValueError):
         VecEnv(0, 1, 42)
+
+
+def test_observations():
+    from gfrl import obs_schema, card_features
+    features = card_features()
+    assert features.shape == (297, 103)
+    assert features.dtype == np.float32 and np.isfinite(features).all()
+    assert not features[0].any() and not features.flags.writeable
+    env = VecEnv(8, 2, 42, history_len=7)
+    schema = env.obs_schema()
+    assert schema == obs_schema(7)
+    t, c, f = schema['T'], schema['C'], schema['F']
+    assert t == 62 and len(schema['num']) == f and len(schema['cat']) == c
+    fields = {'obs_type': (np.int8, (8,t)), 'obs_cards': (np.int16,(8,t,8)),
+              'obs_aux_card': (np.int16,(8,t)), 'obs_cat': (np.int8,(8,t,c)),
+              'obs_num': (np.float32,(8,t,f)), 'obs_valid': (np.bool_,(8,t)),
+              'label_opp_hand': (np.uint8,(8,297)), 'label_opp_hand_count': (np.uint8,(8,))}
+    arrays = {name:getattr(env,name) for name in fields}
+    for name, (dtype, shape) in fields.items():
+        assert arrays[name].shape == shape and arrays[name].dtype == dtype
+        assert not arrays[name].flags.writeable
+        assert np.shares_memory(arrays[name],getattr(env,name))
+    before = env.obs_num.copy()
+    rng = np.random.default_rng(17)
+    for _ in range(40):
+        old = {name:a.copy() for name,a in arrays.items()}
+        env.step(choices(env.mask,rng))
+        # Continuation stages preserve every observation and privileged label.
+        for row in np.flatnonzero(~env.decision_done):
+            for name,a in arrays.items():
+                np.testing.assert_array_equal(a[row],old[name][row])
+        assert np.all(env.label_opp_hand.sum(axis=1) == env.label_opp_hand_count)
+        assert env.obs_cards.max() <= 296
+    assert not np.array_equal(before,env.obs_num)
+    del env
+    gc.collect()
+    assert arrays['obs_valid'][:,0].all()
+    assert VecEnv(1,1,1,history_len=0).obs_type.shape == (1,55)
+    with pytest.raises(ValueError):
+        VecEnv(1,1,1,history_len=4097)

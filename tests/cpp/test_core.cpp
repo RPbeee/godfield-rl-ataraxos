@@ -1,6 +1,7 @@
 #include "gfrl_core/vec_env.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -15,6 +16,8 @@ struct TestAccess {
     static void inject(VecEnv& env, gf::Match match) {
         env.envs_[0].match = std::move(match);
         env.envs_[0].selection.reset();
+        env.envs_[0].encoded=false;
+        for(auto& h:env.envs_[0].history) h.clear();
         env.decision_done[0] = env.episode_done[0] = env.truncated[0] = false;
         env.drive(0);
     }
@@ -127,6 +130,9 @@ void equal_env(const VecEnv& a, const VecEnv& b) {
 #define EQ(name) equal(a.name, b.name, #name)
     EQ(stage); EQ(actor_seat); EQ(mask); EQ(chosen_kind); EQ(chosen_cards); EQ(chosen_count); EQ(substep);
     EQ(decision_done); EQ(episode_done); EQ(outcome); EQ(truncated); EQ(episode_id);
+    EQ(obs_type); EQ(obs_cards); EQ(obs_aux_card); EQ(obs_cat); EQ(obs_num); EQ(obs_valid);
+    EQ(label_opp_hand); EQ(label_opp_hand_count);
+    check(std::memcmp(a.obs_num.data(), b.obs_num.data(), a.obs_num.size*sizeof(float))==0, "obs_num bits differ");
 #undef EQ
     for (std::size_t i = 0; i < a.num_envs; ++i) check(a.match(i).snapshot() == b.match(i).snapshot(), "snapshot differs");
     auto x = a.stats(), y = b.stats();
@@ -161,6 +167,7 @@ void legality() {
         auto s = env.stats();
         std::cout << "canonical=" << canonical << " episodes=" << s.episodes << " decisions=" << s.decisions
             << " policy_stages=" << s.policy_stages << " automatic=" << s.automatic_decisions
+            << " history_dropped=" << s.history_dropped << " card_overflow=" << s.card_overflow << " used_overflow=" << s.used_overflow << " token_overflow=" << s.token_overflow
             << " confusion=" << s.confusion_decisions << " grant=" << s.grant_decisions << " truncated=" << s.truncations << '\n';
     }
 }

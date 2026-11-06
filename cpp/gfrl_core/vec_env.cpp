@@ -55,13 +55,17 @@ void Workers::run(std::function<void(std::size_t)> job) {
     job_ = {};
     if (error_) std::rethrow_exception(error_);
 }
-VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool canonical, gf::MatchConfig config)
+VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool canonical, gf::MatchConfig config, std::size_t k)
     : num_envs(positive(n, "num_envs")), num_threads(positive(threads, "num_threads")),
+      history_len(k<=4096 ? k : throw std::invalid_argument("history_len must be <=4096")), tokens(history_offset + history_len),
+      obs_type(n*tokens), obs_cat(n*tokens*C), obs_cards(n*tokens*8), obs_aux_card(n*tokens),
+      obs_num(n*tokens*F), obs_valid(n*tokens), label_opp_hand(n*297), label_opp_hand_count(n),
       stage(n), actor_seat(n), chosen_kind(n), chosen_cards(n * 18), chosen_count(n), outcome(n * 2),
       mask(n), substep(n), decision_done(n), episode_done(n), truncated(n), episode_id(n),
       base_seed_(seed), canonical_(canonical), workers_(threads) {
     if (config != gf::MatchConfig{}) throw std::invalid_argument("VecEnv supports only default MatchConfig (max_decisions=512, include_fate/external_*=false)");
     envs_.resize(n);
+    for(auto& e:envs_) for(auto& h:e.history) h=History(k);
     workers_.run([&](std::size_t worker) {
         for (std::size_t i = worker; i < n; i += num_threads) {
             reset(i); drive(i);
@@ -76,10 +80,48 @@ void VecEnv::reset(std::size_t i) {
     e.chance_rng = mix(seed ^ 0xa4093822299f31d0ULL);
     const std::array<gf::PlayerSetup, 2> players{{{0, gf::Team::solo, "A"}, {1, gf::Team::solo, "B"}}};
     e.match.reset(players, mix(seed ^ 0x13198a2e03707344ULL));
-    e.selection.reset(); episode_id[i] = e.episode;
+    e.selection.reset(); e.encoded=false; for(auto& h:e.history) h.clear(); episode_id[i] = e.episode;
+}
+void VecEnv::before_decision(std::size_t i) {
+    auto& e=envs_[i];
+    for(int seat=0;seat<2;++seat) e.before[seat]=e.match.view(e.match.snapshot().state.players[seat].id);
+}
+void VecEnv::encode_observation(std::size_t i) {
+    auto& e=envs_[i]; const auto seat=e.selection->actor_seat;
+    // Privileged access is restricted to own slot tokens and the separate labels.
+    const auto& players=e.match.snapshot().state.players;
+    std::vector<gf::ItemToken> order;
+    for(const auto& item:players[seat].items) order.push_back(item.token);
+    const auto v=e.match.view(players[seat].id);
+    auto ts=encode(v,players[seat].id,order);
+    ts.resize(tokens);
+    std::size_t j=history_offset;
+    for(const auto& event:e.history[seat].events()) {
+        ts[j]=event.token;
+        ts[j++].num[Age]=history_len ? float(v.decisions-event.decision)/history_len : 0;
+    }
+    for(j=0;j<tokens;++j) {
+        const auto& t=ts[j];auto row=i*tokens+j;
+        obs_type[row]=t.type;obs_aux_card[row]=t.aux;obs_valid[row]=t.type!=0;
+        std::copy(t.cards.begin(),t.cards.end(),obs_cards.data()+row*8);
+        std::copy(t.cat.begin(),t.cat.end(),obs_cat.data()+row*C);
+        std::copy(t.num.begin(),t.num.end(),obs_num.data()+row*F);
+        if(j<history_offset) e.stats.card_overflow+=t.num[CountOverflow];
+        if(t.type==Player)e.stats.used_overflow+=t.num[UsedOverflow];
+    }
+    std::fill_n(label_opp_hand.data()+i*297,297,0);
+    label_opp_hand_count[i]=players[1-seat].items.size();
+    for(const auto& item:players[1-seat].items) ++label_opp_hand[i*297+card_code(item.model)];
 }
 void VecEnv::record_decision(std::size_t i, bool automatic) {
     auto& e = envs_[i];
+    for(int seat=0;seat<2;++seat) {
+        auto after=e.match.view(e.before[seat].board.viewer);
+        auto d=e.match.last_decision(e.before[seat].board.viewer);
+        if(!d) throw std::runtime_error("accepted decision lacks public record");
+        e.history[seat].append(e.before[seat],after,*d,*e.before[seat].board.viewer);
+    }
+    e.encoded=false;
     ++e.stats.decisions;
     if (automatic) ++e.stats.automatic_decisions;
     decision_done[i] = true;
@@ -101,6 +143,7 @@ void VecEnv::drive(std::size_t i) {
             ++e.episode; reset(i); continue;
         }
         if (s.phase == gf::MatchPhase::grant) {
+            before_decision(i);
             e.match.grant_step(e.match.sample_grant(e.chance_rng));
             ++e.stats.grant_decisions; record_decision(i, true); continue;
         }
@@ -109,6 +152,7 @@ void VecEnv::drive(std::size_t i) {
         if (s.phase == gf::MatchPhase::main && actor != s.state.players.end() && actor->confusion_count > 0) {
             const auto command = e.match.sample_confusion(e.chance_rng);
             if (!e.match.confusion_legal(command)) throw std::runtime_error("illegal sampled confusion command");
+            before_decision(i);
             e.match.confusion_step(command);
             ++e.stats.confusion_decisions; record_decision(i, true); continue;
         }
@@ -117,6 +161,7 @@ void VecEnv::drive(std::size_t i) {
         if (selection.complete) {
             if (!e.match.legal(selection.command)) throw std::runtime_error("env " + std::to_string(i) + ": selection produced illegal Command");
             const bool automatic = selection.substep == 0;
+            before_decision(i);
             e.match.step(selection.command);
             record_decision(i, automatic); continue;
         }
@@ -127,6 +172,7 @@ void VecEnv::drive(std::size_t i) {
     }
 }
 void VecEnv::publish(std::size_t i) {
+    if(!envs_[i].encoded) { encode_observation(i); envs_[i].encoded=true; }
     const auto& s = *envs_[i].selection;
     stage[i] = static_cast<std::int8_t>(s.stage); actor_seat[i] = static_cast<std::int8_t>(s.actor_seat);
     mask[i] = s.mask;
@@ -162,6 +208,9 @@ Stats VecEnv::stats() const {
         sum.policy_stages += e.stats.policy_stages; sum.automatic_decisions += e.stats.automatic_decisions;
         sum.truncations += e.stats.truncations; sum.confusion_decisions += e.stats.confusion_decisions;
         sum.grant_decisions += e.stats.grant_decisions;
+        sum.used_overflow += e.stats.used_overflow;
+        for(const auto& h:e.history) {sum.history_dropped+=h.dropped;sum.card_overflow+=h.card_overflow;}
+        sum.card_overflow+=e.stats.card_overflow;
     }
     return sum;
 }
