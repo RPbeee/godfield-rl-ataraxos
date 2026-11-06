@@ -97,7 +97,7 @@ NB_MODULE(_core, m) {
         .def("stats", &stats_dict)
         .def("obs_schema", [](const VecEnv& e){return schema(e.history_len);});
 #define ONE(name) cls.def_prop_ro(#name, [](VecEnv& e) { return view(e, e.name.data(), {e.num_envs}); });
-    ONE(stage) ONE(actor_seat) ONE(chosen_kind) ONE(chosen_count) ONE(substep)
+    ONE(stage) ONE(actor_seat) ONE(chosen_kind) ONE(chosen_count) ONE(chosen_target) ONE(chosen_alloc_hp) ONE(substep)
     ONE(decision_done) ONE(episode_done) ONE(truncated) ONE(episode_id)
 #undef ONE
     cls.def_prop_ro("mask", [](VecEnv& e) { return view(e, e.mask.data()->data(), {e.num_envs, 21}); });

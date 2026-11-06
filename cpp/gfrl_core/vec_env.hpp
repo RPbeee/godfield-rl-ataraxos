@@ -44,7 +44,7 @@ public:
     Buffer<float> obs_num;
     Buffer<bool> obs_valid;
     Buffer<std::uint8_t> label_opp_hand, label_opp_hand_count;
-    Buffer<std::int8_t> stage, actor_seat, chosen_kind, chosen_cards, chosen_count, outcome;
+    Buffer<std::int8_t> stage, actor_seat, chosen_kind, chosen_cards, chosen_count, chosen_target, chosen_alloc_hp, outcome;
     Buffer<Mask> mask;
     Buffer<std::int16_t> substep;
     Buffer<bool> decision_done, episode_done, truncated;

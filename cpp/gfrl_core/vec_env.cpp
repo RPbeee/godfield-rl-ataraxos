@@ -60,7 +60,7 @@ VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool cano
       history_len(k<=4096 ? k : throw std::invalid_argument("history_len must be <=4096")), tokens(history_offset + history_len),
       obs_type(n*tokens), obs_cat(n*tokens*C), obs_cards(n*tokens*8), obs_aux_card(n*tokens),
       obs_num(n*tokens*F), obs_valid(n*tokens), label_opp_hand(n*297), label_opp_hand_count(n),
-      stage(n), actor_seat(n), chosen_kind(n), chosen_cards(n * 18), chosen_count(n), outcome(n * 2),
+      stage(n), actor_seat(n), chosen_kind(n), chosen_cards(n * 18), chosen_count(n), chosen_target(n), chosen_alloc_hp(n), outcome(n * 2),
       mask(n), substep(n), decision_done(n), episode_done(n), truncated(n), episode_id(n),
       base_seed_(seed), canonical_(canonical), controllers_(controllers), eval_pairs_(eval_pairs), opponent_(opponent), eval_seed_(eval_seed), workers_(threads) {
     if (config != gf::MatchConfig{}) throw std::invalid_argument("VecEnv supports only default MatchConfig (max_decisions=512, include_fate/external_*=false)");
@@ -80,7 +80,7 @@ void VecEnv::reset(std::size_t i) {
     auto& e = envs_[i];
     if(eval_pairs_ && e.game >= 2 * *eval_pairs_) {
         e.waiting=true;e.selection.reset();stage[i]=-1;actor_seat[i]=-1;mask[i].fill(false);
-        chosen_kind[i]=-1;chosen_count[i]=0;substep[i]=0;std::fill_n(chosen_cards.data()+18*i,18,-1);
+        chosen_kind[i]=-1;chosen_target[i]=-1;chosen_alloc_hp[i]=-1;chosen_count[i]=0;substep[i]=0;std::fill_n(chosen_cards.data()+18*i,18,-1);
         return;
     }
     const auto seed = mix(base_seed_ ^ mix(i) ^ mix(e.episode + 0x243f6a8885a308d3ULL));
@@ -200,6 +200,11 @@ void VecEnv::publish(std::size_t i) {
     stage[i] = static_cast<std::int8_t>(s.stage); actor_seat[i] = static_cast<std::int8_t>(s.actor_seat);
     mask[i] = s.mask;
     chosen_kind[i] = s.kind_chosen ? static_cast<std::int8_t>(s.command.kind) : -1;
+    // Target 0 means explicitly no target; -1 means not selected yet.
+    chosen_target[i] = s.stage >= Stage::alloc_hp
+        ? (s.command.target ? (*s.command.target == s.command.actor ? 1 : 2) : 0) : -1;
+    chosen_alloc_hp[i] = s.stage == Stage::alloc_mp
+        ? static_cast<std::int8_t>(s.command.allocation->hp == 99 ? 20 : s.command.allocation->hp / 5) : -1;
     chosen_count[i] = static_cast<std::int8_t>(s.count); substep[i] = static_cast<std::int16_t>(s.substep);
     std::copy(s.cards.begin(), s.cards.end(), chosen_cards.data() + 18 * i);
 }

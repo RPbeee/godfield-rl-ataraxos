@@ -8,6 +8,7 @@ FIELDS = {
     "stage": (np.int8, ()), "actor_seat": (np.int8, ()),
     "mask": (np.bool_, (21,)), "chosen_kind": (np.int8, ()),
     "chosen_cards": (np.int8, (18,)), "chosen_count": (np.int8, ()),
+    "chosen_target": (np.int8, ()), "chosen_alloc_hp": (np.int8, ()),
     "substep": (np.int16, ()), "decision_done": (np.bool_, ()),
     "episode_done": (np.bool_, ()), "outcome": (np.int8, (2,)),
     "truncated": (np.bool_, ()), "episode_id": (np.uint64, ()),
