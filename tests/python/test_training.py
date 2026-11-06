@@ -27,6 +27,31 @@ def tiny():
     return Model(ModelConfig(d=32, depth=1, heads=4, ff=128))
 
 
+@pytest.mark.parametrize('steps, decay', [(0, .1), (10000, .999)])
+def test_ema_decay_uses_optimizer_steps(steps, decay, monkeypatch):
+    learner = Learner(torch.nn.Linear(1, 3))
+    assert learner.optimizer_steps == 0
+    learner.optimizer_steps = steps
+    decision = Decision({}, 0, 0, 1, np.array([.4, .2, .4]), outcome=1)
+
+    def forward(decisions):
+        value = learner.model(torch.ones(len(decisions), 1))
+        zero = value[:, 0] * 0
+        return dict(ratio=zero + 1, kl=zero, magnet=zero, entropy=zero), value
+
+    monkeypatch.setattr(learner, 'forward', forward)
+    for n in range(2):
+        previous = [p.clone() for p in learner.ema.parameters()]
+        learner.update([decision], iteration=1)
+        assert learner.optimizer_steps == steps + n + 1
+        expected_decay = decay if n == 0 else min(.999, (2 + steps) / (11 + steps))
+        changed = False
+        for before, ema, current in zip(previous, learner.ema.parameters(), learner.model.parameters()):
+            changed |= not torch.equal(before, current)
+            torch.testing.assert_close(ema, before * expected_decay + current * (1 - expected_decay))
+        assert changed
+
+
 def test_hand_returns_and_gae():
     p = np.array([[.4, .2, .4], [.6, .1, .3], [.3, .4, .3]])
     xi, a = sequence_targets(p, 1)
@@ -157,7 +182,7 @@ def test_smoke_resume_schedule_pool_and_config(tmp_path):
         path = train.run(args)
         return torch.load(path, weights_only=False)
     separate, continuous = tmp_path/'resume', tmp_path/'full'
-    run(separate, 2)
+    initial = run(separate, 2)
     resumed = run(separate, 1, True)
     full = run(continuous, 3)
     rows = [json.loads(s) for s in (separate/'metrics.jsonl').read_text().splitlines()]
@@ -172,6 +197,9 @@ def test_smoke_resume_schedule_pool_and_config(tmp_path):
     assert rows[-1]['alpha'] == other[-1]['alpha']
     assert rows[-1]['lr'] < rows[0]['lr'] and rows[-1]['alpha'] < rows[0]['alpha']
     assert resumed['optimizer']['state']
+    expected_steps = [sum((row['decisions'] + 4095) // 4096 for row in history)
+                      for history in (rows[:2], rows, other)]
+    assert [state['optimizer_steps'] for state in (initial, resumed, full)] == expected_steps
     config = tmp_path/'overrides.json'
     config.write_text(json.dumps({'iterations': 7, 'magnet': True}))
     assert train.parse_args(['--iterations','2','--config',str(config)]).iterations == 7
@@ -213,3 +241,21 @@ def test_time_limit_saves_at_boundary(tmp_path):
     assert state['iteration'] == 0
     assert state['seed_positions']['train'] == 1
     assert not (tmp_path/'metrics.jsonl').exists()
+
+
+@pytest.mark.parametrize('saved_steps', [37, None])
+def test_resume_optimizer_steps_without_updates(tmp_path, saved_steps):
+    train = train_module()
+    argv = ['--d','32','--depth','1','--num-envs','16','--threads','2',
+            '--max-hours','1e-12','--run-dir',str(tmp_path)]
+    path = train.run(train.parse_args(argv))
+    state = torch.load(path, weights_only=False)
+    assert state['optimizer_steps'] == 0
+    if saved_steps is None:
+        del state['optimizer_steps']
+    else:
+        state['optimizer_steps'] = saved_steps
+    torch.save(state, path)
+    train.run(train.parse_args(argv + ['--resume']))
+    resumed = torch.load(path, weights_only=False)
+    assert resumed['optimizer_steps'] == (saved_steps or 0)

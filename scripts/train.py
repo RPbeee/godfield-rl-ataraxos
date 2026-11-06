@@ -88,6 +88,7 @@ def evaluation_rng(seed, device):
 def save_checkpoint(path, learner, iteration, pool, positions, config, elapsed):
     state = dict(model=learner.model.state_dict(), ema=learner.ema.state_dict(),
                  optimizer=learner.optimizer.state_dict(), iteration=iteration, pool=pool,
+                 optimizer_steps=learner.optimizer_steps,
                  seed_positions=positions.copy(), config=config,
                  model_config=asdict(learner.model.config), elapsed_s=elapsed,
                  torch_rng=torch.get_rng_state(), numpy_rng=np.random.get_state())
@@ -130,6 +131,7 @@ def run(args):
         learner.model.load_state_dict(state['model'])
         learner.ema.load_state_dict(state['ema'])
         learner.optimizer.load_state_dict(state['optimizer'])
+        learner.optimizer_steps = state.get('optimizer_steps', 0)
         pool, iteration = state['pool'], state['iteration']
         positions = state['seed_positions'].copy()
         elapsed_before = state['elapsed_s']

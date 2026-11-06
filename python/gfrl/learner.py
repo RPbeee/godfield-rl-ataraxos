@@ -69,6 +69,7 @@ class Learner:
         self.model = model.to(self.device)
         self.ema = deepcopy(model).eval().requires_grad_(False)
         self.optimizer = torch.optim.Adam(model.parameters(), lr=self.config.lr)
+        self.optimizer_steps = 0
 
     def autocast(self):
         return (nullcontext() if self.dtype == 'fp32' else torch.autocast(
@@ -131,9 +132,11 @@ class Learner:
                     metrics[key] += float(val.detach().sum().cpu())
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
+            decay = min(cfg.ema, (1 + self.optimizer_steps) / (10 + self.optimizer_steps))
+            self.optimizer_steps += 1
             with torch.no_grad():
                 for ema, current in zip(self.ema.parameters(), self.model.parameters()):
-                    ema.lerp_(current, 1-cfg.ema)
+                    ema.lerp_(current, 1-decay)
                 for ema, current in zip(self.ema.buffers(), self.model.buffers()):
                     ema.copy_(current)
         for key in metrics:
