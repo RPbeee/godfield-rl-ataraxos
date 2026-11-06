@@ -2,6 +2,8 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/optional.h>
 namespace nb = nanobind;
 using namespace nb::literals;
 using namespace gfrl;
@@ -11,6 +13,12 @@ template<class T> nb::object view(VecEnv& env, T* data, std::initializer_list<st
     auto array = nb::cast(nb::ndarray<nb::numpy, T>(data, shape, owner));
     array.attr("setflags")("write"_a = false);
     return array;
+}
+nb::list result_list(const std::vector<EvalResult>& results) {
+    nb::list out;
+    for(const auto& r:results){nb::dict d;d["g"]=r.g;d["pair"]=r.pair;d["agent_seat"]=r.agent_seat;
+        d["result"]=r.result;d["truncated"]=r.truncated;d["decisions"]=r.decisions;d["hp"]=nb::cast(r.hp);out.append(d);}
+    return out;
 }
 nb::dict stats_dict(const VecEnv& env) {
     const auto s = env.stats();
@@ -71,8 +79,13 @@ NB_MODULE(_core, m) {
         .def_rw("external_artifacts", &gf::MatchConfig::external_artifacts)
         .def_rw("local_guardian_payloads", &gf::MatchConfig::local_guardian_payloads);
     auto cls = nb::class_<VecEnv>(m, "VecEnv")
-        .def(nb::init<std::size_t, std::size_t, std::uint64_t, bool, gf::MatchConfig, std::size_t>(),
-            "num_envs"_a, "num_threads"_a, "base_seed"_a, "canonical"_a = true, "config"_a = gf::MatchConfig{}, "history_len"_a = 64)
+        .def("__init__", [](VecEnv* self, std::size_t n,std::size_t threads,std::uint64_t seed,bool canonical,gf::MatchConfig config,std::size_t k,
+                             std::array<std::string,2> controls,std::optional<std::size_t> pairs,std::string opponent,std::uint64_t eval_seed){
+            new(self)VecEnv(n,threads,seed,canonical,config,k,{controller(controls[0]),controller(controls[1])},pairs,controller(opponent),eval_seed);
+        }, "num_envs"_a,"num_threads"_a,"base_seed"_a=0,"canonical"_a=true,"config"_a=gf::MatchConfig{},"history_len"_a=64,
+           "controllers"_a=std::array<std::string,2>{"external","external"},"eval_pairs"_a=nb::none(),"opponent"_a="greedy","eval_seed"_a=0)
+        .def("eval_done", &VecEnv::eval_done)
+        .def("eval_results", [](const VecEnv& e){return result_list(e.eval_results());})
         .def_prop_ro("num_envs", [](const VecEnv& e) { return e.num_envs; })
         .def_prop_ro("num_threads", [](const VecEnv& e) { return e.num_threads; })
         .def("step", [](VecEnv& env, nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>, nb::c_contig> choices) {
@@ -98,6 +111,11 @@ NB_MODULE(_core, m) {
     cls.def_prop_ro("obs_num",[](VecEnv& e){return view(e,e.obs_num.data(),{e.num_envs,e.tokens,F});});
     cls.def_prop_ro("label_opp_hand",[](VecEnv& e){return view(e,e.label_opp_hand.data(),{e.num_envs,297});},"特権情報。方策の入力に使わないこと");
     cls.def_prop_ro("label_opp_hand_count",[](VecEnv& e){return view(e,e.label_opp_hand_count.data(),{e.num_envs});},"特権情報。方策の入力に使わないこと");
+    m.def("evaluate_bots",[](const std::string& a,const std::string& b,std::size_t pairs,std::size_t threads,std::uint64_t seed){
+        std::vector<EvalResult> results;
+        {nb::gil_scoped_release release;results=evaluate_bots(controller(a),controller(b),pairs,threads,seed);}
+        return result_list(results);
+    },"bot_a"_a,"bot_b"_a,"pairs"_a,"threads"_a,"eval_seed"_a);
     m.def("obs_schema",&schema,"history_len"_a=64);
     m.def("card_features",[]{
         const auto& f=card_features();

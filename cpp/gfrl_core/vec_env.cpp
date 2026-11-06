@@ -55,16 +55,18 @@ void Workers::run(std::function<void(std::size_t)> job) {
     job_ = {};
     if (error_) std::rethrow_exception(error_);
 }
-VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool canonical, gf::MatchConfig config, std::size_t k)
+VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool canonical, gf::MatchConfig config, std::size_t k, std::array<Controller,2> controllers, std::optional<std::size_t> eval_pairs, Controller opponent, std::uint64_t eval_seed)
     : num_envs(positive(n, "num_envs")), num_threads(positive(threads, "num_threads")),
       history_len(k<=4096 ? k : throw std::invalid_argument("history_len must be <=4096")), tokens(history_offset + history_len),
       obs_type(n*tokens), obs_cat(n*tokens*C), obs_cards(n*tokens*8), obs_aux_card(n*tokens),
       obs_num(n*tokens*F), obs_valid(n*tokens), label_opp_hand(n*297), label_opp_hand_count(n),
       stage(n), actor_seat(n), chosen_kind(n), chosen_cards(n * 18), chosen_count(n), outcome(n * 2),
       mask(n), substep(n), decision_done(n), episode_done(n), truncated(n), episode_id(n),
-      base_seed_(seed), canonical_(canonical), workers_(threads) {
+      base_seed_(seed), canonical_(canonical), controllers_(controllers), eval_pairs_(eval_pairs), opponent_(opponent), eval_seed_(eval_seed), workers_(threads) {
     if (config != gf::MatchConfig{}) throw std::invalid_argument("VecEnv supports only default MatchConfig (max_decisions=512, include_fate/external_*=false)");
+    if(eval_pairs_ && (*eval_pairs_>10000000 || opponent_==Controller::external))throw std::invalid_argument("invalid evaluation configuration");
     envs_.resize(n);
+    for(std::size_t i=0;i<n;++i)envs_[i].game=i;
     for(auto& e:envs_) for(auto& h:e.history) h=History(k);
     workers_.run([&](std::size_t worker) {
         for (std::size_t i = worker; i < n; i += num_threads) {
@@ -76,11 +78,18 @@ VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool cano
 }
 void VecEnv::reset(std::size_t i) {
     auto& e = envs_[i];
+    if(eval_pairs_ && e.game >= 2 * *eval_pairs_) {
+        e.waiting=true;e.selection.reset();stage[i]=-1;actor_seat[i]=-1;mask[i].fill(false);
+        chosen_kind[i]=-1;chosen_count[i]=0;substep[i]=0;std::fill_n(chosen_cards.data()+18*i,18,-1);
+        return;
+    }
     const auto seed = mix(base_seed_ ^ mix(i) ^ mix(e.episode + 0x243f6a8885a308d3ULL));
     e.chance_rng = mix(seed ^ 0xa4093822299f31d0ULL);
     const std::array<gf::PlayerSetup, 2> players{{{0, gf::Team::solo, "A"}, {1, gf::Team::solo, "B"}}};
     e.match.reset(players, mix(seed ^ 0x13198a2e03707344ULL));
-    e.selection.reset(); e.encoded=false; for(auto& h:e.history) h.clear(); episode_id[i] = e.episode;
+    for(int seat=0;seat<2;++seat)e.policy_rng[seat]=mix(seed ^ mix(seat+0x504f4c494359ULL));
+    if(eval_pairs_)reset_evaluation(e.match,eval_seed_,e.game,e.chance_rng,e.policy_rng);
+    e.selection.reset(); e.encoded=false; for(auto& h:e.history) h.clear(); episode_id[i] = eval_pairs_ ? e.game : e.episode;
 }
 void VecEnv::before_decision(std::size_t i) {
     auto& e=envs_[i];
@@ -130,17 +139,24 @@ void VecEnv::record_decision(std::size_t i, bool automatic) {
 void VecEnv::drive(std::size_t i) {
     auto& e = envs_[i];
     for (;;) {
+        if(e.waiting)return;
         const auto& s = e.match.snapshot();
         for (const auto& p : s.state.players) if (p.items.size() > 18)
             throw std::runtime_error("env " + std::to_string(i) + ": hand exceeds 18 cards");
         if (e.match.done()) {
             // Multiple completions within a single step would be unrepresentable.
-            if (episode_done[i]) throw std::runtime_error("multiple episodes completed in one step");
+            if (!eval_pairs_ && episode_done[i]) throw std::runtime_error("multiple episodes completed in one step");
             episode_done[i] = true; truncated[i] = s.truncated;
             for (int seat = 0; seat < 2; ++seat)
                 outcome[2 * i + seat] = s.truncated ? 0 : static_cast<std::int8_t>(s.rewards.at(seat));
             ++e.stats.episodes; e.stats.truncations += s.truncated;
-            ++e.episode; reset(i); continue;
+            if(eval_pairs_){e.results.push_back(evaluation_result(e.match,e.game));e.game+=num_envs;}
+            ++e.episode; reset(i);
+            if(!eval_pairs_ && controllers_[0]!=Controller::external && controllers_[1]!=Controller::external) {
+                // A bot-only training env yields once per episode; next step ignores its choice.
+                stage[i]=-1;actor_seat[i]=-1;mask[i].fill(false);return;
+            }
+            continue;
         }
         if (s.phase == gf::MatchPhase::grant) {
             before_decision(i);
@@ -155,6 +171,13 @@ void VecEnv::drive(std::size_t i) {
             before_decision(i);
             e.match.confusion_step(command);
             ++e.stats.confusion_decisions; record_decision(i, true); continue;
+        }
+        const auto seat=std::size_t(actor-s.state.players.begin());
+        const auto control=eval_pairs_ ? (seat==e.game%2 ? Controller::external : opponent_) : controllers_[seat];
+        if(control!=Controller::external) {
+            const auto command=bot_action(control,e.match,*s.actor,e.policy_rng[seat]);
+            if(!e.match.legal(command))throw std::runtime_error("bot produced illegal Command");
+            before_decision(i);e.match.step(command);record_decision(i,true);continue;
         }
         if (!e.selection) e.selection.emplace(e.match, canonical_);
         auto& selection = *e.selection;
@@ -184,6 +207,7 @@ void VecEnv::step(std::span<const std::int32_t> choices) {
     std::lock_guard lock(api_mutex_);
     if (choices.size() != num_envs) throw std::invalid_argument("choices must have shape [num_envs]");
     for (std::size_t i = 0; i < num_envs; ++i) {
+        if(envs_[i].waiting || !envs_[i].selection)continue;
         const int c = choices[i];
         if (c < 0 || c >= 21 || !envs_[i].selection->mask[c])
             throw std::invalid_argument("env " + std::to_string(i) + ": illegal choice " + std::to_string(c) +
@@ -194,11 +218,24 @@ void VecEnv::step(std::span<const std::int32_t> choices) {
             decision_done[i] = episode_done[i] = truncated[i] = false;
             outcome[2 * i] = outcome[2 * i + 1] = 0;
             auto& e = envs_[i];
+            if(e.waiting)continue;
+            if(!e.selection){drive(i);continue;}
             ++e.stats.policy_stages; ++e.selection->substep;
             e.selection->choose(e.match, choices[i], canonical_);
             drive(i);
         }
     });
+}
+std::vector<EvalResult> VecEnv::eval_results() const {
+    std::lock_guard lock(api_mutex_);
+    std::vector<EvalResult> out;
+    for(const auto& e:envs_)out.insert(out.end(),e.results.begin(),e.results.end());
+    std::sort(out.begin(),out.end(),[](const auto& a,const auto& b){return a.g<b.g;});
+    return out;
+}
+bool VecEnv::eval_done() const {
+    std::lock_guard lock(api_mutex_);
+    return eval_pairs_ && std::all_of(envs_.begin(),envs_.end(),[](const auto& e){return e.waiting;});
 }
 Stats VecEnv::stats() const {
     std::lock_guard lock(api_mutex_);

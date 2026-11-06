@@ -1,5 +1,6 @@
 #pragma once
 #include "history.hpp"
+#include "bots.hpp"
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -49,7 +50,12 @@ public:
     Buffer<bool> decision_done, episode_done, truncated;
     Buffer<std::uint64_t> episode_id;
     VecEnv(std::size_t num_envs, std::size_t num_threads, std::uint64_t base_seed,
-           bool canonical = true, gf::MatchConfig config = {}, std::size_t history_len = 64);
+           bool canonical = true, gf::MatchConfig config = {}, std::size_t history_len = 64,
+           std::array<Controller,2> controllers = {Controller::external, Controller::external},
+           std::optional<std::size_t> eval_pairs = std::nullopt,
+           Controller opponent = Controller::greedy, std::uint64_t eval_seed = 0);
+    std::vector<EvalResult> eval_results() const;
+    bool eval_done() const;
     void step(std::span<const std::int32_t> choices);
     Stats stats() const;
     const gf::Match& match(std::size_t i) const { return envs_.at(i).match; }
@@ -59,6 +65,10 @@ private:
         gf::Match match;
         std::optional<Selection> selection;
         std::uint64_t chance_rng = 0, episode = 0;
+        std::array<std::uint64_t,2> policy_rng{};
+        std::uint64_t game = 0;
+        bool waiting = false;
+        std::vector<EvalResult> results;
         Stats stats;
         std::array<History,2> history;
         std::array<gf::MatchView,2> before;
@@ -66,6 +76,10 @@ private:
     };
     const std::uint64_t base_seed_;
     const bool canonical_;
+    const std::array<Controller,2> controllers_;
+    const std::optional<std::size_t> eval_pairs_;
+    const Controller opponent_;
+    const std::uint64_t eval_seed_;
     std::vector<Env> envs_;
     Workers workers_;
     mutable std::mutex api_mutex_;
