@@ -16,6 +16,7 @@ class ActResult(NamedTuple):
     choices: np.ndarray       # int32 [N], zero for idle rows
     log_prob: np.ndarray      # float32 [N], selected stage log probability
     value_logits: np.ndarray  # float32 [N,3], viewer-relative win/loss/draw
+    log_probs: np.ndarray     # float32 [N,21], complete stage distribution
 
 
 def synchronize(device):
@@ -52,11 +53,11 @@ class Actor:
         return torch.from_numpy(np.array(array, copy=True)).to(self.device)
 
     @torch.inference_mode()
-    def act(self):
+    def act(self, rows=None):
         env = self.env
         # Explicit public allowlist. Never inspect __dict__, dir(), or label_*.
-        active = np.flatnonzero(env.stage >= 0)
-        fresh = np.flatnonzero((env.substep == 0) & (env.stage >= 0))
+        active = np.flatnonzero(env.stage >= 0) if rows is None else np.asarray(rows)
+        fresh = active[env.substep[active] == 0]
         if np.any(~self._cached[active] & (env.substep[active] != 0)):
             raise RuntimeError("attach Actor at the start of a decision (substep == 0)")
         timings = dict(transfer=0.0, encoder=0.0, heads=0.0, encoded_envs=len(fresh),
@@ -75,9 +76,10 @@ class Actor:
         choices = np.zeros(env.num_envs, dtype=np.int32)
         log_prob = np.zeros(env.num_envs, dtype=np.float32)
         values = np.zeros((env.num_envs, 3), dtype=np.float32)
+        all_lp = np.zeros((env.num_envs, 21), dtype=np.float32)
         if not len(active):
             self.last_profile = timings
-            return ActResult(choices, log_prob, values)
+            return ActResult(choices, log_prob, values, all_lp)
         since = start()
         active_t = self._tensor(active).long()
         fresh_t = self._tensor(fresh).long()
@@ -107,10 +109,11 @@ class Actor:
         since = start()
         choices[active] = action.cpu().numpy().astype(np.int32)
         log_prob[active] = picked.cpu().numpy()
-        values[active] = vl.cpu().numpy()
+        values[active] = vl.float().cpu().numpy()
+        all_lp[active] = lp.float().cpu().numpy()
         finish("transfer", since)
         self.last_profile = timings
-        return ActResult(choices, log_prob, values)
+        return ActResult(choices, log_prob, values, all_lp)
 
     def __call__(self, env):
         """evaluate_policy callback; a new VecEnv starts a new cache."""
