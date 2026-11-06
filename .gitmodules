@@ -1,0 +1,4 @@
+[submodule "third_party/goodfield"]
+	path = third_party/goodfield
+	url = https://github.com/RPbeee/godfield-rl.git
+	branch = rl/p0-match-view

@@ -1,0 +1,8 @@
+/runs/
+/build*/
+/.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.so
+*.dylib
