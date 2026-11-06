@@ -1,4 +1,5 @@
 #include "gfrl_core/history.hpp"
+#include "observation_rollouts.hpp"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -52,6 +53,7 @@ void leaks() {
         if(variant==0)check(a.snapshot().state.players[1].items.size()!=b.snapshot().state.players[1].items.size(),"hidden counts converged");
     }
     std::cout<<"leak pairs=3 public decisions=32/pair bitwise comparisons="<<comparisons<<"\n";
+    rollout_leaks();
 }
 void slots() {
     auto m=scene({7,19,6},{});auto s=m.snapshot().state;s.players[0].curses={gf::Curse::dream};s.players[0].items[1].fake_model=27;m.load_scene(s,0,1);
