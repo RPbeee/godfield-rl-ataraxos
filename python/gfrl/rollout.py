@@ -1,6 +1,7 @@
 """Device trajectory records and batched self-play with pinned decision policies."""
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
+from math import ceil
 from time import perf_counter
 import weakref
 
@@ -11,6 +12,9 @@ from . import VecEnv
 from .actor import Actor, PREFIX_FIELDS, synchronize
 from .model import OBS_FIELDS
 from .transfer import tensor_batch
+
+
+COLUMN_BUFFER_GROWTH_FACTOR = 1.25
 
 
 @dataclass
@@ -86,13 +90,15 @@ class ColumnBuffer:
 
     def reserve(self, columns, capacity):
         if capacity > self.capacity or not self.data:
-            self.capacity = max(capacity, self.initial_capacity, self.capacity*2)
+            self.capacity = max(capacity, self.initial_capacity,
+                                ceil(self.capacity * COLUMN_BUFFER_GROWTH_FACTOR))
             for key, value in columns.items():
                 value = torch.as_tensor(value)
                 array = torch.empty((self.capacity, *value.shape[1:]), dtype=value.dtype,
                                     device=self.device)
                 if self.size:
                     array[:self.size].copy_(self.data[key][:self.size])
+                # Release this old column before allocating the next one.
                 self.data[key] = array
 
     def append(self, columns):

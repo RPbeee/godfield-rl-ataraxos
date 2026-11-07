@@ -111,7 +111,7 @@ def run(args):
                            map_location='cpu', weights_only=False)
         # Resume the saved experiment settings; execution length/device/path remain caller-controlled.
         runtime = {k: getattr(args, k) for k in ('iterations', 'device', 'threads', 'run_dir',
-                                                'resume', 'max_hours', 'config')}
+                                                'resume', 'max_hours', 'config', 'microbatch_size')}
         vars(args).update(state['config'])
         vars(args).update(runtime)
     torch.set_num_threads(args.threads)
@@ -192,6 +192,8 @@ def run(args):
         print(json.dumps(metrics, allow_nan=False), flush=True)
         save_checkpoint(checkpoint, learner, iteration, pool, positions, config,
                         elapsed_before+perf_counter()-start)
+        # Release the output-buffer lease before the next collect starts.
+        del rollout
         last_duration = perf_counter()-begin
     return checkpoint
 

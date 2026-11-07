@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import weakref
 
 import numpy as np
 import pytest
@@ -205,6 +206,21 @@ def test_smoke_resume_schedule_pool_and_config(tmp_path):
     assert train.parse_args(['--iterations','2','--config',str(config)]).iterations == 7
 
 
+def test_resume_overrides_microbatch_size(tmp_path):
+    train = train_module()
+    argv = ['--device','cpu','--num-envs','16','--threads','2','--games-per-iter','2',
+            '--iterations','1','--d','32','--depth','1','--eval-every','0',
+            '--run-dir',str(tmp_path)]
+    path = train.run(train.parse_args(argv + ['--microbatch-size','64']))
+    initial = torch.load(path, weights_only=False)
+    assert initial['config']['microbatch_size'] == 64
+    train.run(train.parse_args(argv + ['--resume','--microbatch-size','16']))
+    resumed = torch.load(path, weights_only=False)
+    assert resumed['iteration'] == 2
+    assert resumed['config']['microbatch_size'] == 16
+    assert json.loads((tmp_path/'config.json').read_text())['microbatch_size'] == 16
+
+
 def test_default_ppo_three_iterations_with_evaluation(tmp_path):
     train = train_module()
     args = train.parse_args(['--device','cpu','--num-envs','16','--threads','2',
@@ -218,6 +234,41 @@ def test_default_ppo_three_iterations_with_evaluation(tmp_path):
     assert all(row['lr'] == 1e-4 for row in rows)
     assert set(rows[-1]['evaluation']) == {'random', 'greedy'}
     assert rows[-1]['evaluation']['random']['games'] == 4
+
+
+@pytest.mark.parametrize('eval_every', [0, 1])
+def test_training_releases_rollout_before_next_collection(tmp_path, monkeypatch, eval_every):
+    train = train_module()
+    collectors, batch_refs, column_refs = [], [], []
+
+    class TrackingCollector(Collector):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            collectors.append(self)
+
+        def collect(self, *args, **kwargs):
+            # Check before collection: the preceding update, evaluation, metrics
+            # and checkpoint must retain neither the batch nor its tensor views.
+            assert all(ref() is None for ref in batch_refs + column_refs)
+            batch = super().collect(*args, **kwargs)
+            assert len(self._batch_buffers) == 1
+            batch_refs.append(weakref.ref(batch))
+            column_refs.extend(weakref.ref(tensor)
+                               for columns in (batch.columns, batch.stages)
+                               for tensor in columns.values())
+            return batch
+
+    monkeypatch.setattr(train, 'Collector', TrackingCollector)
+    args = train.parse_args(['--device','cpu','--num-envs','16','--threads','2',
+                             '--games-per-iter','2','--iterations','3','--d','32',
+                             '--depth','1','--pool-every','1','--pool-size','2',
+                             '--eval-every',str(eval_every),'--eval-pairs','1',
+                             '--decision-capacity','32','--stage-capacity','64',
+                             '--run-dir',str(tmp_path)])
+    train.run(args)
+    assert len(batch_refs) == 3
+    assert len(collectors[0]._batch_buffers) == 1
+    assert all(ref() is None for ref in batch_refs + column_refs)
 
 
 def test_evaluation_rng_does_not_advance_training_sampler():

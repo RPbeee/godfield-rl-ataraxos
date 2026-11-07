@@ -114,14 +114,32 @@ def test_random_targets(lv,la):
     np.testing.assert_allclose(b,d,atol=1e-6)
 
 
+@pytest.mark.parametrize('initial,required,expected', [
+    (256, 257, 320),
+    (5, 6, 7),
+    (256, 400, 400),
+])
+def test_column_buffer_growth_capacity(initial, required, expected):
+    buf = ColumnBuffer(device='cpu', capacity=initial)
+    columns = dict(a=torch.arange(1))
+    buf.reserve(columns, 1)
+    assert buf.capacity == initial
+    buf.reserve(columns, required)
+    assert buf.capacity == expected
+    assert buf.capacity >= required
+
+
 def test_growth_and_compaction():
     buf = ColumnBuffer()
     rows = buf.append(dict(a=np.arange(200), b=np.ones((200,3), np.float16)))
     assert len(rows) == 200
     capacity = buf.capacity
     buf.append(dict(a=np.arange(200,400), b=np.zeros((200,3), np.float16)))
-    assert buf.capacity == 2*capacity
+    assert capacity == 256
+    assert buf.capacity == 400
     np.testing.assert_array_equal(buf.data['a'][:400], np.arange(400))
+    np.testing.assert_array_equal(buf.data['b'][:200], np.ones((200,3), np.float16))
+    np.testing.assert_array_equal(buf.data['b'][200:400], np.zeros((200,3), np.float16))
     buf.compact({k:v[100:200].clone() for k,v in buf.data.items()})
     assert buf.size == 100
     np.testing.assert_array_equal(buf.data['a'][:100], np.arange(100,200))
