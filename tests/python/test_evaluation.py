@@ -84,6 +84,4 @@ def test_training_bot_seat_and_errors():
     bots.step(np.array([-999], dtype=np.int32))
     assert bots.stats()['episodes'] == episodes + 1
     with pytest.raises(ValueError):
-        VecEnv(1, 1, opponent='external', eval_pairs=1)
-    with pytest.raises(ValueError):
         evaluate_bots('bad', 'greedy', 1, 1, 0)

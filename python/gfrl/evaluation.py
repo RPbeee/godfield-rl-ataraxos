@@ -1,4 +1,5 @@
 """Paired-seed evaluation; truncated games count as draws."""
+from contextlib import contextmanager
 import math
 
 import numpy as np
@@ -92,3 +93,91 @@ def evaluate_policy(policy_fn, opponent, pairs, num_envs, num_threads, eval_seed
 def evaluate_bots(bot_a, bot_b, pairs, threads, eval_seed):
     """Evaluate two C++ bots over paired deals and summarize agent=bot_a."""
     return summarize(_core.evaluate_bots(bot_a, bot_b, pairs, threads, eval_seed))
+
+
+def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_seed):
+    """Evaluate A against B on paired deals, returning A-relative statistics.
+
+    Callbacks receive (env, rows) and return int32 choices of shape [num_envs],
+    as Actor does. Only selected active rows are used; empty groups are skipped.
+    Actor sampling uses an isolated, seeded Torch RNG, restored on return.
+    Results are reproducible for the same batching and devices; stochastic
+    results need not be invariant to num_envs.
+    """
+    with _policy_rng(eval_seed, (policy_a, policy_b)):
+        env = _core.VecEnv(num_envs, num_threads, eval_pairs=pairs,
+                           opponent='external', eval_seed=eval_seed)
+        while not env.eval_done():
+            active = env.stage >= 0
+            a_turn = env.actor_seat == env.episode_id % 2
+            choices = np.zeros(num_envs, dtype=np.int32)
+            for policy, turn in ((policy_a, a_turn), (policy_b, ~a_turn)):
+                rows = np.flatnonzero(active & turn)
+                if len(rows):
+                    selected = np.asarray(policy(env, rows), dtype=np.int32)
+                    if selected.shape != choices.shape:
+                        raise ValueError('policy must return choices of shape [num_envs]')
+                    choices[rows] = selected[rows]
+            env.step(choices)
+        return summarize(env.eval_results())
+
+
+@contextmanager
+def _policy_rng(seed, policies):
+    """Isolate new evaluation sampling without changing existing callers."""
+    import torch
+    devices = {torch.device(p.device) for p in policies if hasattr(p, 'device')}
+    cuda = sorted({d.index if d.index is not None else torch.cuda.current_device()
+                   for d in devices if d.type == 'cuda'})
+    use_mps = any(d.type == 'mps' for d in devices)
+    mps_state = torch.mps.get_rng_state() if use_mps else None
+    with torch.random.fork_rng(devices=cuda):
+        torch.random.default_generator.manual_seed(seed)
+        for device in cuda:
+            with torch.cuda.device(device):
+                torch.cuda.manual_seed(seed)
+        if use_mps:
+            torch.mps.manual_seed(seed)
+        try:
+            yield
+        finally:
+            if use_mps:
+                torch.mps.set_rng_state(mps_state)
+
+
+def _checkpoint_spec(spec):
+    path, marker, iteration = str(spec).rpartition('@pool:')
+    if not marker:
+        return str(spec), None
+    try:
+        iteration = int(iteration)
+    except ValueError as exc:
+        raise ValueError('pool selector must be @pool:<integer>') from exc
+    return path, iteration
+
+
+def list_pool_iterations(spec):
+    """Return saved pool iterations in checkpoint order (empty for no pool)."""
+    import torch
+    path, _ = _checkpoint_spec(spec)
+    state = torch.load(path, map_location='cpu', weights_only=False)
+    return [entry['iteration'] for entry in state.get('pool', ())]
+
+
+def load_policy_model(spec, device='cpu'):
+    """Load checkpoint EMA, or checkpoint.pt@pool:N, using its model_config."""
+    import torch
+    from .model import Model, ModelConfig
+    path, iteration = _checkpoint_spec(spec)
+    state = torch.load(path, map_location='cpu', weights_only=False)
+    if iteration is None:
+        weights = state['ema']
+    else:
+        entries = [e for e in state.get('pool', ()) if e['iteration'] == iteration]
+        if not entries:
+            available = [e['iteration'] for e in state.get('pool', ())]
+            raise ValueError(f'pool iteration {iteration} not found in {path}; available: {available}')
+        weights = entries[0]['weights']
+    model = Model(ModelConfig(**state['model_config']))
+    model.load_state_dict(weights)
+    return model.to(device).eval().requires_grad_(False)

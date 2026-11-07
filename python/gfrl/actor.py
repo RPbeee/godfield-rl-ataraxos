@@ -121,7 +121,7 @@ class Actor:
         self.last_profile = timings
         return result()
 
-    def __call__(self, env):
-        """evaluate_policy callback; a new VecEnv starts a new cache."""
+    def __call__(self, env, rows=None):
+        """Evaluation callback; selected rows act, a new VecEnv resets the cache."""
         self._bind(env)
-        return self.act().choices
+        return self.act(rows).choices

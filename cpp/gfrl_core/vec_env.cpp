@@ -64,7 +64,7 @@ VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool cano
       mask(n), substep(n), decision_done(n), episode_done(n), truncated(n), episode_id(n),
       base_seed_(seed), canonical_(canonical), controllers_(controllers), eval_pairs_(eval_pairs), opponent_(opponent), eval_seed_(eval_seed), workers_(threads) {
     if (config != gf::MatchConfig{}) throw std::invalid_argument("VecEnv supports only default MatchConfig (max_decisions=512, include_fate/external_*=false)");
-    if(eval_pairs_ && (*eval_pairs_>10000000 || opponent_==Controller::external))throw std::invalid_argument("invalid evaluation configuration");
+    if(eval_pairs_ && *eval_pairs_>10000000)throw std::invalid_argument("invalid evaluation configuration");
     envs_.resize(n);
     for(std::size_t i=0;i<n;++i)envs_[i].game=i;
     for(auto& e:envs_) for(auto& h:e.history) h=History(k);

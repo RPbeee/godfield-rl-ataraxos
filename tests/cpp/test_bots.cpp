@@ -48,7 +48,7 @@ std::vector<EvalResult> run(std::size_t n,std::size_t threads){
     for(std::size_t g=0;g<results.size();++g)check(results[g].g==g && results[g].pair==g/2 && results[g].agent_seat==int(g%2),"bad result metadata");
     return results;
 }
-std::vector<EvalResult> direct_first() {
+std::vector<EvalResult> direct_first(bool external=false) {
     std::vector<EvalResult> results;
     for(std::uint64_t g=0;g<26;++g) {
         gf::Match m;std::uint64_t chance;std::array<std::uint64_t,2> policy;
@@ -59,7 +59,7 @@ std::vector<EvalResult> direct_first() {
             const auto actor=*v.actor;const auto own=m.view(actor);
             if(v.phase==gf::MatchPhase::main && own.board.players[actor].status->confused){m.confusion_step(m.sample_confusion(chance));continue;}
             gf::Command c;
-            if(actor==g%2) {
+            if(external || actor==g%2) {
                 Selection s(m);
                 while(!s.complete)s.choose(m,std::find(s.mask.begin(),s.mask.end(),true)-s.mask.begin(),true);
                 c=s.command;
@@ -72,6 +72,41 @@ std::vector<EvalResult> direct_first() {
 }
 void determinism(){auto a=run(1,1);check(a==direct_first(),"VecEnv and direct Match evaluator differ");check(a==run(7,2),"env count changed results");check(a==run(32,8),"thread count changed results");
     check(evaluate_bots(Controller::random,Controller::greedy,20,1,42)==evaluate_bots(Controller::random,Controller::greedy,20,8,42),"direct evaluator nondeterministic");
+}
+void external_eval(){
+    VecEnv env(26,3,7,true,{},0,{},13,Controller::external,123);
+    VecEnv bot(26,3,7,true,{},0,{},13,Controller::greedy,123);
+    for(std::size_t g=0;g<26;++g){
+        gf::Match expected;std::uint64_t chance;std::array<std::uint64_t,2> policy;
+        reset_evaluation(expected,123,g,chance,policy);
+        check(env.match(g).snapshot()==expected.snapshot(),"external deal differs from evaluation seed");
+        check(env.match(g).snapshot()==env.match(g^1).snapshot(),"external pair deals differ");
+        // Even games expose seat zero immediately in both bot and external modes.
+        if(g%2==0)check(env.match(g).snapshot()==bot.match(g).snapshot(),"bot and external deals differ");
+    }
+    bool seen[2]={false,false};
+    std::vector<std::int32_t> choices(26);
+    int steps=0;
+    while(!env.eval_done()){
+        for(std::size_t i=0;i<26;++i){
+            if(env.stage[i]<0){choices[i]=-999;continue;}
+            seen[env.actor_seat[i]]=true;
+            choices[i]=std::find(env.mask[i].begin(),env.mask[i].end(),true)-env.mask[i].begin();
+        }
+        env.step(choices);check(++steps<100000,"external eval never completed");
+    }
+    check(seen[0] && seen[1],"external evaluation did not return both seats");
+    const auto results=env.eval_results();
+    check(results==direct_first(true),"external result differs from direct evaluation");
+    bool non_draw=false;
+    for(std::size_t g=0;g<26;++g){
+        const auto& snapshot=env.match(g).snapshot();
+        const int expected=snapshot.truncated ? 0 : snapshot.rewards.at(g%2);
+        check(results[g].result==expected,"external result has wrong agent perspective");
+        check(results[g].agent_seat==int(g%2),"external result has wrong agent seat");
+        non_draw |= expected!=0;
+    }
+    check(non_draw,"external perspective test needs decisive games");
 }
 void greedy(){
     auto m=scene({6,13});std::uint64_t rng=0;auto c=Greedy::act(m,0,rng);check(c.kind==gf::CommandKind::play && c.items==std::vector<gf::ItemToken>{101} && c.target==1,"greedy did not choose stronger attack");
@@ -95,4 +130,4 @@ void legal(){
         std::cout<<"bot="<<int(bot)<<" games="<<results.size()<<" decisions="<<decisions<<'\n';
     }
 }
-int main(int argc,char** argv){try{check(argc==2,"case required");std::string s=argv[1];if(s=="leaks")leaks();else if(s=="pairs")paired();else if(s=="determinism")determinism();else if(s=="legal")legal();else if(s=="greedy")greedy();else throw std::runtime_error("unknown case");}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(int argc,char** argv){try{check(argc==2,"case required");std::string s=argv[1];if(s=="external")external_eval();else if(s=="leaks")leaks();else if(s=="pairs")paired();else if(s=="determinism")determinism();else if(s=="legal")legal();else if(s=="greedy")greedy();else throw std::runtime_error("unknown case");}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
