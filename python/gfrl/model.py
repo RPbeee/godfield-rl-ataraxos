@@ -38,6 +38,7 @@ class Model(nn.Module):
     def __init__(self, config=ModelConfig()):
         super().__init__()
         self.config = config
+        self._compiled_encoder = None
         schema = _core.obs_schema()
         self.positions = schema["positions"]
         d = config.d
@@ -73,6 +74,21 @@ class Model(nn.Module):
         self.hp_head = nn.Linear(d, 21)
         self.mp_head = nn.Linear(d, 21)
         self.value_head = nn.Linear(d, 3)
+
+    def _run_encoder(self, packed, padding):
+        if self._compiled_encoder is None:
+            return self.encoder(packed, src_key_padding_mask=padding)
+        from .runtime import encoder_bucket_shape
+        rows, width, _ = packed.shape
+        bucket_rows, bucket_width = encoder_bucket_shape(rows, width)
+        padded = F.pad(packed, (0, 0, 0, bucket_width-width, 0, bucket_rows-rows))
+        mask = F.pad(padding, (0, bucket_width-width, 0, bucket_rows-rows), value=True)
+        # Also protect any real zero-length row in a nonempty chunk. Its output
+        # is masked to zero by encode; dummy outputs are discarded here.
+        mask = mask.clone()
+        mask[:, 0] = mask[:, 0] & ~mask.all(1)
+        encoded = self._compiled_encoder(padded.contiguous(), mask.contiguous())
+        return encoded[:rows, :width]
 
     def encode(self, obs, *, pack=None, chunk=None):
         """Return [B,T,d] in original positions, with invalid positions zeroed.
@@ -112,6 +128,15 @@ class Model(nn.Module):
         self.last_encode_tokens = 0
         if b == 0:
             return x
+        if self._compiled_encoder is not None:
+            from .runtime import encoder_bucket_shape
+            chunk = min(chunk, 256)
+        if not pack and self._compiled_encoder is not None:
+            self.last_encode_tokens = sum(
+                r * w for r, w in (encoder_bucket_shape(min(chunk, b-i), t)
+                                    for i in range(0, b, chunk)))
+            return torch.cat([self._run_encoder(x[i:i+chunk], ~valid[i:i+chunk])
+                              for i in range(0, b, chunk)]).masked_fill(~valid.unsqueeze(-1), 0)
         if not pack:
             self.last_encode_tokens = b * t
             return self.encoder(x, src_key_padding_mask=~valid).masked_fill(
@@ -129,13 +154,17 @@ class Model(nn.Module):
         output = None
         for start, width in zip(range(0, b, chunk), widths):
             group = rows[start:start + chunk]
-            self.last_encode_tokens += len(group) * width
             if width == 0:
                 continue
+            if self._compiled_encoder is None:
+                self.last_encode_tokens += len(group) * width
+            else:
+                padded_rows, padded_width = encoder_bucket_shape(len(group), width)
+                self.last_encode_tokens += padded_rows * padded_width
             slots = positions.index_select(0, group)[:, :width]
             packed = x[group[:, None], slots]
             padding = torch.arange(width, device=x.device)[None] >= lengths[group, None]
-            encoded = self.encoder(packed, src_key_padding_mask=padding)
+            encoded = self._run_encoder(packed, padding)
             encoded = encoded.masked_fill(padding.unsqueeze(-1), 0)
             if output is None:
                 output = x.new_zeros(x.shape, dtype=encoded.dtype)

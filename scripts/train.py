@@ -17,6 +17,8 @@ from gfrl.evaluation import evaluate_policy
 from gfrl.learner import Learner, LearnerConfig
 from gfrl.model import Model, ModelConfig
 from gfrl.rollout import Collector
+from gfrl.runtime import (add_runtime_args, configure_precision, configure_model,
+                          compiler_metrics, metric_delta)
 
 
 def parse_args(argv=None):
@@ -40,6 +42,7 @@ def parse_args(argv=None):
         p.add_argument('--'+f.name.replace('_', '-'), default=value,
                        **(dict(action=argparse.BooleanOptionalAction) if isinstance(value, bool)
                           else dict(type=type(value))))
+    add_runtime_args(p)
     args = p.parse_args(argv)
     if args.config:
         config = json.loads(args.config.read_text())
@@ -111,9 +114,11 @@ def run(args):
                            map_location='cpu', weights_only=False)
         # Resume the saved experiment settings; execution length/device/path remain caller-controlled.
         runtime = {k: getattr(args, k) for k in ('iterations', 'device', 'threads', 'run_dir',
-                                                'resume', 'max_hours', 'config', 'microbatch_size')}
+                                                'resume', 'max_hours', 'config', 'microbatch_size',
+                                                'tf32', 'compile', 'compile_mode_actor', 'compile_mode_learner')}
         vars(args).update(state['config'])
         vars(args).update(runtime)
+    configure_precision(args.device, args.tf32)
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -140,6 +145,8 @@ def run(args):
         elapsed_before = state['elapsed_s']
         torch.set_rng_state(state['torch_rng'])
         np.random.set_state(state['numpy_rng'])
+    configure_model(learner.model, args)
+    configure_model(learner.ema, args)
     # Native VecEnv owns its within-session per-env episode stream. Reserve a new
     # namespace on every construction, so a restart never reuses unfinished deals.
     train_seed = stream_seed(args.seed, 0, positions['train'])
@@ -157,6 +164,7 @@ def run(args):
             save_checkpoint(checkpoint, learner, iteration, pool, positions, config,
                             elapsed_before+perf_counter()-start)
             break
+        compile_before = compiler_metrics()
         begin = perf_counter()
         rollout = collector.collect(args.games_per_iter, pool)
         collected = perf_counter()
@@ -186,6 +194,7 @@ def run(args):
                     actor = Actor(learner.ema, collector.env, args.device, sample=True, dtype=args.dtype)
                     metrics['evaluation'][opponent] = evaluate_policy(
                         actor, opponent, args.eval_pairs, args.num_envs, args.threads, eval_seed)
+        metrics.update(metric_delta(compile_before))
         metrics['elapsed_s'] = elapsed_before+perf_counter()-start
         with (run_dir / 'metrics.jsonl').open('a') as f:
             f.write(json.dumps(metrics, allow_nan=False)+'\n')

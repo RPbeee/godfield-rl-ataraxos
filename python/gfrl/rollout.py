@@ -327,6 +327,7 @@ class Collector:
         if np.any(inflight):
             frozen = copy(live)
             frozen.model = copy(self.model)
+            frozen.model._compiled_encoder = None
             frozen.model._modules = self.model._modules.copy()
             for name in ('kind_embedding', 'stage_embedding', 'target_embedding', 'hp_embedding',
                          'query', 'kind_head', 'card_query', 'stop_head', 'target_head',
