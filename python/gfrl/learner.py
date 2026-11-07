@@ -2,12 +2,13 @@
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
+from time import perf_counter
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .actor import PREFIX_FIELDS
+from .actor import PREFIX_FIELDS, synchronize
 from .model import OBS_FIELDS
 from .targets import compute_targets
 
@@ -28,7 +29,7 @@ class LearnerConfig:
     lambda_a: float = 0.5
     ema: float = 0.999
     minibatch_size: int = 4096
-    microbatch_size: int = 32
+    microbatch_size: int = 0  # automatic: CPU 32, CUDA full minibatch
 
 
 def schedules(config, iteration):
@@ -62,7 +63,7 @@ def decision_terms(new_lp, old_lp, mask, choices, owners, count):
 class Learner:
     def __init__(self, model, config=None, device='cpu', dtype='fp32'):
         self.config = config or LearnerConfig()
-        if min(self.config.minibatch_size, self.config.microbatch_size) <= 0:
+        if self.config.minibatch_size <= 0 or self.config.microbatch_size < 0:
             raise ValueError('batch sizes must be positive')
         self.device = torch.device(device)
         self.dtype = dtype
@@ -76,21 +77,44 @@ class Learner:
             self.device.type, dtype={'fp16': torch.float16, 'bf16': torch.bfloat16}[self.dtype]))
 
     def _tensor(self, array):
-        return torch.as_tensor(np.asarray(array), device=self.device)
+        return torch.as_tensor(array, device=self.device)
+
+    def _prepare(self, batch, rows, xi=None, advantages=None, keep=None):
+        rows = torch.as_tensor(rows, device=self.device, dtype=torch.long)
+        stages, owners = batch.stage_rows(rows)
+        arrays = {k: batch.columns[k][rows] for k in OBS_FIELDS}
+        arrays.update({k: batch.stages[k][stages] for k in PREFIX_FIELDS})
+        arrays.update(owners=owners, choice=batch.stages['choice'][stages].long(),
+                      old_lp=batch.stages['old_log_probs'][stages].float())
+        if xi is not None:
+            arrays.update(xi=xi[rows], advantage=advantages[rows], selected=keep[rows].float())
+        return arrays
 
     def forward(self, decisions):
-        obs = {k: self._tensor(np.stack([d.obs[k] for d in decisions])) for k in OBS_FIELDS}
-        stages = [s for d in decisions for s in d.stages]
-        owners = self._tensor([i for i, d in enumerate(decisions) for _ in d.stages]).long()
-        prefix = {k: self._tensor(np.stack([s.prefix[k] for s in stages])) for k in PREFIX_FIELDS}
+        if hasattr(decisions, 'columns'):
+            decisions = self._prepare(decisions, torch.arange(len(decisions), device=self.device))
+        if isinstance(decisions, dict):
+            obs = {k: decisions[k] for k in OBS_FIELDS}
+            prefix = {k: decisions[k] for k in PREFIX_FIELDS}
+            owners, choices, old_lp = decisions['owners'], decisions['choice'], decisions['old_lp']
+        else:
+            # Compatibility for external callers constructing individual records.
+            obs = {k: self._tensor(np.stack([d.obs[k] for d in decisions])) for k in OBS_FIELDS}
+            stages = [s for d in decisions for s in d.stages]
+            owners = self._tensor([i for i,d in enumerate(decisions) for _ in d.stages]).long()
+            prefix = {k: self._tensor(np.stack([s.prefix[k] for s in stages])) for k in PREFIX_FIELDS}
+            choices = self._tensor([s.choice for s in stages]).long()
+            old_lp = self._tensor(np.stack([s.old_log_probs for s in stages]).astype(np.float32))
         with self.autocast():
             encoded = self.model.encode(obs)
             lp, _ = self.model.heads(encoded.index_select(0, owners), **prefix)
             value = self.model.value_head(encoded[:, self.model.positions['cls']]).float()
-        terms = decision_terms(lp, self._tensor(np.stack([s.old_log_probs for s in stages])),
-                               prefix['mask'].bool(), self._tensor([s.choice for s in stages]).long(),
-                               owners, len(decisions))
+        terms = decision_terms(lp, old_lp, prefix['mask'].bool(), choices, owners, len(value))
         return terms, value
+
+    def _tick(self):
+        synchronize(self.device)
+        return perf_counter()
 
     def update(self, decisions, iteration):
         if not decisions:
@@ -99,7 +123,11 @@ class Learner:
         lr, alpha = schedules(cfg, iteration)
         for group in self.optimizer.param_groups:
             group['lr'] = lr
+        timings = dict(transfer=0., forward=0., backward=0., targets=0., optimizer=0.)
+        update_begin = self._tick()
+        since = self._tick()
         xi, advantages = compute_targets(decisions, cfg.lambda_v, cfg.lambda_a)
+        timings['targets'] = self._tick()-since
         keep = (np.abs(advantages) >= max(float(np.quantile(np.abs(advantages), .75)), .01)
                 if cfg.filtering else np.ones(len(decisions), dtype=bool))
         metrics = dict(policy_loss=0., kl_loss=0., magnet_loss=0., value_loss=0.,
@@ -107,29 +135,55 @@ class Learner:
         # Dropout remains off to match the behavior policies (gradients stay enabled).
         self.model.eval()
         order = np.random.permutation(len(decisions))
+        columnar = hasattr(decisions, 'columns')
+        if columnar:
+            # Preserve the numpy permutation/RNG while transferring only 1-D indices.
+            order = self._tensor(order)
+            xi, advantages, keep = self._tensor(xi), self._tensor(advantages), self._tensor(keep)
         for start in range(0, len(order), cfg.minibatch_size):
             batch = order[start:start+cfg.minibatch_size]
             policy_count = max(int(keep[batch].sum()), 1)
             self.optimizer.zero_grad(set_to_none=True)
+            packed = None
+            if columnar:
+                since = self._tick()
+                packed = self._prepare(decisions, batch, xi, advantages, keep)
+                timings['transfer'] += self._tick()-since
+                stage_offsets = torch.cat((batch.new_zeros(1), decisions.stage_count[batch].cumsum(0)))
+            microbatch = cfg.microbatch_size or (len(batch) if self.device.type == 'cuda' else 32)
             # Accumulate microbatches for bounded activation memory; one Adam step per minibatch.
-            for offset in range(0, len(batch), cfg.microbatch_size):
-                rows = batch[offset:offset+cfg.microbatch_size]
-                terms, value = self.forward([decisions[i] for i in rows])
-                advantage = self._tensor(advantages[rows])
-                selected = self._tensor(keep[rows]).float()
+            for offset in range(0, len(batch), microbatch):
+                rows = batch[offset:offset+microbatch]
+                since = self._tick()
+                if packed is not None:
+                    end = offset+len(rows)
+                    stage_slice = slice(int(stage_offsets[offset]), int(stage_offsets[end]))
+                    inputs = {k: v[offset:end] if k in (*OBS_FIELDS, 'xi', 'advantage', 'selected')
+                              else v[stage_slice] for k,v in packed.items()}
+                    inputs['owners'] = inputs['owners']-offset
+                    terms, value = self.forward(inputs)
+                    advantage, selected, target = inputs['advantage'], inputs['selected'], inputs['xi']
+                else:
+                    terms, value = self.forward([decisions[i] for i in rows])
+                    advantage, selected = self._tensor(advantages[rows]), self._tensor(keep[rows]).float()
+                    target = self._tensor(xi[rows])
                 ratio = terms['ratio']
                 policy = -torch.minimum(ratio*advantage, ratio.clamp(1-cfg.clip, 1+cfg.clip)*advantage)
-                ce = -(self._tensor(xi[rows])*F.log_softmax(value, -1)).sum(-1)
+                ce = -(target*F.log_softmax(value, -1)).sum(-1)
                 total_policy = policy + cfg.kl_coef*terms['kl'] + alpha*terms['magnet']
                 loss = (total_policy*selected).sum()/policy_count + ce.sum()/len(batch)
+                timings['forward'] += self._tick()-since
+                since = self._tick()
                 loss.backward()
+                timings['backward'] += self._tick()-since
                 values = dict(policy_loss=policy*selected, kl_loss=cfg.kl_coef*terms['kl']*selected,
                               magnet_loss=alpha*terms['magnet']*selected, value_loss=ce,
                               entropy=terms['entropy'], ratio_mean=ratio,
                               clip_fraction=((ratio-1).abs() > cfg.clip).float(),
-                              value_accuracy=(value.argmax(-1) == self._tensor(xi[rows]).argmax(-1)).float())
+                              value_accuracy=(value.argmax(-1) == target.argmax(-1)).float())
                 for key, val in values.items():
                     metrics[key] += float(val.detach().sum().cpu())
+            since = self._tick()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             decay = min(cfg.ema, (1 + self.optimizer_steps) / (10 + self.optimizer_steps))
@@ -139,10 +193,14 @@ class Learner:
                     ema.lerp_(current, 1-decay)
                 for ema, current in zip(self.ema.buffers(), self.model.buffers()):
                     ema.copy_(current)
+            timings['optimizer'] += self._tick()-since
         for key in metrics:
             denom = max(int(keep.sum()), 1) if key in ('policy_loss', 'kl_loss', 'magnet_loss') else len(decisions)
             metrics[key] /= denom
-        metrics.update(lr=lr, alpha=alpha, filtering_fraction=float(keep.mean()))
+        metrics.update(lr=lr, alpha=alpha, filtering_fraction=float(keep.float().mean())
+                       if columnar else float(keep.mean()))
+        timings['other'] = self._tick()-update_begin-sum(timings.values())
+        metrics.update({'learn_'+k+'_s': v for k,v in timings.items()})
         return metrics
 
     def pool_entry(self, iteration):

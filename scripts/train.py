@@ -28,7 +28,8 @@ def parse_args(argv=None):
     p.add_argument('--dtype', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     for name, default in dict(num_envs=64, threads=4, games_per_iter=128, iterations=100,
                               pool_every=10, pool_size=8, eval_every=10, eval_pairs=100,
-                              seed=0, d=0, depth=0).items():
+                              seed=0, d=0, depth=0, decision_capacity=4096,
+                              stage_capacity=16384).items():
         p.add_argument('--'+name.replace('_', '-'), type=int, default=default)
     p.add_argument('--pool-fraction', type=float, default=.2)
     p.add_argument('--run-dir', default='runs/train')
@@ -48,9 +49,11 @@ def parse_args(argv=None):
         for k, v in config.items():
             setattr(args, k, v)
     positive = ('num_envs', 'threads', 'games_per_iter', 'iterations', 'pool_every',
-                'pool_size', 'eval_pairs', 'minibatch_size', 'microbatch_size')
+                'pool_size', 'eval_pairs', 'minibatch_size', 'decision_capacity', 'stage_capacity')
     if any(getattr(args, k) <= 0 for k in positive) or args.eval_every < 0:
         p.error('counts must be positive (eval_every may be zero)')
+    if args.microbatch_size < 0:
+        p.error('microbatch-size must be nonnegative (0 = automatic)')
     if not 0 <= args.pool_fraction <= 1 or args.max_hours <= 0:
         p.error('invalid pool_fraction or max_hours')
     return args
@@ -143,7 +146,8 @@ def run(args):
     positions['train'] += 1
     collector = Collector(learner.model, num_envs=args.num_envs, threads=args.threads,
                           seed=train_seed, device=args.device, dtype=args.dtype,
-                          pool_fraction=args.pool_fraction)
+                          pool_fraction=args.pool_fraction, decision_capacity=args.decision_capacity,
+                          stage_capacity=args.stage_capacity)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     (run_dir / 'config.json').write_text(json.dumps(config, indent=2)+'\n')
     last_duration = 0.
@@ -170,6 +174,8 @@ def run(args):
                        learn_decisions_per_s=len(rollout.decisions)/max(learned-collected, 1e-9),
                        collect_s=collected-begin, learn_s=learned-collected,
                        pool_iterations=[entry['iteration'] for entry in pool])
+        metrics.update({'collect_'+k+('_s' if k in ('env_step', 'inference', 'record', 'other') else ''): v
+                        for k,v in rollout.timings.items()})
         if args.eval_every and iteration % args.eval_every == 0:
             eval_seed = stream_seed(args.seed, 1, positions['evaluation'])
             positions['evaluation'] += 1

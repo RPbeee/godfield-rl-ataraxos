@@ -79,3 +79,16 @@ HP選択後にMPの離散化による行き止まりはない。
 既定configではgrant phaseは発生しない（補充はエンジン内部で解決）。
 C++テストでは専用fixtureでgrantと混乱の自動解決、強制決定、打ち切りを検証する。
 fixtureのみ非既定configのMatchを内部注入し、公開APIのconfig制限は維持している。
+
+TSUBAME の対話ノードでは、リポジトリ直下から次のラッパーで実行する。
+引数はそのまま venv の Python に渡されるので、ベンチマークなどにも使える。
+
+```sh
+scripts/tsubame_run.sh scripts/train.py --device cuda --threads 4
+scripts/tsubame_run.sh scripts/bench_training.py --help
+```
+
+ラッパーは `MALLOC_MMAP_THRESHOLD_=17179869184`、
+`MALLOC_TRIM_THRESHOLD_=68719476736`、`MALLOC_TOP_PAD_=1073741824` を設定し、
+`module` があれば libstdc++ 用に `gcc/14.2.0` をロードする。
+`OMP_NUM_THREADS` は未設定なら4（指定済みならその値）を使う。

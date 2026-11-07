@@ -139,7 +139,7 @@ def test_collection_pool_carry_and_encoder_once():
     model.encode = encode
     terms, value = learner.forward(batch)
     assert calls == [len(batch)]
-    expected = [sum(s.old_log_probs[s.choice] for s in d.stages) for d in batch]
+    expected = [sum(float(s.old_log_probs[s.choice]) for s in d.stages) for d in batch]
     np.testing.assert_allclose(terms['old_log_prob'].detach(), expected, atol=1e-6)
     assert value.shape == (len(batch), 3)
     assert second.decisions
