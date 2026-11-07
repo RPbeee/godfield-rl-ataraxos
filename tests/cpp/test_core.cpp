@@ -135,6 +135,18 @@ void equal_env(const VecEnv& a, const VecEnv& b) {
     check(std::memcmp(a.obs_num.data(), b.obs_num.data(), a.obs_num.size*sizeof(float))==0, "obs_num bits differ");
 #undef EQ
     for (std::size_t i = 0; i < a.num_envs; ++i) check(a.match(i).snapshot() == b.match(i).snapshot(), "snapshot differs");
+    // Privileged snapshot oracle: labels and observations must describe the
+    // same pre-action state, including continuation stages and episode resets.
+    for (std::size_t i = 0; i < a.num_envs; ++i) {
+        const auto& snap = a.match(i).snapshot();
+        const auto seat = a.actor_seat[i];
+        std::array<std::uint8_t, 297> expected{};
+        const auto& hand = snap.state.players[1-seat].items;
+        for (const auto& item : hand) ++expected[card_code(item.model)];
+        check(std::equal(expected.begin(), expected.end(), a.label_opp_hand.data()+297*i), "opponent label time/model mismatch");
+        check(a.label_opp_hand_count[i] == hand.size(), "opponent label count mismatch");
+        check(a.obs_num[i*a.tokens*F+Decisions]*512 == snap.decisions, "observation time mismatch");
+    }
     auto x = a.stats(), y = b.stats();
     check(x.episodes == y.episodes && x.decisions == y.decisions && x.policy_stages == y.policy_stages &&
           x.automatic_decisions == y.automatic_decisions && x.truncations == y.truncations, "stats differ");
