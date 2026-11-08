@@ -7,12 +7,49 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 using namespace gfrl;
+// Private fixture for Python end-to-end search leak tests. No production path
+// calls this; replacement is restricted to supported decision boundaries.
+namespace gfrl {
+struct TestAccess {
+    static void danger_root(VecEnv& env, bool opponent_209) {
+        auto& e=env.envs_.at(0);
+        auto state=e.match.snapshot().state;
+        for(auto& p:state.players) {p.items.clear();p.curses.clear();p.guardian=gf::Guardian::none;}
+        state.players[0].items={{100,94,{},false},{101,232,{},false}};
+        if(opponent_209)state.players[1].items={{200,209,{},false}};
+        e.match.load_scene(state,state.players[0].id,19);
+        for(auto& h:e.history)h=History(env.history_len);
+        e.selection.reset();e.encoded=false;e.waiting=false;env.drive(0);
+    }
+    static void replace_hidden_hand(VecEnv& env, std::size_t row, std::uint64_t seed,
+                                    std::optional<std::uint64_t> decisions) {
+        auto& e=env.envs_.at(row);
+        if(env.substep[row]!=0 || !e.selection)throw std::invalid_argument("not a root");
+        const auto seat=e.selection->actor_seat;
+        const auto id=e.match.snapshot().state.players[seat].id;
+        // An empty hidden hand is a deliberately different physical source.
+        e.match=e.match.determinized(id,std::span<const gf::CardId>{},seed);
+        if(decisions) {auto state=e.match.snapshot();state.decisions=*decisions;e.match.restore(state);}
+        e.selection.reset();e.encoded=false;
+        env.drive(row);
+    }
+};
+}
 namespace {
 template<class T> nb::object view(VecEnv& env, T* data, std::initializer_list<std::size_t> shape) {
     nb::object owner = nb::cast(&env, nb::rv_policy::reference);
     auto array = nb::cast(nb::ndarray<nb::numpy, T>(data, shape, owner));
     array.attr("setflags")("write"_a = false);
     return array;
+}
+using Rows = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>, nb::c_contig>;
+using Assignments = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>, nb::c_contig>;
+using Seeds = nb::ndarray<nb::numpy, const std::uint64_t, nb::ndim<1>, nb::c_contig>;
+nb::object int_array(std::span<const std::int32_t> values) {
+    auto* p=new std::int32_t[values.size()];std::copy(values.begin(),values.end(),p);
+    nb::capsule owner(p,[](void* ptr) noexcept {delete[] static_cast<std::int32_t*>(ptr);});
+    auto out=nb::cast(nb::ndarray<nb::numpy,std::int32_t>(p,{values.size()},owner));
+    out.attr("setflags")("write"_a=false);return out;
 }
 nb::list result_list(const std::vector<EvalResult>& results) {
     nb::list out;
@@ -66,6 +103,9 @@ nb::dict schema(std::size_t k) {
 
 }
 NB_MODULE(_core, m) {
+    m.def("_test_danger_root", &TestAccess::danger_root);
+    m.def("_test_replace_hidden_hand", &TestAccess::replace_hidden_hand,
+          "env"_a, "row"_a, "seed"_a, "decisions"_a=nb::none());
     nb::class_<gf::MatchConfig>(m, "MatchConfig")
         .def(nb::init<>())
         .def_rw("max_decisions", &gf::MatchConfig::max_decisions)
@@ -80,10 +120,11 @@ NB_MODULE(_core, m) {
         .def_rw("local_guardian_payloads", &gf::MatchConfig::local_guardian_payloads);
     auto cls = nb::class_<VecEnv>(m, "VecEnv")
         .def("__init__", [](VecEnv* self, std::size_t n,std::size_t threads,std::uint64_t seed,bool canonical,gf::MatchConfig config,std::size_t k,
-                             std::array<std::string,2> controls,std::optional<std::size_t> pairs,std::string opponent,std::uint64_t eval_seed){
-            new(self)VecEnv(n,threads,seed,canonical,config,k,{controller(controls[0]),controller(controls[1])},pairs,controller(opponent),eval_seed);
+                             std::array<std::string,2> controls,std::optional<std::size_t> pairs,std::string opponent,std::uint64_t eval_seed,bool track_projection){
+            new(self)VecEnv(n,threads,seed,canonical,config,k,{controller(controls[0]),controller(controls[1])},pairs,controller(opponent),eval_seed,track_projection);
         }, "num_envs"_a,"num_threads"_a,"base_seed"_a=0,"canonical"_a=true,"config"_a=gf::MatchConfig{},"history_len"_a=64,
-           "controllers"_a=std::array<std::string,2>{"external","external"},"eval_pairs"_a=nb::none(),"opponent"_a="greedy","eval_seed"_a=0)
+           "controllers"_a=std::array<std::string,2>{"external","external"},"eval_pairs"_a=nb::none(),"opponent"_a="greedy","eval_seed"_a=0,"track_projection"_a=false)
+        .def_ro("track_projection", &VecEnv::track_projection)
         .def("eval_done", &VecEnv::eval_done)
         .def("eval_results", [](const VecEnv& e){return result_list(e.eval_results());})
         .def_prop_ro("num_envs", [](const VecEnv& e) { return e.num_envs; })
@@ -96,9 +137,46 @@ NB_MODULE(_core, m) {
         }, "choices"_a.noconvert())
         .def("stats", &stats_dict)
         .def("obs_schema", [](const VecEnv& e){return schema(e.history_len);});
+    cls.def("determinize_support",[](const VecEnv& e,Rows rows) {
+        const auto values=e.determinize_support({rows.data(),rows.shape(0)});return int_array(values);
+    },"rows"_a.noconvert());
+    cls.def("unused_assignment",[](const VecEnv& e,std::size_t row,Rows assignment) {
+        const auto counts=e.unused_assignment(row,{assignment.data(),assignment.shape(0)});return int_array(counts);
+    },"row"_a,"assignment"_a.noconvert());
+    cls.def("load_worlds",[](VecEnv& e,const VecEnv& src,Rows rows,Assignments assignments,Seeds seeds) {
+        if(assignments.shape(0)!=e.num_envs || assignments.shape(1)!=297)throw std::invalid_argument("assignments must have shape [num_envs,297]");
+        const std::vector<std::int32_t> r(rows.data(),rows.data()+rows.shape(0));
+        const std::vector<std::int32_t> a(assignments.data(),assignments.data()+assignments.size());
+        const std::vector<std::uint64_t> sd(seeds.data(),seeds.data()+seeds.shape(0));
+        {nb::gil_scoped_release release;e.load_worlds(src,r,a,sd);}
+        return view(e,e.world_status.data(),{e.num_envs});
+    },"src_env"_a,"src_rows"_a.noconvert(),"assignments"_a.noconvert(),"seeds"_a.noconvert());
+    cls.def("observe",[](VecEnv& e,Rows rows,nb::object seat) {
+        const std::vector<std::int32_t> r(rows.data(),rows.data()+rows.shape(0));
+        std::vector<std::int32_t> seats;
+        if(nb::isinstance<nb::int_>(seat)) seats.assign(r.size(),nb::cast<int>(seat));
+        else {auto a=nb::cast<Rows>(seat);seats.assign(a.data(),a.data()+a.shape(0));}
+        {nb::gil_scoped_release release;e.observe(r,seats);}
+        const auto n=r.size();nb::dict out;
+        out["obs_type"]=view(e,e.leaf_obs_type.data(),{n,e.tokens});
+        out["obs_aux_card"]=view(e,e.leaf_obs_aux_card.data(),{n,e.tokens});
+        out["obs_valid"]=view(e,e.leaf_obs_valid.data(),{n,e.tokens});
+        out["obs_cards"]=view(e,e.leaf_obs_cards.data(),{n,e.tokens,8});
+        out["obs_cat"]=view(e,e.leaf_obs_cat.data(),{n,e.tokens,C});
+        out["obs_num"]=view(e,e.leaf_obs_num.data(),{n,e.tokens,F});
+        return out;
+    },"rows"_a.noconvert(),"seat"_a);
+    nb::class_<SearchEnv,VecEnv>(m,"SearchEnv")
+        .def(nb::init<std::size_t,std::size_t,std::size_t,std::size_t,bool>(),
+             "num_envs"_a,"num_threads"_a,"history_len"_a=64,"max_decisions"_a=512,"canonical"_a=true);
+    m.attr("WORLD_OK")=int(WorldStatus::ok);
+    m.attr("WORLD_INVALID_ASSIGNMENT")=int(WorldStatus::invalid_assignment);
+    m.attr("WORLD_UNSUPPORTED_ROOT")=int(WorldStatus::unsupported_root);
+    m.attr("NOT_DECISION_START")=-1;
 #define ONE(name) cls.def_prop_ro(#name, [](VecEnv& e) { return view(e, e.name.data(), {e.num_envs}); });
     ONE(stage) ONE(actor_seat) ONE(chosen_kind) ONE(chosen_count) ONE(chosen_target) ONE(chosen_alloc_hp) ONE(substep)
     ONE(decision_done) ONE(episode_done) ONE(truncated) ONE(episode_id)
+    ONE(decisions) ONE(world_status) ONE(searcher_seat) ONE(result)
 #undef ONE
     cls.def_prop_ro("mask", [](VecEnv& e) { return view(e, e.mask.data()->data(), {e.num_envs, 21}); });
     cls.def_prop_ro("chosen_cards", [](VecEnv& e) { return view(e, e.chosen_cards.data(), {e.num_envs, 18}); });

@@ -55,21 +55,27 @@ void Workers::run(std::function<void(std::size_t)> job) {
     job_ = {};
     if (error_) std::rethrow_exception(error_);
 }
-VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool canonical, gf::MatchConfig config, std::size_t k, std::array<Controller,2> controllers, std::optional<std::size_t> eval_pairs, Controller opponent, std::uint64_t eval_seed)
+VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool canonical, gf::MatchConfig config, std::size_t k, std::array<Controller,2> controllers, std::optional<std::size_t> eval_pairs, Controller opponent, std::uint64_t eval_seed, bool track_projection, bool search, std::size_t max_decisions)
     : num_envs(positive(n, "num_envs")), num_threads(positive(threads, "num_threads")),
-      history_len(k<=4096 ? k : throw std::invalid_argument("history_len must be <=4096")), tokens(history_offset + history_len),
+      history_len(k<=4096 ? k : throw std::invalid_argument("history_len must be <=4096")), tokens(history_offset + history_len), track_projection(track_projection),
       obs_type(n*tokens), obs_cat(n*tokens*C), obs_cards(n*tokens*8), obs_aux_card(n*tokens),
       obs_num(n*tokens*F), obs_valid(n*tokens), label_opp_hand(n*297), label_opp_hand_count(n),
       stage(n), actor_seat(n), chosen_kind(n), chosen_cards(n * 18), chosen_count(n), chosen_target(n), chosen_alloc_hp(n), outcome(n * 2),
-      mask(n), substep(n), decision_done(n), episode_done(n), truncated(n), episode_id(n),
-      base_seed_(seed), canonical_(canonical), controllers_(controllers), eval_pairs_(eval_pairs), opponent_(opponent), eval_seed_(eval_seed), workers_(threads) {
+      mask(n), substep(n), decision_done(n), episode_done(n), truncated(n), episode_id(n), decisions(n), world_status(n), searcher_seat(n), result(n),
+      leaf_obs_type(0), leaf_obs_cat(0), leaf_obs_cards(0),
+      leaf_obs_aux_card(0), leaf_obs_num(0), leaf_obs_valid(0),
+      search_(search), max_decisions_(positive(max_decisions,"max_decisions")), base_seed_(seed), canonical_(canonical), controllers_(controllers), eval_pairs_(eval_pairs), opponent_(opponent), eval_seed_(eval_seed), workers_(threads) {
     if (config != gf::MatchConfig{}) throw std::invalid_argument("VecEnv supports only default MatchConfig (max_decisions=512, include_fate/external_*=false)");
     if(eval_pairs_ && *eval_pairs_>10000000)throw std::invalid_argument("invalid evaluation configuration");
     envs_.resize(n);
     for(std::size_t i=0;i<n;++i)envs_[i].game=i;
-    for(auto& e:envs_) for(auto& h:e.history) h=History(k);
+    for(auto& e:envs_) {
+        for(auto& h:e.history) h=History(k);
+        if(track_projection) e.projected_before=std::make_unique<std::array<gf::MatchView,2>>();
+    }
     workers_.run([&](std::size_t worker) {
         for (std::size_t i = worker; i < n; i += num_threads) {
+            if(search_) { stop(i); episode_done[i]=true; searcher_seat[i]=-1; world_status[i]=int(WorldStatus::unsupported_root); continue; }
             reset(i); drive(i);
             decision_done[i] = episode_done[i] = truncated[i] = false;
             outcome[2 * i] = outcome[2 * i + 1] = 0;
@@ -93,10 +99,13 @@ void VecEnv::reset(std::size_t i) {
 }
 void VecEnv::before_decision(std::size_t i) {
     auto& e=envs_[i];
-    for(int seat=0;seat<2;++seat) e.before[seat]=e.match.view(e.match.snapshot().state.players[seat].id);
+    for(int seat=0;seat<2;++seat) {
+        e.before[seat]=e.match.view(e.match.snapshot().state.players[seat].id);
+        if(track_projection) (*e.projected_before)[seat]=project_history(e.before[seat],e.match.snapshot(),seat);
+    }
 }
-void VecEnv::encode_observation(std::size_t i) {
-    auto& e=envs_[i]; const auto seat=e.selection->actor_seat;
+std::vector<Token> VecEnv::observation(std::size_t i, int seat) const {
+    const auto& e=envs_[i];
     // Privileged access is restricted to own slot tokens and the separate labels.
     const auto& players=e.match.snapshot().state.players;
     std::vector<gf::ItemToken> order;
@@ -109,6 +118,13 @@ void VecEnv::encode_observation(std::size_t i) {
         ts[j]=event.token;
         ts[j++].num[Age]=history_len ? float(v.decisions-event.decision)/history_len : 0;
     }
+    return ts;
+}
+void VecEnv::encode_observation(std::size_t i) {
+    auto& e=envs_[i]; const auto seat=e.selection->actor_seat;
+    const auto& players=e.match.snapshot().state.players;
+    auto ts=observation(i,seat);
+    std::size_t j;
     for(j=0;j<tokens;++j) {
         const auto& t=ts[j];auto row=i*tokens+j;
         obs_type[row]=t.type;obs_aux_card[row]=t.aux;obs_valid[row]=t.type!=0;
@@ -129,11 +145,20 @@ void VecEnv::record_decision(std::size_t i, bool automatic) {
         auto d=e.match.last_decision(e.before[seat].board.viewer);
         if(!d) throw std::runtime_error("accepted decision lacks public record");
         e.history[seat].append(e.before[seat],after,*d,*e.before[seat].board.viewer);
+        if(track_projection) {
+            const auto& snap=e.match.snapshot();
+            const auto other=1-seat;
+            if(snap.last_decision && (snap.last_decision->hidden_viewers & (1u<<other))) {d->faces.clear();d->faces_hidden=true;}
+            History projected(4096);
+            projected.append((*e.projected_before)[seat],project_history(after,snap,seat),*d,snap.state.players[other].id);
+            e.history[seat].set_projection(projected);
+        }
     }
     e.encoded=false;
     ++e.stats.decisions;
     if (automatic) ++e.stats.automatic_decisions;
-    decision_done[i] = true;
+    if(!search_ || !automatic) decision_done[i] = true;
+    if(search_ && !automatic) ++decisions[i];
     e.selection.reset();
 }
 void VecEnv::drive(std::size_t i) {
@@ -144,6 +169,12 @@ void VecEnv::drive(std::size_t i) {
         for (const auto& p : s.state.players) if (p.items.size() > 18)
             throw std::runtime_error("env " + std::to_string(i) + ": hand exceeds 18 cards");
         if (e.match.done()) {
+            if(search_) {
+                episode_done[i]=true; truncated[i]=s.truncated;
+                for(int seat=0;seat<2;++seat) outcome[2*i+seat]=s.truncated ? 0 : s.rewards.at(seat);
+                result[i]=outcome[2*i+searcher_seat[i]];
+                stop(i); return;
+            }
             // Multiple completions within a single step would be unrepresentable.
             if (!eval_pairs_ && episode_done[i]) throw std::runtime_error("multiple episodes completed in one step");
             episode_done[i] = true; truncated[i] = s.truncated;
@@ -189,7 +220,10 @@ void VecEnv::drive(std::size_t i) {
             record_decision(i, automatic); continue;
         }
         const auto count = std::count(selection.mask.begin(), selection.mask.end(), true);
-        if (count >= 2) { publish(i); return; }
+        if (count >= 2) {
+            if(search_ && decisions[i]>=max_decisions_) {truncated[i]=true;episode_done[i]=true;stop(i);return;}
+            publish(i); return;
+        }
         const auto choice = std::find(selection.mask.begin(), selection.mask.end(), true) - selection.mask.begin();
         selection.choose(e.match, static_cast<int>(choice), canonical_);
     }
@@ -220,6 +254,8 @@ void VecEnv::step(std::span<const std::int32_t> choices) {
     }
     workers_.run([&](std::size_t worker) {
         for (std::size_t i = worker; i < num_envs; i += num_threads) {
+            if(search_)decision_done[i]=false;
+            if(search_ && envs_[i].waiting)continue;
             decision_done[i] = episode_done[i] = truncated[i] = false;
             outcome[2 * i] = outcome[2 * i + 1] = 0;
             auto& e = envs_[i];
@@ -256,4 +292,119 @@ Stats VecEnv::stats() const {
     }
     return sum;
 }
+void VecEnv::stop(std::size_t i) {
+    auto& e=envs_[i];e.waiting=true;e.selection.reset();
+    stage[i]=actor_seat[i]=chosen_kind[i]=chosen_target[i]=chosen_alloc_hp[i]=-1;
+    chosen_count[i]=0;substep[i]=0;mask[i].fill(false);
+    std::fill_n(chosen_cards.data()+18*i,18,-1);
+}
+std::vector<int> VecEnv::determinize_support(std::span<const std::int32_t> rows) const {
+    std::lock_guard lock(api_mutex_);
+    std::vector<int> out;
+    for(auto row:rows) {
+        if(row<0 || std::size_t(row)>=num_envs)throw std::out_of_range("source row");
+        const auto& e=envs_[row];
+        out.push_back(e.waiting || !e.selection || substep[row]!=0 ? -1 :
+            int(e.match.determinize_support(e.match.snapshot().state.players[e.selection->actor_seat].id)));
+    }
+    return out;
+}
+std::array<std::int32_t,297> unused_assignment(const gf::Match& m, int searcher, std::span<const std::int32_t> assignment) {
+    if(searcher<0 || searcher>1 || assignment.size()!=297)throw std::invalid_argument("assignment must have 297 counts and valid seat");
+    std::array<std::int32_t,297> counts{};
+    std::uint64_t total=0;
+    for(std::size_t c=0;c<297;++c) {
+        if(assignment[c]<0)throw std::invalid_argument("negative assignment count");
+        total+=assignment[c];counts[c]=assignment[c];
+    }
+    if(counts[0] || total>m.snapshot().config.hand_limit)throw std::invalid_argument("invalid assignment capacity or padding");
+    for(const auto& card:gf::catalog())
+        if(counts[card_code(card.id)] && !m.gift_supported(card.id))throw std::invalid_argument("non-gift assignment card");
+    std::size_t used=0;
+    for(const auto& item:m.snapshot().state.players[1-searcher].items)if(item.used) {
+        ++used;auto& c=counts[card_code(item.model)];c=std::max(0,c-1);
+    }
+    std::uint64_t physical=used;
+    for(auto c:counts)physical+=c;
+    if(physical>m.snapshot().config.hand_limit)throw std::invalid_argument("assignment plus retained used cards exceeds capacity");
+    return counts;
+}
+std::array<std::int32_t,297> VecEnv::unused_assignment(std::size_t row, std::span<const std::int32_t> assignment) const {
+    std::lock_guard lock(api_mutex_);
+    const auto& e=envs_.at(row);
+    if(e.waiting || !e.selection || substep[row]!=0)throw std::invalid_argument("not a root decision");
+    return gfrl::unused_assignment(e.match,e.selection->actor_seat,assignment);
+}
+void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
+                         std::span<const std::int32_t> assignments, std::span<const std::uint64_t> seeds) {
+    if(!search_ || this==&src)throw std::invalid_argument("load_worlds needs a separate SearchEnv destination");
+    if(!src.track_projection)throw std::invalid_argument("load_worlds requires src with track_projection=true");
+    std::scoped_lock lock(api_mutex_,src.api_mutex_);
+    if(rows.size()!=num_envs || seeds.size()!=num_envs || assignments.size()!=num_envs*297 || history_len!=src.history_len || canonical_!=src.canonical_)
+        throw std::invalid_argument("world shapes, history_len or canonical mismatch");
+    for(auto row:rows)if(row<0 || std::size_t(row)>=src.num_envs)throw std::out_of_range("source row");
+    workers_.run([&](std::size_t worker){for(std::size_t i=worker;i<num_envs;i+=num_threads) {
+        auto& e=envs_[i];const auto& root=src.envs_[rows[i]];
+        stop(i);decisions[i]=0;decision_done[i]=false;episode_done[i]=true;truncated[i]=false;
+        result[i]=0;outcome[2*i]=outcome[2*i+1]=0;episode_id[i]=src.episode_id[rows[i]];searcher_seat[i]=-1;
+        // Clear every old world output, including invalid rows on reload.
+        std::fill_n(obs_type.data()+i*tokens,tokens,0);std::fill_n(obs_valid.data()+i*tokens,tokens,false);
+        std::fill_n(obs_cards.data()+i*tokens*8,tokens*8,0);std::fill_n(obs_aux_card.data()+i*tokens,tokens,0);
+        std::fill_n(obs_cat.data()+i*tokens*C,tokens*C,0);std::fill_n(obs_num.data()+i*tokens*F,tokens*F,0);
+        std::fill_n(label_opp_hand.data()+i*297,297,0);label_opp_hand_count[i]=0;
+        world_status[i]=int(WorldStatus::unsupported_root);
+        if(root.waiting || !root.selection || src.substep[rows[i]]!=0)continue;
+        const auto seat=root.selection->actor_seat;
+        const auto id=root.match.snapshot().state.players[seat].id;
+        if(root.match.determinize_support(id)!=gf::DeterminizeSupport::ok)continue;
+        world_status[i]=int(WorldStatus::invalid_assignment);
+        try {
+            const auto counts=gfrl::unused_assignment(root.match,seat,assignments.subspan(i*297,297));
+            std::vector<gf::CardId> models;
+            for(const auto& card:gf::catalog())for(int j=0;j<counts[card_code(card.id)];++j)models.push_back(card.id);
+            e.match=root.match.determinized(id,models,seeds[i]);
+            // Canonicalize fresh physical IDs as well: a source already produced by
+            // determinized() must not carry its discarded hidden allocator into worlds.
+            auto canonical=e.match.snapshot();
+            gf::ItemToken next=1;
+            for(int p=0;p<2;++p)for(const auto& item:canonical.state.players[p].items)
+                if(p==seat || item.used)next=std::max(next,item.token+1);
+            next=std::max({next,canonical.dream_rolls,canonical.redrawn_items});
+            if(canonical.last_tick && canonical.last_tick->revival_token)
+                next=std::max(next,*canonical.last_tick->revival_token+1);
+            for(auto& item:canonical.state.players[1-seat].items)if(!item.used)item.token=next++;
+            canonical.next_token=next;
+            e.match.restore(canonical);
+        } catch(const std::invalid_argument&) {continue;}
+          catch(const gf::MatchError& error) {if(error.code==gf::MatchErrorCode::invalid)continue;throw;}
+        e.history[seat]=root.history[seat];e.history[1-seat]=root.history[seat].projected();
+        e.chance_rng=mix(seeds[i]^0xa4093822299f31d0ULL);e.encoded=false;e.waiting=false;
+        e.selection.reset();searcher_seat[i]=seat;episode_done[i]=false;world_status[i]=int(WorldStatus::ok);
+        drive(i);
+    }});
+}
+void VecEnv::observe(std::span<const std::int32_t> rows, std::span<const std::int32_t> seats) {
+    std::lock_guard lock(api_mutex_);
+    if(rows.size()!=seats.size() || rows.size()>num_envs)throw std::invalid_argument("observe expects matching rows/seats, at most num_envs");
+    for(std::size_t j=0;j<rows.size();++j) {
+        if(rows[j]<0 || std::size_t(rows[j])>=num_envs || seats[j]<0 || seats[j]>1)throw std::out_of_range("observe row/seat");
+        if(search_ && world_status[rows[j]]!=int(WorldStatus::ok))throw std::invalid_argument("observe invalid world");
+    }
+    if(!leaf_obs_type.size) {
+        leaf_obs_type=Buffer<std::int8_t>(num_envs*tokens);leaf_obs_cat=Buffer<std::int8_t>(num_envs*tokens*C);
+        leaf_obs_cards=Buffer<std::int16_t>(num_envs*tokens*8);leaf_obs_aux_card=Buffer<std::int16_t>(num_envs*tokens);
+        leaf_obs_num=Buffer<float>(num_envs*tokens*F);leaf_obs_valid=Buffer<bool>(num_envs*tokens);
+    }
+    for(std::size_t j=0;j<rows.size();++j) {
+        const auto ts=observation(rows[j],seats[j]);
+        for(std::size_t k=0;k<tokens;++k) {
+            const auto& t=ts[k];const auto row=j*tokens+k;
+            leaf_obs_type[row]=t.type;leaf_obs_aux_card[row]=t.aux;leaf_obs_valid[row]=t.type!=0;
+            std::copy(t.cards.begin(),t.cards.end(),leaf_obs_cards.data()+row*8);
+            std::copy(t.cat.begin(),t.cat.end(),leaf_obs_cat.data()+row*C);
+            std::copy(t.num.begin(),t.num.end(),leaf_obs_num.data()+row*F);
+        }
+    }
+}
+
 }

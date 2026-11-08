@@ -2,11 +2,55 @@
 #include <algorithm>
 #include <cmath>
 namespace gfrl {
+// Uses source-visible values and event-time visibility metadata only.
+gf::MatchView project_history(gf::MatchView v, const gf::MatchSnapshot& s, int source) {
+    const int other=1-source;
+    const auto viewer=s.state.players[other].id;
+    const auto owner=std::find_if(v.board.players.begin(),v.board.players.end(),[&](const auto& p){return p.id==viewer;});
+    const bool fog=!v.board.is_over && owner!=v.board.players.end() && !owner->dead && (!owner->status ||
+        std::find(owner->status->curses.begin(),owner->status->curses.end(),gf::Curse::fog)!=owner->status->curses.end());
+    v.board.viewer=viewer;
+    for(auto& p:v.board.players) {
+        p.fogged=fog && !p.dead && p.id!=viewer;
+        if(p.fogged)p.status.reset(); // Never fill a source-hidden pane.
+    }
+    v.last_reveals.clear();
+    for(const auto& e:s.last_reveals)
+        if((!e.owner_only || e.owner==s.state.players[source].id) && (!e.owner_only || e.owner==viewer))
+            v.last_reveals.push_back({e.owner,e.face,e.model});
+    // Only events visible in the source can pass the intersection of masks.
+    v.last_guardian_changes.clear();
+    for(const auto& e:s.last_guardian_changes)
+        if(!(e.hidden_viewers & ((1u<<source)|(1u<<other))))
+            v.last_guardian_changes.push_back({e.player,e.before,e.after,e.reason});
+    return v;
+}
+
 void History::push(Token token, std::uint64_t decision) {
     card_overflow+=static_cast<std::uint64_t>(token.num[CountOverflow]);
     if(!capacity_) { ++dropped; return; }
     if(events_.size()==capacity_) {events_.pop_front(); ++dropped;}
-    events_.push_back({std::move(token),decision});
+    events_.push_back({std::move(token),decision,std::nullopt});
+}
+void History::set_projection(const History& projection) {
+    // Match backwards so a source ring cutting a same-decision event prefix
+    // cannot accidentally recover that evicted prefix from projection.
+    auto end=projection.events_.rbegin();
+    for(auto src=events_.rbegin();src!=events_.rend();++src) {
+        auto found=end;
+        for(;found!=projection.events_.rend();++found) {
+            if(found->decision!=src->decision)continue;
+            auto token=found->token;
+            for(auto c:{Actor,Target,Origin,SourceSeat})if(token.cat[c])token.cat[c]=3-token.cat[c];
+            if((token.type==Decision && src->token.type==Decision) || token==src->token)break;
+        }
+        if(found!=projection.events_.rend()) {src->opposite=found->token;end=std::next(found);}
+    }
+}
+History History::projected() const {
+    History out(capacity_);
+    for(const auto& event:events_)if(event.opposite)out.push(*event.opposite,event.decision);
+    return out;
 }
 void History::append(const gf::MatchView& b,const gf::MatchView& a,const gf::PublicDecision& d,gf::PlayerId viewer) {
     Token t; t.type=Decision; t.cat[Phase]=int(d.phase)+1; t.cat[Source]=int(d.source)+1;
