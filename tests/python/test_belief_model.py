@@ -9,7 +9,7 @@ import pytest
 import torch
 from gfrl import VecEnv
 from gfrl.model import Model, ModelConfig, OBS_FIELDS
-from gfrl.belief import Belief, BeliefConfig
+from gfrl.belief import Belief, IndependentBelief, BeliefConfig, belief_from_checkpoint
 from gfrl.belief_training import ReplayBuffer, PositionStream
 from gfrl.belief_metrics import fit_baselines
 
@@ -110,14 +110,15 @@ def test_samples_distribution_and_monotonicity(model):
     assert model.presence_probs(obs, 8).shape == (1, 297)
 
 
-def test_warmstart_and_label_isolation(tmp_path):
+@pytest.mark.parametrize("belief_class", [Belief, IndependentBelief])
+def test_warmstart_and_label_isolation(tmp_path, belief_class):
     config = ModelConfig(d=16, depth=1, heads=4, ff=32)
     policy = Model(config)
     path = tmp_path/'policy.pt'
     torch.save(dict(ema=policy.state_dict(), model_config=asdict(config),
                     pool=[dict(iteration=1, weights=policy.state_dict())]), path)
     before = hashlib.sha256(path.read_bytes()).digest()
-    model = Belief.from_policy(path, BeliefConfig(heads=4)).eval()
+    model = belief_class.from_policy(path, BeliefConfig(heads=4)).eval()
     for k, v in model.state_dict().items():
         if k in policy.state_dict():
             torch.testing.assert_close(v, policy.state_dict()[k], rtol=0, atol=0)
@@ -148,7 +149,9 @@ def test_warmstart_and_label_isolation(tmp_path):
     assert hashlib.sha256(path.read_bytes()).digest() == before
 
 
-def test_learns_below_b0(model):
+@pytest.mark.parametrize("belief_class", [Belief, IndependentBelief])
+def test_learns_below_b0(belief_class):
+    model = belief_class(ModelConfig(d=16, depth=1, heads=4, ff=32), BeliefConfig(depth=1, heads=4)).eval()
     obs = observation(8)
     labels = torch.zeros(8, 297, dtype=torch.uint8)
     labels[:, 20] = 2
@@ -191,7 +194,8 @@ def test_resume_optimizer(model, tmp_path):
         torch.testing.assert_close(a, b)
 
 
-def test_streaming_cli_resume_and_metrics(tmp_path):
+@pytest.mark.parametrize("kind", ["autoregressive", "independent"])
+def test_streaming_cli_resume_and_metrics(tmp_path, kind, capsys):
     import json
     from gfrl.belief_data import make_belief_data
     config = ModelConfig(d=16, depth=1, heads=4, ff=32)
@@ -204,7 +208,7 @@ def test_streaming_cli_resume_and_metrics(tmp_path):
     torch.save(data, validation)
     spec = importlib.util.spec_from_file_location('online_belief', Path(__file__).resolve().parents[2]/'scripts/train_belief.py')
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-    argv = ['--checkpoint', str(policy), '--run-dir', str(tmp_path/'run'), '--steps', '3',
+    argv = ['--model', kind, '--checkpoint', str(policy), '--run-dir', str(tmp_path/'run'), '--steps', '3',
             '--buffer-size', '32', '--warmup-positions', '8', '--batch-size', '4',
             '--microbatch', '2', '--num-envs', '4', '--threads', '1', '--sample-prob', '1',
             '--warmup-steps', '2', '--save-every', '1', '--eval-every', '3',
@@ -222,3 +226,26 @@ def test_streaming_cli_resume_and_metrics(tmp_path):
     assert set(report['evaluation'][str(validation)]) == {'belief', 'B0', 'B1'}
     assert report['buffer_positions'] >= 8
     assert report['learn_positions_per_s'] > 0 and report['collect_positions_per_s'] > 0
+
+    assert first['model_type'] == kind
+    restored = belief_from_checkpoint(second).eval()
+    assert isinstance(restored, IndependentBelief) == (kind == 'independent')
+    if kind == 'autoregressive':
+        del second['model_type']
+        torch.save(second, checkpoint)
+        assert type(belief_from_checkpoint(second)) is Belief
+        # Exercise actual legacy resume as well as evaluation.
+        argv[argv.index('--steps')+1] = '6'
+        module.run(module.parse_args([*argv, '--resume']))
+        second = torch.load(checkpoint, weights_only=False)
+        del second['model_type']
+        torch.save(second, checkpoint)
+    spec = importlib.util.spec_from_file_location('eval_belief', Path(__file__).resolve().parents[2]/'scripts/eval_belief.py')
+    evaluator = importlib.util.module_from_spec(spec); spec.loader.exec_module(evaluator)
+    out = tmp_path/'eval.json'
+    result = evaluator.run(evaluator.parse_args(['--checkpoint', str(checkpoint),
+        '--validation', str(validation), '--fit', str(validation), '--presence-samples', '3',
+        '--presence-sample-batch-size', '2', '--out', str(out)]))
+    assert {r['model_type'] for r in result['results'] if 'model_type' in r} == {kind}
+    assert len(json.loads(out.read_text())['results']) == 3
+    assert '| Data | Model | Multiset NLL |' in capsys.readouterr().out

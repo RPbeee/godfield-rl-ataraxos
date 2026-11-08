@@ -73,7 +73,10 @@ class ReplayBuffer:
 
 
 @torch.no_grad()
-def evaluate_belief(model, data, device, batch_size=32, num_samples=64):
+def evaluate_belief(model, data, device, batch_size=32, num_samples=64, presence_sample_batch_size=None):
+    if batch_size <= 0 or num_samples <= 0 or (presence_sample_batch_size is not None and presence_sample_batch_size <= 0):
+        raise ValueError('evaluation batch and sample sizes must be positive')
+    from .belief import IndependentBelief
     previous = model.training
     model.eval()
     lp, cp, accuracy = [], [], []
@@ -86,7 +89,15 @@ def evaluate_belief(model, data, device, batch_size=32, num_samples=64):
             total, count, _ = model.log_prob(obs, labels)
             lp.append(total.cpu()); cp.append(count.cpu())
             accuracy.append((model.count_probs(obs).argmax(1) == labels.long().sum(1)).cpu())
-            metrics = calibration_metrics(model.presence_probs(obs, num_samples).cpu(), labels.cpu())
+            if isinstance(model, IndependentBelief) or presence_sample_batch_size is None:
+                presence = model.presence_probs(obs, num_samples)
+            else:
+                presence = torch.zeros_like(labels, dtype=torch.float32)
+                for offset in range(0, num_samples, presence_sample_batch_size):
+                    size = min(presence_sample_batch_size, num_samples-offset)
+                    presence.add_((model.sample(obs, size) > 0).float().sum(1))
+                presence.div_(num_samples)
+            metrics = calibration_metrics(presence.cpu(), labels.cpu())
             for i, row in enumerate(metrics['reliability']):
                 bc[i] += row['count']
                 ps[i] += (row['mean_prediction'] or 0)*row['count']

@@ -11,8 +11,9 @@ from time import perf_counter
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 import numpy as np
 import torch
-from gfrl.belief import Belief, BeliefConfig
-from gfrl.model import ModelConfig, OBS_FIELDS
+from gfrl.belief import (Belief, IndependentBelief, BeliefConfig,
+                         belief_from_checkpoint, belief_model_type)
+from gfrl.model import OBS_FIELDS
 from gfrl.belief_training import PositionStream, ReplayBuffer, evaluate_belief
 from gfrl.belief_metrics import fit_baselines, evaluate_baseline
 from gfrl.actor import synchronize
@@ -22,6 +23,8 @@ from gfrl.runtime import configure_precision
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', required=True)
+    p.add_argument('--model', choices=('autoregressive', 'independent'), default='autoregressive')
+    p.add_argument('--presence-sample-batch-size', type=int, default=None)
     p.add_argument('--run-dir', default='runs/belief/train')
     p.add_argument('--device', choices=('cpu', 'cuda', 'mps'), default='cpu')
     p.add_argument('--resume', nargs='?', const='auto')
@@ -44,11 +47,13 @@ def parse_args(argv=None):
     for name in ('batch_size', 'microbatch', 'steps', 'eval_batch_size', 'presence_samples', 'num_envs', 'threads', 'save_every', 'log_every'):
         if getattr(a, name) <= 0:
             p.error(name+' must be positive')
+    if a.presence_sample_batch_size is not None and a.presence_sample_batch_size <= 0:
+        p.error('presence-sample-batch-size must be positive')
     return a
 
 
 def save_checkpoint(path, model, optimizer, step, config, generation):
-    state = dict(model=model.state_dict(), optimizer=optimizer.state_dict(), step=step,
+    state = dict(model_type=belief_model_type(model), model=model.state_dict(), optimizer=optimizer.state_dict(), step=step,
                  config=config, model_config=asdict(model.config),
                  belief_config=asdict(model.belief_config), policy_checkpoint=config['checkpoint'],
                  generation=generation, torch_rng=torch.get_rng_state(),
@@ -79,8 +84,10 @@ def run(args):
     torch.set_num_threads(args.threads)
     configure_precision(args.device, args.tf32)
     torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
-    model = (Belief(ModelConfig(**state['model_config']), BeliefConfig(**state['belief_config'])) if state else
-             Belief.from_policy(args.checkpoint, BeliefConfig(args.decoder_depth, args.decoder_heads, args.decoder_ff)))
+    model_class = IndependentBelief if args.model == 'independent' else Belief
+    model = (belief_from_checkpoint(state) if state else
+             model_class.from_policy(args.checkpoint, BeliefConfig(args.decoder_depth, args.decoder_heads, args.decoder_ff)))
+    args.model = belief_model_type(model)
     model.to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
     step, generation = 0, 0
@@ -161,7 +168,7 @@ def run(args):
                 print('| Data | Model | Multiset NLL | Count NLL | Count accuracy | ECE | Early / Middle / Late NLL |', flush=True)
                 print('|---|---|---:|---:|---:|---:|---|', flush=True)
                 for p, data in validations.items():
-                    results = dict(baseline_results[p], belief=evaluate_belief(model, data, args.device, args.eval_batch_size, args.presence_samples))
+                    results = dict(baseline_results[p], belief=evaluate_belief(model, data, args.device, args.eval_batch_size, args.presence_samples, args.presence_sample_batch_size))
                     metrics['evaluation'][p] = results
                     for name, r in results.items():
                         phases = ' / '.join('—' if v['nll'] is None else f'{v["nll"]:.4f}' for v in r['phase_nll'].values())

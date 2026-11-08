@@ -118,3 +118,73 @@ class Belief(Model):
     @torch.no_grad()
     def presence_probs(self, obs, num_samples=64):
         return (self.sample(obs, num_samples) > 0).float().mean(1)
+
+
+class IndependentBelief(Belief):
+    """B2: contextual count distribution and iid cards conditional on count."""
+    def __init__(self, encoder_config=ModelConfig(), config=BeliefConfig()):
+        Model.__init__(self, encoder_config)
+        for name in ('kind_embedding', 'stage_embedding', 'target_embedding', 'hp_embedding',
+                     'query', 'kind_head', 'card_query', 'stop_head', 'target_head',
+                     'hp_head', 'mp_head', 'value_head'):
+            delattr(self, name)
+        self.belief_config = config
+        self.count_head = nn.Linear(encoder_config.d, 19)
+        self.card_head = nn.Linear(encoder_config.d, 296)
+
+    def _log_probs(self, obs):
+        cls = self.encode({k: obs[k] for k in OBS_FIELDS})[:, 0]
+        return (self.count_head(cls).float().log_softmax(-1),
+                self.card_head(cls).float().log_softmax(-1))
+
+    def log_prob(self, obs, labels):
+        counts = labels.long().sum(1)
+        validate_labels(labels, counts)
+        pn, pk = self._log_probs(obs)
+        count_part = pn.gather(1, counts[:, None]).squeeze(1)
+        c = labels[:, 1:].float()
+        # Batched, differentiable multinomial law, evaluated in log space
+        # without the baseline's probability floor (softmax has full support).
+        card_part = (torch.lgamma(counts.float()+1) - torch.lgamma(c+1).sum(1)
+                     + (c*pk).sum(1))
+        return count_part+card_part, count_part, card_part
+
+    @torch.no_grad()
+    def count_probs(self, obs):
+        return self._log_probs(obs)[0].exp()
+
+    @torch.no_grad()
+    def sample(self, obs, num_samples, generator=None):
+        if num_samples <= 0:
+            raise ValueError('num_samples must be positive')
+        pn, pk = self._log_probs(obs)
+        counts = torch.multinomial(pn.exp(), num_samples, replacement=True, generator=generator)
+        cards = torch.multinomial(pk.exp(), num_samples*18, replacement=True,
+                                 generator=generator).reshape(len(pn), num_samples, 18)+1
+        active = torch.arange(18, device=pn.device) < counts[..., None]
+        result = torch.zeros(len(pn), num_samples, 297, dtype=torch.long, device=pn.device)
+        result.scatter_add_(2, cards, active.long())
+        return result
+
+    @torch.no_grad()
+    def presence_probs(self, obs, num_samples=64):
+        pn, pk = self._log_probs(obs)
+        n = torch.arange(19, device=pn.device)
+        absent = (1-pk.exp()).clamp(0, 1)[:, None, :].pow(n[None, :, None])
+        presence = (1-(pn.exp()[:, :, None]*absent).sum(1)).clamp(0, 1)
+        return F.pad(presence, (1, 0))
+
+
+def belief_model_type(model):
+    return 'independent' if isinstance(model, IndependentBelief) else 'autoregressive'
+
+
+def belief_from_checkpoint(state):
+    """Construct on CPU; checkpoints predating model_type are autoregressive."""
+    kind = state.get('model_type', 'autoregressive')
+    classes = {'autoregressive': Belief, 'independent': IndependentBelief}
+    if kind not in classes:
+        raise ValueError(f'unknown belief model type: {kind}')
+    model = classes[kind](ModelConfig(**state['model_config']), BeliefConfig(**state['belief_config']))
+    model.load_state_dict(state['model'])
+    return model
