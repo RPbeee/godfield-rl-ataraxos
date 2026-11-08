@@ -50,7 +50,8 @@ def test_formula_and_distribution():
     rng = np.random.default_rng(9)
     freq = np.bincount(rng.choice(2, 20000, p=p), minlength=2)/20000
     np.testing.assert_allclose(freq, np.sqrt(rho*pi)/np.sqrt(rho*pi).sum(), atol=.015)
-    for kwargs in (dict(depth=-1), dict(worlds=0), dict(alpha=0, beta=0), dict(beta=float('nan'))):
+    for kwargs in (dict(depth=-1), dict(worlds=0), dict(alpha=0, beta=0), dict(beta=float('nan')),
+                   dict(leaf_view='invalid'), dict(max_inference_batch=-1)):
         with pytest.raises(ValueError):
             SearchConfig(**kwargs)
 
@@ -216,7 +217,7 @@ def test_pre_optimization_reference(case):
     # Frozen with the original search.py/actor.py, before compact transfer,
     # root encoding sharing, vectorized forcing, and workspace reuse.
     env = VecEnv(4, 1, 741, track_projection=True)
-    agent = SearchAgent(model(), baseline(), config=SearchConfig(**case['config']), seed=421)
+    agent = SearchAgent(model(), baseline(), config=SearchConfig(**case['config'], leaf_view='searcher'), seed=421)
     with _policy_rng(42, (agent,)):
         choices = agent(env, np.arange(4, dtype=np.int32))
     assert choices.tolist() == case['choices']
@@ -287,16 +288,26 @@ def test_depth_zero_stops_at_next_policy_boundary():
         live.step(choices)
         for i in np.flatnonzero(live.decisions == 1):
             if int(i) not in boundaries:
-                observed = live.observe(np.array([i], np.int32), int(live.searcher_seat[i]))
-                boundaries[int(i)] = ({k: v.copy() for k, v in observed.items()},
-                                      int(live.stage[i]), int(live.substep[i]))
+                actor_seat = int(live.actor_seat[i])
+                actor_obs = live.observe(np.array([i], np.int32), actor_seat)
+                # These are precisely the buffers Actor encodes at substep 0.
+                for key in OBS_FIELDS:
+                    np.testing.assert_array_equal(actor_obs[key][0], getattr(live, key)[i])
+                boundaries[int(i)] = ({k: v.copy() for k, v in actor_obs.items()},
+                                      int(live.stage[i]), int(live.substep[i]), actor_seat)
     assert np.all(stopped.decisions == 1)
     cutoff = np.flatnonzero(stopped.truncated).astype(np.int32)
     assert len(cutoff)
+    assert {boundaries[int(i)][3] == stopped.searcher_seat[i] for i in cutoff} == {True, False}
+    # A response (phase enum 1 -> category 2) immediately after root attack.
+    phase = env.obs_schema()['cat']['phase']['index']
+    assert any(boundaries[int(i)][0]['obs_cat'][0, 0, phase] == 2
+               and boundaries[int(i)][3] != stopped.searcher_seat[i] for i in cutoff)
     for i in cutoff:
-        boundary, stage, substep = boundaries[int(i)]
+        boundary, stage, substep, actor_seat = boundaries[int(i)]
         assert stage >= 0 and substep == 0
-        leaf = stopped.observe(np.array([i], np.int32), int(stopped.searcher_seat[i]))
+        assert stopped.next_actor_seats(np.array([i], np.int32))[0] == actor_seat
+        leaf = stopped.observe(np.array([i], np.int32), actor_seat)
         for key in OBS_FIELDS:
             np.testing.assert_array_equal(leaf[key], boundary[key])
 
@@ -348,3 +359,82 @@ def test_noise_metrics_defined_and_missing_cases():
     assert m['failed_searches'] == 2
     assert m['centered_q_correlation'] is None
     assert noise.metrics([])['total_variation'] is None
+
+
+@pytest.mark.parametrize('view', ['actor', 'searcher'])
+@pytest.mark.parametrize('depth', [0, 3])
+def test_search_inference_chunks(view, depth):
+    from dataclasses import replace
+    config = SearchConfig(worlds=3, candidates=4, candidate_samples=12, depth=depth, leaf_view=view)
+    reports, choices = [], []
+    for cap in (0, 1, 5):
+        env = VecEnv(4, 1, 741, track_projection=True)
+        agent = SearchAgent(model(), baseline(), config=replace(config, max_inference_batch=cap), seed=421)
+        if cap:
+            encode, heads = agent.model.encode, agent.model.heads
+            def bounded_encode(obs):
+                assert len(obs['obs_type']) <= cap
+                return encode(obs)
+            def bounded_heads(tokens, **prefix):
+                assert len(tokens) <= cap
+                return heads(tokens, **prefix)
+            agent.model.encode, agent.model.heads = bounded_encode, bounded_heads
+        with _policy_rng(42, (agent,)):
+            choices.append(agent.search(env, np.arange(4, dtype=np.int32)))
+        reports.append(agent.last_search)
+        world = agent._workspaces['rollout'][1]
+        rows = np.arange(world.num_envs, dtype=np.int32)
+        phase = env.obs_schema()['cat']['phase']['index']
+        leaf = world.observe(rows, world.searcher_seat.astype(np.int32))
+        np.testing.assert_array_equal(world.next_actor_seats(rows) < 0, leaf['obs_cat'][:, 0, phase] == 3)
+        assert agent.counts['depth_leaves'] == (agent.counts['depth_leaves_searcher']
+                                              + agent.counts['depth_leaves_opponent'])
+    for actual, choice in zip(reports[1:], choices[1:]):
+        assert choice == choices[0]
+        for a, b in zip(actual, reports[0], strict=True):
+            assert a['selected'] == b['selected']
+            assert [c['path'] for c in a['candidates']] == [c['path'] for c in b['candidates']]
+            for key in ('q', 'log_pi', 'log_rho'):
+                np.testing.assert_allclose([c[key] for c in a['candidates']],
+                                           [c[key] for c in b['candidates']], atol=2e-6, rtol=2e-6)
+            np.testing.assert_allclose(a['probabilities'], b['probabilities'], atol=2e-6, rtol=2e-6)
+
+
+def test_opponent_leaf_value_sign():
+    env = VecEnv(4, 1, 741, track_projection=True)
+    m = model()
+    with torch.no_grad():
+        m.value_head.weight.zero_()
+        m.value_head.bias.copy_(torch.tensor([2., 0., 0.]))
+    agent = SearchAgent(m, baseline(), config=SearchConfig(worlds=2, candidates=4, candidate_samples=12, depth=0))
+    with _policy_rng(42, (agent,)):
+        agent.search(env, np.arange(4, dtype=np.int32), report_values=True)
+    world = agent._workspaces['rollout'][1]
+    rows = np.arange(world.num_envs, dtype=np.int32)
+    seats = world.next_actor_seats(rows)
+    v = float((torch.tensor([2., 0., 0.]).softmax(0)[0]-torch.tensor([2., 0., 0.]).softmax(0)[1]))
+    expected = np.where(seats == world.searcher_seat, v, -v)
+    actual = [v for report in agent.last_search for c in report['candidates'] for v in c['world_values']]
+    assert (seats != world.searcher_seat).any()
+    np.testing.assert_allclose(actual, expected, atol=1e-7)
+
+
+@pytest.mark.parametrize('cls', [Belief, IndependentBelief])
+def test_belief_inference_chunks(cls):
+    from dataclasses import replace
+    torch.manual_seed(34)
+    belief = cls(ModelConfig(d=16, heads=2, depth=1, ff=32), BeliefConfig(depth=1, heads=2)).eval()
+    env = VecEnv(4, 1, 741, track_projection=True)
+    config = SearchConfig(worlds=2, candidates=3, candidate_samples=8, depth=3)
+    reports = []
+    for cap in (0, 1, 5):
+        agent = SearchAgent(model(), belief, config=replace(config, max_inference_batch=cap), seed=421)
+        with _policy_rng(42, (agent,)):
+            agent.search(env, np.arange(4, dtype=np.int32))
+        reports.append(agent.last_search)
+    for actual in reports[1:]:
+        for a, b in zip(actual, reports[0], strict=True):
+            assert a['selected'] == b['selected']
+            assert [c['path'] for c in a['candidates']] == [c['path'] for c in b['candidates']]
+            np.testing.assert_allclose([c['q'] for c in a['candidates']],
+                                       [c['q'] for c in b['candidates']], atol=2e-6, rtol=2e-6)

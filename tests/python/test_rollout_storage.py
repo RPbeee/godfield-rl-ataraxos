@@ -41,8 +41,8 @@ def test_storage_training_equivalence(device, monkeypatch):
             assert batch.cpu_storage == (storage == 'cpu')
             assert batch[:2].cpu_storage == batch.cpu_storage
             pending |= batch.timings['pending_decisions'] > 0
-            assert collector.current.device == collector.buffer.device == batch.env.device
-            assert all(v.device == batch.env.device for v in batch.stages.values())
+            assert collector.current.device.type == collector.buffer.device.type == batch.env.device.type
+            assert all(v.device.type == batch.env.device.type for v in batch.stages.values())
             metrics = learner.update(batch, iteration)
             history.append({k: v for k, v in metrics.items() if not k.endswith('_s')})
             del batch

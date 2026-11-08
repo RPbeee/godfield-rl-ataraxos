@@ -12,8 +12,8 @@ import numpy as np
 import torch
 
 from . import SearchEnv, VecEnv
-from .actor import Actor, synchronize
-from .belief import belief_from_checkpoint
+from .actor import Actor, ActResult, PREFIX_FIELDS, synchronize
+from .belief import IndependentBelief, belief_from_checkpoint
 from .belief_metrics import Baseline, fit_baselines, gift_probabilities
 from .evaluation import _policy_rng
 from .model import OBS_FIELDS
@@ -30,12 +30,18 @@ class SearchConfig:
     beta: float = .02
     select: str = 'sample'
     max_attempts: int = 100
+    leaf_view: str = 'actor'
+    max_inference_batch: int = 0  # 0: no splitting
 
     def __post_init__(self):
         if min(self.worlds, self.candidates, self.candidate_samples, self.max_attempts) <= 0 or self.depth < 0:
             raise ValueError('positive search budgets and nonnegative depth required')
         if not np.isfinite([self.alpha, self.beta]).all() or min(self.alpha, self.beta) < 0 or self.alpha+self.beta <= 0:
             raise ValueError('finite nonnegative alpha/beta with positive sum required')
+        if self.leaf_view not in ('actor', 'searcher'):
+            raise ValueError('leaf_view must be actor or searcher')
+        if self.max_inference_batch < 0:
+            raise ValueError('max_inference_batch must be nonnegative')
         if self.select not in ('sample', 'argmax'):
             raise ValueError('select must be sample or argmax')
 
@@ -73,6 +79,80 @@ _SUPPORT = {-1: 'inside_decision', 1: 'invalid_viewer', 2: 'unsupported_players'
             7: 'replay_proof', 8: 'hidden_status', 9: 'hidden_confusion', 10: 'hidden_own_model'}
 
 
+class _SearchActor(Actor):
+    """Bound search inference workspace, keeping decision encodings on the host.
+
+    Heads are collected before a single sampling call, preserving RNG ordering
+    regardless of chunk size. Ordinary Actor/training/evaluation are unchanged.
+    """
+    def __init__(self, *args, max_batch=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_batch = max_batch
+
+    @torch.inference_mode()
+    def act(self, rows=None, *, observation_groups=None, **kwargs):
+        if not self.max_batch:
+            return super().act(rows, observation_groups=observation_groups, **kwargs)
+        env = self.env
+        active = np.flatnonzero(env.stage >= 0) if rows is None else np.asarray(rows)
+        fresh = active[env.substep[active] == 0]
+        if np.any(~self._cached[active] & (env.substep[active] != 0)):
+            raise RuntimeError('attach Actor at the start of a decision (substep == 0)')
+        timings = dict(transfer=0., encoder=0., heads=0.)
+        def clock():
+            if self.profile:
+                synchronize(self.device)
+            return perf_counter()
+        encode_rows, inverse = fresh, np.arange(len(fresh))
+        if observation_groups is not None and len(fresh):
+            _, first, inverse = np.unique(np.asarray(observation_groups)[fresh], return_index=True, return_inverse=True)
+            encode_rows = fresh[first]
+        # Assign every duplicate directly into the CPU cache; never expand an
+        # entire world/candidate batch on the accelerator.
+        for lo in range(0, len(encode_rows), self.max_batch):
+            rr = encode_rows[lo:lo+self.max_batch]
+            since = clock()
+            obs = tensor_batch({k: getattr(env, k)[rr] for k in OBS_FIELDS}, self.device)
+            timings['transfer'] += clock()-since
+            since = clock()
+            encoded = self.model.encode(obs).cpu()
+            timings['encoder'] += clock()-since
+            if self.token_cache is None:
+                self.token_cache = torch.empty((env.num_envs, *encoded.shape[1:]), dtype=encoded.dtype)
+            if observation_groups is None:
+                self.token_cache[rr] = encoded
+            else:
+                for j in range(len(rr)):
+                    self.token_cache[fresh[inverse == lo+j]] = encoded[j]
+            del obs, encoded
+        self._cached[fresh] = True
+        lp_parts, value_parts = [], []
+        for lo in range(0, len(active), self.max_batch):
+            rr = active[lo:lo+self.max_batch]
+            since = clock()
+            tokens = self.token_cache[rr].to(self.device)
+            prefix = tensor_batch({k: getattr(env, k)[rr] for k in PREFIX_FIELDS}, self.device)
+            timings['transfer'] += clock()-since
+            since = clock()
+            lp, vl = self.model.heads(tokens, **prefix)
+            lp_parts.append(lp.float())
+            value_parts.append(vl.float())
+            timings['heads'] += clock()-since
+            del tokens, prefix
+        choices = np.zeros(env.num_envs, np.int32)
+        log_prob = np.zeros(env.num_envs, np.float32)
+        values = np.zeros((env.num_envs, 3), np.float32)
+        all_lp = np.zeros((env.num_envs, 21), np.float32)
+        if len(active):
+            lp, vl = torch.cat(lp_parts), torch.cat(value_parts)
+            action = torch.multinomial(lp.exp(), 1).squeeze(1) if self.sample else lp.argmax(-1)
+            choices[active] = action.cpu().numpy()
+            log_prob[active] = lp.gather(1, action[:, None]).squeeze(1).cpu().numpy()
+            values[active], all_lp[active] = vl.cpu().numpy(), lp.cpu().numpy()
+        self.last_profile = timings
+        return ActResult(choices, log_prob, values, all_lp)
+
+
 class SearchAgent:
     def __init__(self, model, belief, device='cpu', *, config=SearchConfig(), seed=0, num_threads=1, profile=False):
         self.device = torch.device(device)
@@ -85,7 +165,8 @@ class SearchAgent:
         self.counts = Counter({k: 0 for k in (
             'decisions', 'searched', 'selected', 'invalid_samples', 'resamples',
             'exhausted_worlds', 'invalid_loads', 'invalid_candidate_worlds',
-            'real_mismatches', 'policy_disagreements', 'fallback_no_candidates')})
+            'real_mismatches', 'policy_disagreements', 'fallback_no_candidates',
+            'depth_leaves', 'depth_leaves_searcher', 'depth_leaves_opponent', 'terminal_leaves')})
         self.seconds = Counter()
         self.pending = {}
         self.last_search = []
@@ -121,6 +202,50 @@ class SearchAgent:
         self.counts['invalid_loads'] += int((status != 0).sum())
         return env, status.copy()
 
+    def _belief_samples(self, src, rows):
+        """Chunk deterministic belief work; retain the original sampling order."""
+        cap = self.config.max_inference_batch
+        if not cap:
+            obs = tensor_batch({k: getattr(src, k)[rows] for k in OBS_FIELDS}, self.device)
+            return self.belief.sample(obs, 1)[:, 0].cpu().numpy().astype(np.int32)
+        chunks, count_probs, card_probs = [], [], []
+        independent = isinstance(self.belief, IndependentBelief)
+        for lo in range(0, len(rows), cap):
+            rr = rows[lo:lo+cap]
+            obs = tensor_batch({k: getattr(src, k)[rr] for k in OBS_FIELDS}, self.device)
+            if independent:
+                pn, pk = self.belief._log_probs(obs)
+                count_probs.append(pn.exp())
+                card_probs.append(pk.exp())
+            else:
+                cls, memory, padding = self.belief.memory(obs)
+                count_probs.append(self.belief.count_head(cls).float().softmax(-1))
+                chunks.append((memory.cpu(), padding.cpu()))
+                del cls, memory, padding
+            del obs
+        counts = torch.multinomial(torch.cat(count_probs), 1, replacement=True).flatten()
+        result = torch.zeros(len(rows), 297, dtype=torch.long, device=self.device)
+        if independent:
+            cards = torch.multinomial(torch.cat(card_probs), 18, replacement=True)+1
+            result.scatter_add_(1, cards, (torch.arange(18, device=self.device) < counts[:, None]).long())
+        else:
+            # memory() packs to the batch's maximum valid width. Restore that
+            # width across chunks, matching the unsplit decoder's padding.
+            width = max(m.shape[1] for m, _ in chunks)
+            chunks = [(torch.nn.functional.pad(m, (0, 0, 0, width-m.shape[1])),
+                       torch.nn.functional.pad(p, (0, width-p.shape[1]), value=True)) for m, p in chunks]
+            inputs = torch.zeros(len(rows), 1, dtype=torch.long, device=self.device)
+            for t in range(int(counts.max())):
+                parts = []
+                for ci, (memory, padding) in enumerate(chunks):
+                    lo = ci*cap
+                    parts.append(self.belief.decode(memory.to(self.device), padding.to(self.device),
+                                                   inputs[lo:lo+cap], counts[lo:lo+cap])[:, -1])
+                card = torch.multinomial(torch.cat(parts).exp(), 1)+1
+                result.scatter_add_(1, card, (counts > t).long()[:, None])
+                inputs = torch.cat((inputs, card), 1)
+        return result.cpu().numpy().astype(np.int32)
+
     def _sample_worlds(self, src, roots):
         c = self.config
         rr = np.repeat(roots, c.worlds).astype(np.int32)
@@ -135,8 +260,7 @@ class SearchAgent:
                 pn, pk = self.belief.count_probs.numpy(), self.belief.card_probs.numpy()
                 samples = np.array([self.rng.multinomial(self.rng.choice(19, p=pn), pk) for _ in todo], np.int32)
             else:
-                obs = tensor_batch({k: getattr(src, k)[rr[todo]] for k in OBS_FIELDS}, self.device)
-                samples = self.belief.sample(obs, 1)[:, 0].cpu().numpy().astype(np.int32)
+                samples = self._belief_samples(src, rr[todo])
             for i, sample in zip(todo, samples):
                 attempts[i] += 1
                 try:
@@ -185,7 +309,7 @@ class SearchAgent:
         if fixed_candidates is None:
             indices = np.concatenate([np.resize(ids, c.candidate_samples) for ids in groups.values() if len(ids)])
             env, status = self._world_env(src, rr[indices], assignments[indices], seeds[indices], 1, role="candidate")
-            actor = Actor(self.model, env, self.device, profile=self.profile)
+            actor = _SearchActor(self.model, env, self.device, profile=self.profile, max_batch=c.max_inference_batch)
             actor._search_root_groups = rr[indices]
             paths = [[] for _ in indices]
             lp, lr = np.zeros(len(indices)), np.zeros(len(indices))
@@ -216,7 +340,7 @@ class SearchAgent:
         start = self._time()
         wi = np.array([j[3] for j in jobs])
         env, status = self._world_env(src, rr[wi], assignments[wi], seeds[wi], c.depth+1, role="rollout")
-        actor = Actor(self.model, env, self.device, profile=self.profile)
+        actor = _SearchActor(self.model, env, self.device, profile=self.profile, max_batch=c.max_inference_batch)
         actor._search_root_groups = rr[wi]
         valid = status == 0
         cursor = np.zeros(len(jobs), int)
@@ -250,20 +374,29 @@ class SearchAgent:
         start = self._time()
         values = env.result.astype(np.float64).copy()
         rows = np.flatnonzero(valid).astype(np.int32)
-        # Encoder category encoding is enum+1: finished=2 -> 3. Unlike
-        # truncated/decisions alone, this also distinguishes engine draws at D.
+        # The engine actor is absent for true terminals (including draws at D).
         if len(rows):
-            leaf = env.observe(rows, env.searcher_seat[rows].astype(np.int32))
-            phase = src.obs_schema()['cat']['phase']['index']
-            cutoff = leaf['obs_cat'][:, 0, phase] != 3
+            acting = env.next_actor_seats(rows)
+            cutoff = acting >= 0
             selected = rows[cutoff]
+            own = acting[cutoff] == env.searcher_seat[selected]
             self.counts['depth_leaves'] += len(selected)
+            self.counts['depth_leaves_searcher'] += int(own.sum())
+            self.counts['depth_leaves_opponent'] += int((~own).sum())
             self.counts['terminal_leaves'] += int((~cutoff).sum())
-            if len(selected):
-                obs = tensor_batch({k: v[cutoff] for k, v in leaf.items()}, self.device)
+            seats = acting[cutoff] if c.leaf_view == 'actor' else env.searcher_seat[selected]
+            batch = c.max_inference_batch or max(len(selected), 1)
+            for lo in range(0, len(selected), batch):
+                rr = selected[lo:lo+batch]
+                leaf = env.observe(rr, seats[lo:lo+batch].astype(np.int32))
+                obs = tensor_batch(leaf, self.device)
                 logits = self.model.value_head(self.model.encode(obs)[:, 0]).float()
                 p = logits.softmax(-1)
-                values[selected] = (p[:, 0]-p[:, 1]).cpu().numpy()
+                v = (p[:, 0]-p[:, 1]).cpu().numpy()
+                if c.leaf_view == 'actor':
+                    v = np.where(own[lo:lo+batch], v, -v)
+                values[rr] = v
+                del obs, logits, p
         self.seconds['leaf'] += self._time()-start
         aggregated = {}
         for i, (r, path, _, _) in enumerate(jobs):

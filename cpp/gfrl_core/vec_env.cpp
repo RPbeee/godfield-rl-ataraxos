@@ -383,6 +383,22 @@ void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
         drive(i);
     }});
 }
+// stop() clears selection and actor_seat; the engine still retains the actor
+// of the next policy boundary. Read it without publishing/mutating the row.
+std::vector<int> VecEnv::next_actor_seats(std::span<const std::int32_t> rows) const {
+    std::lock_guard lock(api_mutex_);
+    std::vector<int> out;
+    for(auto row:rows) {
+        if(row<0 || std::size_t(row)>=num_envs)throw std::out_of_range("actor row");
+        const auto& m=envs_[row].match;
+        const auto& s=m.snapshot();
+        int seat=-1;
+        if(!m.done() && (!search_ || world_status[row]==int(WorldStatus::ok)))
+            for(int j=0;j<2;++j)if(s.actor && s.state.players[j].id==*s.actor)seat=j;
+        out.push_back(seat);
+    }
+    return out;
+}
 void VecEnv::observe(std::span<const std::int32_t> rows, std::span<const std::int32_t> seats) {
     std::lock_guard lock(api_mutex_);
     if(rows.size()!=seats.size() || rows.size()>num_envs)throw std::invalid_argument("observe expects matching rows/seats, at most num_envs");

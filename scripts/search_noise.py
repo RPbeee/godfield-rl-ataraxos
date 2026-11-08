@@ -109,6 +109,9 @@ def main():
     p.add_argument('--worlds', type=int, nargs='+', default=[16])
     p.add_argument('--depth', type=int, nargs='+', default=[10])
     p.add_argument('--beta', type=float, nargs='+', default=[.02])
+    p.add_argument('--leaf-view', choices=('actor', 'searcher'), default='actor')
+    p.add_argument('--max-inference-batch', type=int, default=0,
+                   help='search inference row limit (0: unsplit; start with 128 on a 10 GB GPU)')
     p.add_argument('--alpha', type=float, default=.002)
     for name, default in [('roots', 200), ('repeats', 2), ('candidates', 16), ('candidate-samples', 64),
                           ('num-envs', 32), ('threads', 1), ('seed', 0), ('warmup', 20)]:
@@ -123,7 +126,8 @@ def main():
         p.error('positive roots/num-envs/threads, repeats >= 2, nonnegative seed/warmup required')
     try:
         configs = [SearchConfig(worlds=w, depth=d, beta=b, alpha=args.alpha, candidates=args.candidates,
-                                candidate_samples=args.candidate_samples) for w, d, b in product(args.worlds, args.depth, args.beta)]
+                                candidate_samples=args.candidate_samples, leaf_view=args.leaf_view,
+                                max_inference_batch=args.max_inference_batch) for w, d, b in product(args.worlds, args.depth, args.beta)]
     except ValueError as exc:
         p.error(str(exc))
     torch.set_num_threads(args.threads)
@@ -184,7 +188,7 @@ def main():
         multi = [rs for rs in data[ci] if any(r and len(r['candidates']) > 1 for r in rs)]
         results.append(dict(config=asdict(config), metrics=result, multi_candidate_roots=len(multi),
                             multi_candidate_metrics=metrics(multi), seconds=float(elapsed[ci]),
-                            phase_seconds=dict(agent.seconds), roots=data[ci]))
+                            phase_seconds=dict(agent.seconds), counts=dict(agent.counts), roots=data[ci]))
     report = dict(arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   definitions=__doc__, root_locations=locations, results=results, elapsed_seconds=perf_counter()-start)
     md = markdown(results)

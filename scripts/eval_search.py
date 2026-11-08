@@ -25,6 +25,9 @@ def main():
     for name, default in (('worlds', 16), ('candidates', 16), ('candidate-samples', 64), ('depth', 10),
                           ('pairs', 500), ('num-envs', 32), ('threads', 1), ('seed', 0)):
         p.add_argument('--'+name, type=int, default=default)
+    p.add_argument('--leaf-view', choices=('actor', 'searcher'), default='actor')
+    p.add_argument('--max-inference-batch', type=int, default=0,
+                   help='search inference row limit (0: unsplit; start with 128 on a 10 GB GPU)')
     p.add_argument('--alpha', type=float, default=.002)
     p.add_argument('--beta', type=float, default=.02)
     p.add_argument('--select', choices=('sample', 'argmax'), default='sample')
@@ -36,7 +39,7 @@ def main():
     if min(args.pairs, args.num_envs, args.threads) <= 0:
         p.error('pairs, num-envs, threads must be positive')
     try:
-        config = SearchConfig(**{k: getattr(args, k) for k in ('worlds', 'candidates', 'candidate_samples', 'depth', 'alpha', 'beta', 'select')})
+        config = SearchConfig(**{k: getattr(args, k) for k in ('worlds', 'candidates', 'candidate_samples', 'depth', 'alpha', 'beta', 'select', 'leaf_view', 'max_inference_batch')})
         belief = load_search_belief(args.belief, args.fit, args.device)
     except ValueError as exc:
         p.error(str(exc))

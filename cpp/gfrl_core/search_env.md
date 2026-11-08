@@ -193,3 +193,40 @@ Here HEAD is the pre-projection commit above; if HEAD advances, archive
 `7b53337` explicitly instead. The search smoke also retains the recorded
 64-world trajectory: 581 decisions, 9 terminals, 55 depth cutoffs, and leaf
 value mean 0.0309136733 with range [-0.7121445537, 0.8830882907].
+
+### Leaf actor and bounded inference
+
+`next_actor_seats(rows)` returns an owning int32 array of absolute seats at the
+next decision boundary, including depth-stopped rows; true terminals and invalid
+worlds return -1. This read-only query is needed because `stop()` clears the
+published `actor_seat` and selection. It reads the retained engine actor without
+publishing observations, advancing work, or accessing hidden opponent state.
+
+Search defaults to `SearchConfig(leaf_view='actor')`: nonterminal leaves use
+`observe(rows, next_actor_seats(rows))` and negate opponent values to recover the
+searcher's win-minus-loss value. `leaf_view='searcher'` preserves the previous
+leaf evaluation for comparisons. Terminal results remain searcher-relative.
+The counters `depth_leaves_searcher` and `depth_leaves_opponent` partition
+`depth_leaves` by the boundary actor, independent of the selected leaf view.
+
+At either boundary actor, `observe` produces exactly the OBS_FIELDS buffers
+that a live SearchEnv publishes for Actor at substep 0. Forced singleton choices
+before the first external stage do not modify the match observation. Tests
+compare all fields with a longer-lived world at the same boundary, covering
+both own turns and opponent responses immediately after a root attack at D0.
+The opponent's retained pre-root history still uses the existing projected
+history approximation described above: missing private events or eviction can
+make it differ from the real opponent's training trajectory. This change does
+not reconstruct those unavailable facts.
+
+`max_inference_batch=0` (CLI `--max-inference-batch`) retains unsplit inference.
+A positive limit chunks search belief encoding/decoding, candidate and rollout
+policy encoding/heads, and leaf value inference. The search-only Actor keeps
+its decision token cache in host memory, transferring at most that many rows
+for each head call; ordinary Actor is unchanged. Probabilities are collected
+before the original whole-batch sampling calls to preserve RNG ordering.
+CPU tests cover baseline, autoregressive and independent beliefs and compare
+candidates, values and selected paths with unsplit inference. Floating point
+roundoff can still depend on batch size/device. Start with 128 rows on a 10 GB
+GPU and reduce to 64 if other jobs leave less available memory; GPU memory and
+throughput require measurement on the target machine.

@@ -71,6 +71,7 @@ public:
     std::vector<int> determinize_support(std::span<const std::int32_t> rows) const;
     void load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
                      std::span<const std::int32_t> assignments, std::span<const std::uint64_t> seeds);
+    std::vector<int> next_actor_seats(std::span<const std::int32_t> rows) const;
     void observe(std::span<const std::int32_t> rows, std::span<const std::int32_t> seats);
     std::array<std::int32_t,297> unused_assignment(std::size_t row, std::span<const std::int32_t> assignment) const;
     const gf::Match& match(std::size_t i) const { return envs_.at(i).match; }

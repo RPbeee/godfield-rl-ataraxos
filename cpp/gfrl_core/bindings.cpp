@@ -151,6 +151,9 @@ NB_MODULE(_core, m) {
         {nb::gil_scoped_release release;e.load_worlds(src,r,a,sd);}
         return view(e,e.world_status.data(),{e.num_envs});
     },"src_env"_a,"src_rows"_a.noconvert(),"assignments"_a.noconvert(),"seeds"_a.noconvert());
+    cls.def("next_actor_seats",[](const VecEnv& e,Rows rows) {
+        return int_array(e.next_actor_seats({rows.data(),rows.shape(0)}));
+    },"rows"_a.noconvert());
     cls.def("observe",[](VecEnv& e,Rows rows,nb::object seat) {
         const std::vector<std::int32_t> r(rows.data(),rows.data()+rows.shape(0));
         std::vector<std::int32_t> seats;
