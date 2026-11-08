@@ -209,3 +209,142 @@ def test_known_danger_94_area_232_mask_difference_and_fallback():
         else:
             pytest.fail('root decision did not complete')
     assert agent.counts['real_mismatches'] > 0
+
+
+@pytest.mark.parametrize('case', json.loads((Path(__file__).parent/'fixtures/search_before.json').read_text()))
+def test_pre_optimization_reference(case):
+    # Frozen with the original search.py/actor.py, before compact transfer,
+    # root encoding sharing, vectorized forcing, and workspace reuse.
+    env = VecEnv(4, 1, 741, track_projection=True)
+    agent = SearchAgent(model(), baseline(), config=SearchConfig(**case['config']), seed=421)
+    with _policy_rng(42, (agent,)):
+        choices = agent(env, np.arange(4, dtype=np.int32))
+    assert choices.tolist() == case['choices']
+    for actual, expected in zip(agent.last_search, case['reports'], strict=True):
+        assert actual['selected'] == expected['selected']
+        assert [c['path'] for c in actual['candidates']] == [c['path'] for c in expected['candidates']]
+        np.testing.assert_allclose([c['q'] for c in actual['candidates']],
+                                   [c['q'] for c in expected['candidates']], atol=1e-7, rtol=1e-6)
+        np.testing.assert_allclose(actual['probabilities'], expected['probabilities'], atol=1e-6)
+
+
+def test_fixed_candidates_and_workspace_reload():
+    env = VecEnv(4, 1, 741, track_projection=True)
+    agent = SearchAgent(model(), baseline(), config=SearchConfig(worlds=3, candidates=4, candidate_samples=12, depth=0))
+    rows = np.arange(4, dtype=np.int32)
+    with _policy_rng(42, (agent,)):
+        agent.search(env, rows, report_values=True)
+    fixed, policy = agent.last_candidates, agent.last_policy_paths
+    saved = []
+    for _ in range(2):
+        agent.rng = np.random.default_rng(123)
+        with _policy_rng(456, (agent,)):
+            agent.search(env, rows, fixed_candidates=fixed, policy_paths=policy, report_values=True)
+        saved.append(agent.last_search)
+        assert agent.last_candidates == fixed
+        for report in agent.last_search:
+            assert [tuple(c['path']) for c in report['candidates']] == [c[0] for c in fixed[report['row']]]
+            for c in report['candidates']:
+                assert c['q'] == np.mean(c['world_values'])
+                assert c['q_se'] == pytest.approx(np.std(c['world_values'], ddof=1)/np.sqrt(c['valid_worlds']))
+        workspace = agent._workspaces['rollout'][1]
+        if len(saved) == 1:
+            previous = workspace
+        else:
+            assert workspace is previous
+    assert saved[0] == saved[1]
+
+
+def test_depth_zero_stops_at_next_policy_boundary():
+    env = VecEnv(2, 1, 741, track_projection=True)
+    agent = SearchAgent(model(), baseline(), config=SearchConfig(worlds=2, candidates=3, candidate_samples=8, depth=0))
+    original = agent._world_env
+    loaded = []
+    def capture(src, rows, assignments, seeds, depth, role=None):
+        if role == 'rollout':
+            loaded.append((rows.copy(), assignments.copy(), seeds.copy()))
+        return original(src, rows, assignments, seeds, depth, role)
+    agent._world_env = capture
+    with _policy_rng(42, (agent,)):
+        agent.search(env, np.arange(2, dtype=np.int32))
+    stopped = agent._workspaces['rollout'][1]
+    rows, assignments, seeds = loaded[0]
+    live, status = original(env, rows, assignments, seeds, 2)
+    assert not status.any()
+    # Complete just the forced root, stopping manually at the next live policy
+    # boundary. Compare it to max_decisions=1's stopped leaf observations.
+    paths = [tuple(c['path']) for r in agent.last_search for c in r['candidates'] for _ in range(2)]
+    cursor = np.zeros(len(paths), int)
+    boundaries = {}
+    while np.any(live.decisions == 0):
+        active = np.flatnonzero((live.decisions == 0) & (live.stage >= 0))
+        assert len(active)
+        choices = np.zeros(live.num_envs, np.int32)
+        choices[live.stage >= 0] = live.mask[live.stage >= 0].argmax(1)
+        for i in active:
+            choices[i] = paths[i][cursor[i]]
+            cursor[i] += 1
+        live.step(choices)
+        for i in np.flatnonzero(live.decisions == 1):
+            if int(i) not in boundaries:
+                observed = live.observe(np.array([i], np.int32), int(live.searcher_seat[i]))
+                boundaries[int(i)] = ({k: v.copy() for k, v in observed.items()},
+                                      int(live.stage[i]), int(live.substep[i]))
+    assert np.all(stopped.decisions == 1)
+    cutoff = np.flatnonzero(stopped.truncated).astype(np.int32)
+    assert len(cutoff)
+    for i in cutoff:
+        boundary, stage, substep = boundaries[int(i)]
+        assert stage >= 0 and substep == 0
+        leaf = stopped.observe(np.array([i], np.int32), int(stopped.searcher_seat[i]))
+        for key in OBS_FIELDS:
+            np.testing.assert_array_equal(leaf[key], boundary[key])
+
+
+def test_noise_cli_twenty_roots(tmp_path):
+    checkpoint = tmp_path/'policy.pt'
+    m = model()
+    torch.save(dict(ema=m.state_dict(), model_config=asdict(m.config)), checkpoint)
+    out = tmp_path/'noise.json'
+    subprocess.run([sys.executable, str(Path(__file__).resolve().parents[2]/'scripts/search_noise.py'),
+                    '--checkpoint', str(checkpoint), '--belief', 'uniform', '--roots', '20', '--num-envs', '8',
+                    '--worlds', '2', '--depth', '0', '3', '--beta', '.02', '.1', '--candidates', '3',
+                    '--candidate-samples', '6', '--repeats', '3', '--out', str(out)], check=True, capture_output=True)
+    report = json.loads(out.read_text())
+    assert len(report['root_locations']) == 20
+    assert len(report['results']) == 4
+    for result in report['results']:
+        assert len(result['roots']) == 20
+        assert result['metrics']['failed_searches'] == 0
+        assert result['metrics']['repeat_pairs'] == 60
+        for repeats in result['roots']:
+            assert all(r['candidates'] for r in repeats)
+            assert len({tuple(tuple(c['path']) for c in r['candidates']) for r in repeats}) == 1
+    assert 'centered_q_correlation' in out.with_suffix('.md').read_text()
+
+
+def test_noise_metrics_defined_and_missing_cases():
+    import importlib.util
+    script = Path(__file__).resolve().parents[2]/'scripts/search_noise.py'
+    spec = importlib.util.spec_from_file_location('noise_metrics', script)
+    noise = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(noise)
+    def report(q, probs, selected):
+        return dict(candidates=[dict(path=[i], q=v, q_se=.1) for i, v in enumerate(q)],
+                    probabilities=probs, selected=[selected], policy_path=[0])
+    a, b = report([1., 3.], [.8, .2], 0), report([2., 4.], [.3, .7], 1)
+    m = noise.metrics([[a, b]])
+    assert m['q_correlation'] == pytest.approx(1)
+    assert m['centered_q_correlation'] == pytest.approx(1)
+    assert m['total_variation'] == pytest.approx(.5)
+    assert m['argmax_agreement'] == m['sample_agreement'] == 0
+    assert m['q_argmax_agreement'] == 1
+    assert m['policy_agreement'] == .5
+    assert m['se_gap_ratio'] == pytest.approx(np.sqrt(.02)/2)
+    b['candidates'].pop()
+    b['probabilities'] = [1.]
+    m = noise.metrics([[a, b], [None, None]])
+    assert m['missing_candidate_pairs'] == 1
+    assert m['failed_searches'] == 2
+    assert m['centered_q_correlation'] is None
+    assert noise.metrics([])['total_variation'] is None

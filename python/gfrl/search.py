@@ -74,7 +74,7 @@ _SUPPORT = {-1: 'inside_decision', 1: 'invalid_viewer', 2: 'unsupported_players'
 
 
 class SearchAgent:
-    def __init__(self, model, belief, device='cpu', *, config=SearchConfig(), seed=0, num_threads=1):
+    def __init__(self, model, belief, device='cpu', *, config=SearchConfig(), seed=0, num_threads=1, profile=False):
         self.device = torch.device(device)
         self.model = model.to(device).eval()
         self.belief = belief
@@ -90,6 +90,10 @@ class SearchAgent:
         self.pending = {}
         self.last_search = []
         self.env = None
+        self.profile = profile
+        self._workspaces = {}
+        self.last_candidates = {}
+        self.last_policy_paths = {}
 
     def statistics(self):
         n = self.counts['searched']
@@ -104,8 +108,15 @@ class SearchAgent:
         synchronize(self.device)
         return perf_counter()
 
-    def _world_env(self, src, rows, assignments, seeds, depth):
-        env = SearchEnv(len(rows), self.num_threads, history_len=src.obs_schema()['K'], max_decisions=depth)
+    def _world_env(self, src, rows, assignments, seeds, depth, role=None):
+        key = (len(rows), src.obs_schema()['K'], depth)
+        cached = self._workspaces.get(role) if role else None
+        if cached is not None and cached[0] == key:
+            env = cached[1]
+        else:
+            env = SearchEnv(key[0], self.num_threads, history_len=key[1], max_decisions=depth)
+            if role:
+                self._workspaces[role] = (key, env)
         status = env.load_worlds(src, np.asarray(rows, np.int32), np.asarray(assignments, np.int32), np.asarray(seeds, np.uint64))
         self.counts['invalid_loads'] += int((status != 0).sum())
         return env, status.copy()
@@ -140,10 +151,29 @@ class SearchAgent:
         seeds = self.rng.integers(0, np.iinfo(np.uint64).max, len(rr), dtype=np.uint64)
         return rr[valid], assignments[valid], seeds[valid]
 
+    def _act(self, actor, rows, phase):
+        groups = getattr(actor, '_search_root_groups', None)
+        result = actor.act(rows, compact_transfer=True, observation_groups=groups)
+        actor._search_root_groups = None
+        if self.profile:
+            for key in ('transfer', 'encoder', 'heads'):
+                self.seconds[phase+'_'+key] += actor.last_profile[key]
+        return result
+
     @torch.inference_mode()
-    def search(self, src, roots):
-        """Search all supplied supported roots together; returns row -> path."""
+    def search(self, src, roots, *, fixed_candidates=None, policy_paths=None, report_values=False):
+        """Search supported roots; return row -> full external-choice path.
+
+        For repeated q measurements, pass last_candidates as fixed_candidates
+        and last_policy_paths as policy_paths. Paths, order and log priors stay
+        fixed; hidden worlds, chance seeds and rollout actions are resampled.
+        report_values adds per-world leaves and their sample standard error.
+        The caller isolates Torch RNG (as __call__ does with _policy_rng).
+        """
         c = self.config
+        self.last_search = []
+        self.last_candidates = {}
+        self.last_policy_paths = {}
         start = self._time()
         rr, assignments, seeds = self._sample_worlds(src, roots)
         self.seconds['sample'] += self._time()-start
@@ -152,59 +182,70 @@ class SearchAgent:
             self.last_search = []
             return {}
         start = self._time()
-        indices = np.concatenate([np.resize(ids, c.candidate_samples) for ids in groups.values() if len(ids)])
-        env, status = self._world_env(src, rr[indices], assignments[indices], seeds[indices], 1)
-        actor = Actor(self.model, env, self.device)
-        paths = [[] for _ in indices]
-        lp, lr = np.zeros(len(indices)), np.zeros(len(indices))
-        while not env.episode_done.all():
-            active = np.flatnonzero(env.stage >= 0)
-            act = actor.act(active)
-            for i in active:
-                paths[i].append(int(act.choices[i]))
-            lp[active] += act.log_prob[active]
-            lr[active] -= np.log(env.mask[active].sum(1))
-            env.step(act.choices)
-        candidates = {int(r): {} for r in roots}
-        policy_paths = {}
-        for i, idx in enumerate(indices):
-            if status[i] == 0:
-                policy_paths.setdefault(int(rr[idx]), tuple(paths[i]))
-                candidates[int(rr[idx])][tuple(paths[i])] = (float(lp[i]), float(lr[i]))
-        candidates = {r: sorted(items.items(), key=lambda x: (-x[1][0], x[0]))[:c.candidates] for r, items in candidates.items()}
+        if fixed_candidates is None:
+            indices = np.concatenate([np.resize(ids, c.candidate_samples) for ids in groups.values() if len(ids)])
+            env, status = self._world_env(src, rr[indices], assignments[indices], seeds[indices], 1, role="candidate")
+            actor = Actor(self.model, env, self.device, profile=self.profile)
+            actor._search_root_groups = rr[indices]
+            paths = [[] for _ in indices]
+            lp, lr = np.zeros(len(indices)), np.zeros(len(indices))
+            while not env.episode_done.all():
+                active = np.flatnonzero(env.stage >= 0)
+                act = self._act(actor, active, "candidate")
+                for i in active:
+                    paths[i].append(int(act.choices[i]))
+                lp[active] += act.log_prob[active]
+                lr[active] -= np.log(env.mask[active].sum(1))
+                env.step(act.choices)
+            candidates = {int(r): {} for r in roots}
+            policy_paths = {}
+            for i, idx in enumerate(indices):
+                if status[i] == 0:
+                    policy_paths.setdefault(int(rr[idx]), tuple(paths[i]))
+                    candidates[int(rr[idx])][tuple(paths[i])] = (float(lp[i]), float(lr[i]))
+            candidates = {r: sorted(items.items(), key=lambda x: (-x[1][0], x[0]))[:c.candidates] for r, items in candidates.items()}
+        else:
+            candidates = {int(r): fixed_candidates.get(int(r), []) for r in roots}
+            policy_paths = policy_paths or {}
+        self.last_candidates = candidates
+        self.last_policy_paths = policy_paths
         jobs = [(r, path, priors, int(w)) for r, items in candidates.items() for path, priors in items for w in groups[r]]
         self.seconds['candidate'] += self._time()-start
         if not jobs:
             return {}
         start = self._time()
         wi = np.array([j[3] for j in jobs])
-        env, status = self._world_env(src, rr[wi], assignments[wi], seeds[wi], c.depth+1)
-        actor = Actor(self.model, env, self.device)
+        env, status = self._world_env(src, rr[wi], assignments[wi], seeds[wi], c.depth+1, role="rollout")
+        actor = Actor(self.model, env, self.device, profile=self.profile)
+        actor._search_root_groups = rr[wi]
         valid = status == 0
         cursor = np.zeros(len(jobs), int)
+        lengths = np.array([len(j[1]) for j in jobs])
+        paths = np.zeros((len(jobs), max(lengths.max(), 1)), np.int32)
+        for i, job in enumerate(jobs):
+            paths[i, :lengths[i]] = job[1]
         while True:
             active = np.flatnonzero((env.stage >= 0) & valid)
             if not len(active):
                 break
-            act = actor.act(active)
+            act = self._act(actor, active, "rollout")
             forcing = active[env.decisions[active] == 0]
-            for i in forcing:
-                path = jobs[i][1]
-                if cursor[i] >= len(path) or not env.mask[i, path[cursor[i]]]:
-                    valid[i] = False
-                    self.counts['invalid_candidate_worlds'] += 1
-                else:
-                    act.choices[i] = path[cursor[i]]
-                    cursor[i] += 1
+            choices = paths[forcing, np.minimum(cursor[forcing], paths.shape[1]-1)]
+            ok = (cursor[forcing] < lengths[forcing]) & env.mask[forcing, choices]
+            invalid = forcing[~ok]
+            valid[invalid] = False
+            self.counts['invalid_candidate_worlds'] += len(invalid)
+            accepted = forcing[ok]
+            act.choices[accepted] = choices[ok]
+            cursor[accepted] += 1
             # Invalid rows must still receive legal choices until other rows stop.
             idle_invalid = np.flatnonzero((env.stage >= 0) & ~valid)
             act.choices[idle_invalid] = env.mask[idle_invalid].argmax(1)
             before = env.decisions.copy()
             env.step(act.choices)
-            for i in forcing:
-                if valid[i] and env.decisions[i] > before[i] and cursor[i] != len(jobs[i][1]):
-                    valid[i] = False
-                    self.counts['invalid_candidate_worlds'] += 1
+            invalid = forcing[valid[forcing] & (env.decisions[forcing] > before[forcing]) & (cursor[forcing] != lengths[forcing])]
+            valid[invalid] = False
+            self.counts['invalid_candidate_worlds'] += len(invalid)
         self.seconds['rollout'] += self._time()-start
         start = self._time()
         values = env.result.astype(np.float64).copy()
@@ -240,9 +281,16 @@ class SearchAgent:
             probs = search_distribution([x[2] for x in kept], [x[1][1] for x in kept], [x[1][0] for x in kept], c.alpha, c.beta)
             pick = int(probs.argmax()) if c.select == 'argmax' else int(self.rng.choice(len(kept), p=probs))
             self.counts['selected'] += 1
-            self.counts['policy_disagreements'] += kept[pick][0] != policy_paths[r]
+            self.counts['policy_disagreements'] += kept[pick][0] != policy_paths.get(r)
             selected_paths[r] = kept[pick][0]
             reports.append(dict(row=r, candidates=[dict(path=list(x[0]), log_pi=x[1][0], log_rho=x[1][1], q=x[2], valid_worlds=x[3]) for x in kept], probabilities=probs.tolist(), selected=list(kept[pick][0])))
+        if report_values:
+            for report in reports:
+                report['policy_path'] = list(policy_paths.get(report['row'], ()))
+                for candidate in report['candidates']:
+                    samples = aggregated[(report['row'], tuple(candidate['path']))]
+                    candidate['world_values'] = list(samples)
+                    candidate['q_se'] = float(np.std(samples, ddof=1)/np.sqrt(len(samples))) if len(samples) > 1 else None
         self.last_search = reports
         return selected_paths
 

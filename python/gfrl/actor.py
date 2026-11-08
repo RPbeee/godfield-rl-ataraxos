@@ -50,7 +50,8 @@ class Actor:
         self._cached = np.zeros(env.num_envs, dtype=bool)
 
     @torch.inference_mode()
-    def act(self, rows=None, *, buffers=None, tensors=None, device_result=False):
+    def act(self, rows=None, *, buffers=None, tensors=None, device_result=False,
+            compact_transfer=False, observation_groups=None):
         env = self.env
         buffers = buffers if buffers is not None else {
             key: getattr(env, key) for key in (*OBS_FIELDS, *PREFIX_FIELDS, 'substep')}
@@ -85,12 +86,27 @@ class Actor:
             self.last_profile = timings
             return result()
         since = start()
-        if tensors is None:
-            tensors = tensor_batch({k: buffers[k] for k in (*OBS_FIELDS, *PREFIX_FIELDS)}, self.device)
         active_t = torch.as_tensor(active, device=self.device, dtype=torch.long)
         fresh_t = torch.as_tensor(fresh, device=self.device, dtype=torch.long)
-        obs = {key: tensors[key].index_select(0, fresh_t) for key in OBS_FIELDS} if len(fresh) else None
-        prefix = {key: tensors[key].index_select(0, active_t) for key in PREFIX_FIELDS}
+        encode_rows = fresh
+        expand = None
+        if observation_groups is not None and len(fresh):
+            # Caller guarantees identical observations within a group. Search
+            # uses this only on freshly determinized copies of the same root.
+            _, first, inverse = np.unique(np.asarray(observation_groups)[fresh], return_index=True, return_inverse=True)
+            encode_rows = fresh[first]
+            expand = torch.as_tensor(inverse, device=self.device, dtype=torch.long)
+        if compact_transfer and tensors is None:
+            # Search-only path: gather fresh observations and active prefixes
+            # on the host, avoiding full observation transfers at later stages.
+            obs = tensor_batch({k: buffers[k][encode_rows] for k in OBS_FIELDS}, self.device) if len(fresh) else None
+            prefix = tensor_batch({k: buffers[k][active] for k in PREFIX_FIELDS}, self.device)
+        else:
+            if tensors is None:
+                tensors = tensor_batch({k: buffers[k] for k in (*OBS_FIELDS, *PREFIX_FIELDS)}, self.device)
+            encode_t = fresh_t if expand is None else torch.as_tensor(encode_rows, device=self.device, dtype=torch.long)
+            obs = {key: tensors[key].index_select(0, encode_t) for key in OBS_FIELDS} if len(fresh) else None
+            prefix = {key: tensors[key].index_select(0, active_t) for key in PREFIX_FIELDS}
         finish("transfer", since)
         autocast = (torch.autocast(self.device.type,
                                   dtype={"fp16": torch.float16, "bf16": torch.bfloat16}[self.dtype])
@@ -101,6 +117,9 @@ class Actor:
                 encoded = self.model.encode(obs)
                 timings["encoder_tokens"] = self.model.last_encode_tokens
                 timings["unpacked_tokens"] = encoded.shape[0] * encoded.shape[1]
+                timings["encoded_envs"] = len(encode_rows)
+                if expand is not None:
+                    encoded = encoded.index_select(0, expand)
                 if self.token_cache is None:
                     self.token_cache = torch.empty((env.num_envs, *encoded.shape[1:]),
                                                    device=self.device, dtype=encoded.dtype)

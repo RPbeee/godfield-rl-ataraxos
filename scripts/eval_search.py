@@ -29,6 +29,7 @@ def main():
     p.add_argument('--beta', type=float, default=.02)
     p.add_argument('--select', choices=('sample', 'argmax'), default='sample')
     p.add_argument('--device', choices=('cpu', 'mps', 'cuda'), default='cpu')
+    p.add_argument('--profile', action='store_true', help='synchronized Actor phase timings (adds overhead)')
     p.add_argument('--tf32', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--out', type=Path, default=Path('eval-search.json'))
     args = p.parse_args()
@@ -42,7 +43,7 @@ def main():
     torch.set_num_threads(args.threads)
     configure_precision(args.device, args.tf32)
     agent = SearchAgent(load_policy_model(args.checkpoint, args.device), belief, args.device,
-                        config=config, seed=args.seed, num_threads=args.threads)
+                        config=config, seed=args.seed, num_threads=args.threads, profile=args.profile)
     start = perf_counter()
     if args.opponent == 'policy':
         opponent = Actor(load_policy_model(args.opponent_checkpoint or args.checkpoint, args.device),
