@@ -95,18 +95,21 @@ def evaluate_bots(bot_a, bot_b, pairs, threads, eval_seed):
     return summarize(_core.evaluate_bots(bot_a, bot_b, pairs, threads, eval_seed))
 
 
-def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_seed):
+def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_seed, *,
+                      track_projection=False):
     """Evaluate A against B on paired deals, returning A-relative statistics.
 
     Callbacks receive (env, rows) and return int32 choices of shape [num_envs],
     as Actor does. Only selected active rows are used; empty groups are skipped.
     Actor sampling uses an isolated, seeded Torch RNG, restored on return.
+    track_projection enables search roots and defaults to the existing fast path.
     Results are reproducible for the same batching and devices; stochastic
     results need not be invariant to num_envs.
     """
     with _policy_rng(eval_seed, (policy_a, policy_b)):
         env = _core.VecEnv(num_envs, num_threads, eval_pairs=pairs,
-                           opponent='external', eval_seed=eval_seed)
+                           opponent='external', eval_seed=eval_seed,
+                           track_projection=track_projection)
         while not env.eval_done():
             active = env.stage >= 0
             a_turn = env.actor_seat == env.episode_id % 2
