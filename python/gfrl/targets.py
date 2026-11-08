@@ -29,8 +29,8 @@ def compute_targets(decisions, lambda_v=0.8, lambda_a=0.5):
     if not 0 <= lambda_v <= 1 or not 0 <= lambda_a <= 1:
         raise ValueError('lambda must be in [0,1]')
     if hasattr(decisions, 'columns'):
-        # Only these small columns cross to the host. Observation and stage
-        # storage stay on the training device throughout the update.
+        # Only these small columns need host access. CPU rollout storage
+        # already has them here; device storage transfers no observations.
         c = {k: (decisions.columns[k].cpu().numpy() if torch.is_tensor(decisions.columns[k])
                  else decisions.columns[k])
              for k in ('env', 'game', 'seat', 'old_value', 'outcome')}

@@ -1,4 +1,4 @@
-"""Device trajectory records and batched self-play with pinned decision policies."""
+"""Columnar trajectory storage and batched self-play with pinned decision policies."""
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from math import ceil
@@ -38,8 +38,9 @@ class Decision:
 
 class RolloutBatch:
     """Contiguous decision and stage columns. Object access is a debug adapter only."""
-    def __init__(self, columns, stages):
+    def __init__(self, columns, stages, *, cpu_storage=False):
         self.columns, self.stages = columns, stages
+        self.cpu_storage = cpu_storage
 
     def __len__(self):
         return len(self.columns['env'])
@@ -78,13 +79,14 @@ class RolloutBatch:
         columns['stage_start'] = columns['stage_count'].cumsum(0)-columns['stage_count']
         stages = {k: v.index_select(0, sr) for k, v in self.stages.items()}
         stages['decision'] = owners
-        return RolloutBatch(columns, stages)
+        return RolloutBatch(columns, stages, cpu_storage=self.cpu_storage)
 
 
 class ColumnBuffer:
-    def __init__(self, device='cpu', capacity=256):
+    def __init__(self, device='cpu', capacity=256, *, pin_memory=False):
         self.device = torch.device(device)
         self.initial_capacity = capacity
+        self.pin_memory = pin_memory
         self.data = {}
         self.size = self.capacity = 0
 
@@ -95,7 +97,7 @@ class ColumnBuffer:
             for key, value in columns.items():
                 value = torch.as_tensor(value)
                 array = torch.empty((self.capacity, *value.shape[1:]), dtype=value.dtype,
-                                    device=self.device)
+                                    device=self.device, pin_memory=self.pin_memory)
                 if self.size:
                     array[:self.size].copy_(self.data[key][:self.size])
                 # Release this old column before allocating the next one.
@@ -106,8 +108,17 @@ class ColumnBuffer:
         end = self.size+n
         self.reserve(columns, end)
         rows = torch.arange(self.size, end, device=self.device)
-        for key, value in columns.items():
-            self.data[key].index_copy_(0, rows, torch.as_tensor(value, device=self.device))
+        if self.pin_memory:
+            # Queue all columns into contiguous pinned slices, then wait once
+            # before CPU bookkeeping reads them or a source can be reused.
+            sources = [torch.as_tensor(value) for value in columns.values()]
+            for key, value in zip(columns, sources):
+                self.data[key][self.size:end].copy_(value, non_blocking=True)
+            for device in {v.device for v in sources if v.device.type == 'cuda'}:
+                synchronize(device)
+        else:
+            for key, value in columns.items():
+                self.data[key].index_copy_(0, rows, torch.as_tensor(value, device=self.device))
         self.size = end
         return rows
 
@@ -122,7 +133,12 @@ class Collector:
     """Live weights are shared; only heads of unfinished decisions are pinned."""
     def __init__(self, model, *, num_envs=64, threads=4, seed=0, device='cpu',
                  dtype='fp32', pool_fraction=0.2, env=None,
-                 decision_capacity=4096, stage_capacity=16384):
+                 decision_capacity=4096, stage_capacity=16384, rollout_storage='device'):
+        if rollout_storage not in ('device', 'cpu'):
+            raise ValueError('rollout_storage must be device or cpu')
+        self.cpu_storage = rollout_storage == 'cpu'
+        self.storage_device = torch.device('cpu' if self.cpu_storage else device)
+        pin = self.cpu_storage and torch.device(device).type == 'cuda'
         if decision_capacity <= 0 or stage_capacity <= 0:
             raise ValueError('buffer capacities must be positive')
         if not 0 <= pool_fraction <= 1:
@@ -138,10 +154,10 @@ class Collector:
         self.opponent_policy = np.full(n, -1, dtype=np.int64)
         self.assigned = np.zeros(n, dtype=bool)
         self.routing = np.full(n, -1, dtype=np.int64)
-        self.current = torch.full((n,), -1, dtype=torch.long, device=device)
+        self.current = torch.full((n,), -1, dtype=torch.long, device=self.storage_device)
         self.retired_key = -2
-        self.buffer = ColumnBuffer(device, decision_capacity)
-        self.stage_buffer = ColumnBuffer(device, stage_capacity)
+        self.buffer = ColumnBuffer(self.storage_device, decision_capacity, pin_memory=pin)
+        self.stage_buffer = ColumnBuffer(self.storage_device, stage_capacity, pin_memory=pin)
         self._batch_buffers = []
 
     @property
@@ -159,7 +175,7 @@ class Collector:
         c['stage_count'] = torch.zeros(self.buffer.size, dtype=torch.long, device=order.device)
         c['stage_count'].index_add_(0, s['decision'], torch.ones_like(s['decision']))
         c['stage_start'] = c['stage_count'].cumsum(0)-c['stage_count']
-        return RolloutBatch(c, s)
+        return RolloutBatch(c, s, cpu_storage=self.cpu_storage)
 
     def _finish_batch(self):
         # Keep leased output storage alive until the caller releases its batch.
@@ -167,8 +183,10 @@ class Collector:
             if slot[2]() is None:
                 break
         else:
-            slot = [ColumnBuffer(self.buffer.device, self.buffer.initial_capacity),
-                    ColumnBuffer(self.stage_buffer.device, self.stage_buffer.initial_capacity),
+            slot = [ColumnBuffer(self.buffer.device, self.buffer.initial_capacity,
+                                 pin_memory=self.buffer.pin_memory),
+                    ColumnBuffer(self.stage_buffer.device, self.stage_buffer.initial_capacity,
+                                 pin_memory=self.stage_buffer.pin_memory),
                     lambda: None]
             self._batch_buffers.append(slot)
         decisions, stages, _ = slot
@@ -200,6 +218,7 @@ class Collector:
         ns = int(counts[:nc].sum())
         batch = RolloutBatch({k: v[:nc] for k, v in decisions.data.items()},
                              {k: v[:ns] for k, v in stages.data.items()})
+        batch.cpu_storage = getattr(self, 'cpu_storage', False)
         slot[2] = weakref.ref(batch)
         self.buffer.compact({k: decisions.data[k][nc:n] for k in source})
         self.stage_buffer.compact({k: v[ns:m] for k, v in stages.data.items()})
@@ -226,6 +245,8 @@ class Collector:
             # Native uint64 episode counters use numpy's platform ulonglong
             # spelling on macOS; reinterpret the counter bits without a copy.
             snapshot['episode_id'] = snapshot['episode_id'].view(np.int64)
+            if self.cpu_storage:
+                snapshot['episode_id'] = snapshot['episode_id'].copy()
             active = np.flatnonzero(snapshot['stage'] >= 0)
             fresh = active[snapshot['substep'][active] == 0]
             new_games = active[~self.assigned[active]]
@@ -281,10 +302,12 @@ class Collector:
                                game=tensors['episode_id'][new_t],
                                old_value=value/value.sum(dim=1, keepdim=True),
                                outcome=torch.full((len(new),), 2, dtype=torch.int8, device=live.device))
-                self.current[new_t] = self.buffer.append(columns)
+                new_storage = torch.as_tensor(new, device=self.storage_device)
+                training_storage = torch.as_tensor(training, device=self.storage_device)
+                self.current[new_storage] = self.buffer.append(columns)
                 sampled += len(new)
                 stages = {k: tensors[k].index_select(0, training_t) for k in PREFIX_FIELDS}
-                stages.update(decision=self.current[training_t],
+                stages.update(decision=self.current[training_storage],
                               choice=torch.as_tensor(choices, device=live.device)[training_t],
                               old_log_probs=result.log_probs.index_select(0, training_t).masked_fill(
                                   ~stages['mask'], -torch.inf).to(torch.float16))
@@ -296,16 +319,17 @@ class Collector:
             steps += 1
             since = perf_counter()
             done, ended, trunc, outcome = env.decision_done, env.episode_done, env.truncated, env.outcome
-            self.current[torch.as_tensor(done, device=live.device)] = -1
+            self.current[torch.as_tensor(done, device=self.storage_device)] = -1
             self.routing[done] = -1
             c = self.buffer.data
-            # Results are gathered by device env/seat columns. No host scan of decisions.
-            ended_t = torch.as_tensor(ended, device=live.device)
-            trunc_t = torch.as_tensor(trunc, device=live.device)
-            outcome_t = torch.as_tensor(outcome, device=live.device)
+            # Gather results using env/seat columns on the storage device.
+            ended_t = torch.as_tensor(ended, device=self.storage_device)
+            trunc_t = torch.as_tensor(trunc, device=self.storage_device)
+            outcome_t = torch.as_tensor(outcome, device=self.storage_device)
             envs = c['env'][:self.buffer.size]
             seats = c['seat'][:self.buffer.size].long()
-            games_t = tensors['episode_id']
+            games_t = (torch.from_numpy(snapshot['episode_id']) if self.cpu_storage
+                       else tensors['episode_id'])
             unfinished = c['outcome'][:self.buffer.size] == 2
             finished = ended_t[envs] & unfinished & (c['game'][:self.buffer.size] == games_t[envs])
             c['outcome'][:self.buffer.size][finished] = torch.where(
@@ -314,7 +338,7 @@ class Collector:
             self.assigned[ended_rows] = False
             self.opponent_seat[ended_rows] = self.opponent_policy[ended_rows] = -1
             self.routing[ended_rows] = -1
-            self.current[torch.as_tensor(ended_rows, device=live.device)] = -1
+            self.current[torch.as_tensor(ended_rows, device=self.storage_device)] = -1
             games += len(ended_rows)
             truncated += int(trunc[ended_rows].sum())
             timing['record'] += perf_counter()-since

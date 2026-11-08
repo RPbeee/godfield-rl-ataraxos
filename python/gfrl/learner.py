@@ -80,7 +80,7 @@ class Learner:
         return torch.as_tensor(array, device=self.device)
 
     def _prepare(self, batch, rows, xi=None, advantages=None, keep=None):
-        rows = torch.as_tensor(rows, device=self.device, dtype=torch.long)
+        rows = torch.as_tensor(rows, device=batch.env.device, dtype=torch.long)
         stages, owners = batch.stage_rows(rows)
         arrays = {k: batch.columns[k][rows] for k in OBS_FIELDS}
         arrays.update({k: batch.stages[k][stages] for k in PREFIX_FIELDS})
@@ -88,6 +88,14 @@ class Learner:
                       old_lp=batch.stages['old_log_probs'][stages].float())
         if xi is not None:
             arrays.update(xi=xi[rows], advantage=advantages[rows], selected=keep[rows].float())
+        if batch.env.device != self.device:
+            if self.device.type == 'cuda' and batch.env.device.type == 'cpu':
+                # Advanced indexing returns pageable tensors. Pin only this
+                # microbatch, and enqueue all copies on the current CUDA stream.
+                arrays = {k: v.pin_memory() for k, v in arrays.items()}
+                arrays = {k: v.to(self.device, non_blocking=True) for k, v in arrays.items()}
+            else:
+                arrays = {k: v.to(self.device) for k, v in arrays.items()}
         return arrays
 
     def forward(self, decisions):
@@ -136,7 +144,12 @@ class Learner:
         self.model.eval()
         order = np.random.permutation(len(decisions))
         columnar = hasattr(decisions, 'columns')
-        if columnar:
+        cpu_storage = columnar and getattr(decisions, 'cpu_storage', False)
+        if cpu_storage:
+            order = torch.as_tensor(order, device=decisions.env.device)
+            xi, advantages, keep = (torch.as_tensor(v, device=decisions.env.device)
+                                    for v in (xi, advantages, keep))
+        elif columnar:
             # Preserve the numpy permutation/RNG while transferring only 1-D indices.
             order = self._tensor(order)
             xi, advantages, keep = self._tensor(xi), self._tensor(advantages), self._tensor(keep)
@@ -145,7 +158,7 @@ class Learner:
             policy_count = max(int(keep[batch].sum()), 1)
             self.optimizer.zero_grad(set_to_none=True)
             packed = None
-            if columnar:
+            if columnar and not cpu_storage:
                 since = self._tick()
                 packed = self._prepare(decisions, batch, xi, advantages, keep)
                 timings['transfer'] += self._tick()-since
@@ -154,8 +167,15 @@ class Learner:
             # Accumulate microbatches for bounded activation memory; one Adam step per minibatch.
             for offset in range(0, len(batch), microbatch):
                 rows = batch[offset:offset+microbatch]
+                if cpu_storage:
+                    since = self._tick()
+                    inputs = self._prepare(decisions, rows, xi, advantages, keep)
+                    timings['transfer'] += self._tick()-since
                 since = self._tick()
-                if packed is not None:
+                if cpu_storage:
+                    terms, value = self.forward(inputs)
+                    advantage, selected, target = inputs['advantage'], inputs['selected'], inputs['xi']
+                elif packed is not None:
                     end = offset+len(rows)
                     stage_slice = slice(int(stage_offsets[offset]), int(stage_offsets[end]))
                     inputs = {k: v[offset:end] if k in (*OBS_FIELDS, 'xi', 'advantage', 'selected')

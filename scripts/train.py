@@ -27,6 +27,7 @@ def parse_args(argv=None):
     p.add_argument('--resume', nargs='?', const='auto')
     p.add_argument('--size', choices=['S', 'M', 'L'], default='S')
     p.add_argument('--device', choices=['cpu', 'mps', 'cuda'], default='cpu')
+    p.add_argument('--rollout-storage', choices=['device', 'cpu'], default='device')
     p.add_argument('--dtype', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     for name, default in dict(num_envs=64, threads=4, games_per_iter=128, iterations=100,
                               pool_every=10, pool_size=8, eval_every=10, eval_pairs=100,
@@ -55,6 +56,8 @@ def parse_args(argv=None):
                 'pool_size', 'eval_pairs', 'minibatch_size', 'decision_capacity', 'stage_capacity')
     if any(getattr(args, k) <= 0 for k in positive) or args.eval_every < 0:
         p.error('counts must be positive (eval_every may be zero)')
+    if args.rollout_storage not in ('device', 'cpu'):
+        p.error('rollout-storage must be device or cpu')
     if args.microbatch_size < 0:
         p.error('microbatch-size must be nonnegative (0 = automatic)')
     if not 0 <= args.pool_fraction <= 1 or args.max_hours <= 0:
@@ -114,7 +117,7 @@ def run(args):
                            map_location='cpu', weights_only=False)
         # Resume the saved experiment settings; execution length/device/path remain caller-controlled.
         runtime = {k: getattr(args, k) for k in ('iterations', 'device', 'threads', 'run_dir',
-                                                'resume', 'max_hours', 'config', 'microbatch_size',
+                                                'resume', 'max_hours', 'config', 'microbatch_size', 'rollout_storage',
                                                 'tf32', 'compile', 'compile_mode_actor', 'compile_mode_learner')}
         vars(args).update(state['config'])
         vars(args).update(runtime)
@@ -154,7 +157,7 @@ def run(args):
     collector = Collector(learner.model, num_envs=args.num_envs, threads=args.threads,
                           seed=train_seed, device=args.device, dtype=args.dtype,
                           pool_fraction=args.pool_fraction, decision_capacity=args.decision_capacity,
-                          stage_capacity=args.stage_capacity)
+                          stage_capacity=args.stage_capacity, rollout_storage=args.rollout_storage)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     (run_dir / 'config.json').write_text(json.dumps(config, indent=2)+'\n')
     last_duration = 0.
@@ -165,12 +168,17 @@ def run(args):
                             elapsed_before+perf_counter()-start)
             break
         compile_before = compiler_metrics()
+        if args.device == 'cuda':
+            torch.cuda.reset_peak_memory_stats(learner.device)
         begin = perf_counter()
         rollout = collector.collect(args.games_per_iter, pool)
         collected = perf_counter()
         iteration += 1
         metrics = learner.update(rollout.decisions, iteration)
         learned = perf_counter()
+        if args.device == 'cuda':
+            metrics.update(cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(learner.device),
+                           cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(learner.device))
         if iteration % args.pool_every == 0:
             pool.append(learner.pool_entry(iteration))
             pool = pool[-args.pool_size:]
