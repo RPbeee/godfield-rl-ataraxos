@@ -29,6 +29,7 @@ def main():
     for name, default in (('worlds', 16), ('candidates', 16), ('candidate-samples', 64), ('depth', 10),
                           ('pairs', 500), ('num-envs', 32), ('threads', 1), ('seed', 0)):
         p.add_argument('--'+name, type=int, default=default)
+    p.add_argument('--search-response', action='store_true', help='search supported ordinary response roots')
     p.add_argument('--leaf-view', choices=('actor', 'searcher'), default='actor')
     p.add_argument('--max-inference-batch', type=int, default=0,
                    help='search inference row limit (0: unsplit; start with 128 on a 10 GB GPU)')
@@ -56,7 +57,7 @@ def main():
     if not math.isfinite(args.progress_interval) or args.progress_interval < 0:
         p.error('progress-interval must be finite and nonnegative')
     try:
-        config_fields = ('worlds', 'candidates', 'candidate_samples', 'depth', 'alpha', 'beta',
+        config_fields = ('search_response', 'worlds', 'candidates', 'candidate_samples', 'depth', 'alpha', 'beta',
                          'select', 'leaf_view', 'max_inference_batch', 'skip_forced_inference',
                          'skip_single_candidate', 'search_cache_device', 'search_cache_mb', 'root_batch_size')
         config = SearchConfig(**{k: getattr(args, k) for k in config_fields})

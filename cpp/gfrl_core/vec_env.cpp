@@ -324,7 +324,23 @@ std::array<std::int32_t,297> unused_assignment(const gf::Match& m, int searcher,
     for(const auto& item:m.snapshot().state.players[1-searcher].items)if(item.used) {
         ++used;auto& c=counts[card_code(item.model)];c=std::max(0,c-1);
     }
-    std::uint64_t physical=used;
+    // The launch anchor also retains public selected cards: consumed weapons
+    // are absent now, but still occupy physical slots before replay.
+    std::size_t retained=used;
+    const auto& snap=m.snapshot();
+    if(snap.phase==gf::MatchPhase::response && snap.batch) {
+        const auto& b=*snap.batch;
+        const auto& opponent=snap.state.players[1-searcher];
+        retained=0;
+        for(const auto& item:b.initial_state.players[1-searcher].items) {
+            bool selected=b.attack.actor==opponent.id &&
+                std::find(b.attack.items.begin(),b.attack.items.end(),item.token)!=b.attack.items.end();
+            for(const auto& command:b.responses)if(command.actor==opponent.id &&
+                std::find(command.items.begin(),command.items.end(),item.token)!=command.items.end())selected=true;
+            retained+=item.used || selected;
+        }
+    }
+    std::uint64_t physical=retained;
     for(auto c:counts)physical+=c;
     if(physical>m.snapshot().config.hand_limit)throw std::invalid_argument("assignment plus retained used cards exceeds capacity");
     return counts;
@@ -362,19 +378,7 @@ void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
             const auto counts=gfrl::unused_assignment(root.match,seat,assignments.subspan(i*297,297));
             std::vector<gf::CardId> models;
             for(const auto& card:gf::catalog())for(int j=0;j<counts[card_code(card.id)];++j)models.push_back(card.id);
-            e.match=root.match.determinized(id,models,seeds[i]);
-            // Canonicalize fresh physical IDs as well: a source already produced by
-            // determinized() must not carry its discarded hidden allocator into worlds.
-            auto canonical=e.match.snapshot();
-            gf::ItemToken next=1;
-            for(int p=0;p<2;++p)for(const auto& item:canonical.state.players[p].items)
-                if(p==seat || item.used)next=std::max(next,item.token+1);
-            next=std::max({next,canonical.dream_rolls,canonical.redrawn_items});
-            if(canonical.last_tick && canonical.last_tick->revival_token)
-                next=std::max(next,*canonical.last_tick->revival_token+1);
-            for(auto& item:canonical.state.players[1-seat].items)if(!item.used)item.token=next++;
-            canonical.next_token=next;
-            e.match.restore(canonical);
+            e.match=root.match.determinized(id,models,seeds[i],true);
         } catch(const std::invalid_argument&) {continue;}
           catch(const gf::MatchError& error) {if(error.code==gf::MatchErrorCode::invalid)continue;throw;}
         e.history[seat]=root.history[seat];e.history[1-seat]=root.history[seat].projected();

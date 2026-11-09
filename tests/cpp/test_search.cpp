@@ -103,6 +103,70 @@ void worlds() {
     check(root.substep[0]>0 && root.determinize_support(row)[0]==-1,"partial decision accepted");
     a.load_worlds(root,row,assignment,seed);check(a.world_status[0]==2 && a.episode_done[0],"unsupported root moved");
 }
+void response_worlds() {
+    auto m=scene({6,7,235},{8,8,120});
+    auto root=projection_root(),other=projection_root();TestAccess::inject(root,m);
+    TestAccess::accept(root,{0,gf::CommandKind::play,{100},1});TestAccess::drive(root);
+    check(root.match(0).snapshot().phase==gf::MatchPhase::response,"response fixture");
+    check(root.determinize_support(row)[0]==0,"response unsupported");
+    // Inflate the hidden allocator, hand, and RNG while keeping the public root.
+    TestAccess::inject(other,root.match(0).determinized(1,std::array<gf::CardId,2>{19,20},987));
+    TestAccess::copy_searcher(other,root,1);
+    std::array<std::int32_t,297> truth{},sample{};
+    for(const auto& item:root.match(0).snapshot().state.players[0].items)++truth[card_code(item.model)];
+    sample[card_code(6)]=2;
+    const std::array<std::uint64_t,1> seeds{42};SearchEnv a(1,1),b(1,1),c(1,1);
+    a.load_worlds(root,row,truth,seeds);b.load_worlds(other,row,truth,seeds);c.load_worlds(root,row,sample,seeds);
+    check(a.world_status[0]==0 && b.world_status[0]==0 && c.world_status[0]==0,"response load failed");
+    obs_equal(root,a);obs_equal(root,b);obs_equal(root,c);equal(root.mask,a.mask);
+    check(a.match(0).snapshot()==b.match(0).snapshot(),"response hidden source/allocator leaked");
+    auto strip=[](gf::MatchSnapshot s) {
+        for(auto& item:s.state.players[0].items)if(!item.used)item.model=6;
+        for(auto& item:s.batch->initial_state.players[0].items)
+            if(!item.used && item.token!=100)item.model=6;
+        return s;
+    };
+    check(strip(a.match(0).snapshot())==strip(c.match(0).snapshot()),"response assignment leaked beyond unused models");
+    const auto& snap=a.match(0).snapshot();
+    check(snap.rng==42 && snap.batch->rng==42 && snap.queue.front().redirect_rng==42,"response RNG not reset");
+    check(TestAccess::chance(a)!=TestAccess::chance(root),"response chance copied");
+    auto bad=sample;bad[card_code(6)]=18;bool rejected=false;
+    try{(void)root.unused_assignment(0,bad);}catch(const std::invalid_argument&){rejected=true;}
+    check(rejected,"consumed launch weapon omitted from capacity");
+    a.load_worlds(root,row,bad,seeds);check(a.world_status[0]==1,"oversized response anchor loaded");
+}
+void response_conversion() {
+    gf::CardId sword=0;
+    for(const auto& card:gf::catalog())if(std::string_view(card.image_name)=="reflection-sword")sword=card.id;
+    check(sword!=0,"reflection fixture missing");
+    for(int variant=0;variant<3;++variant) {
+        auto m=variant==2 ? scene({6,sword,235},{sword,120}) : scene({gf::CardId(variant ? 235 : 6),7,235},{120,42});
+        auto root=projection_root();TestAccess::inject(root,m);
+        TestAccess::accept(root,{0,gf::CommandKind::play,{100},1});
+        if(variant==2) {
+            TestAccess::accept(root,{1,gf::CommandKind::defend,{200},{}});
+            TestAccess::accept(root,{0,gf::CommandKind::defend,{101},{}});
+        }
+        TestAccess::drive(root);
+        check(root.match(0).snapshot().phase==gf::MatchPhase::response && root.determinize_support(row)[0]==0,"conversion response unsupported");
+        std::array<std::int32_t,297> assignment{},unused{};
+        for(const auto& item:root.match(0).snapshot().state.players[0].items) {
+            ++assignment[card_code(item.model)];
+            if(!item.used)++unused[card_code(item.model)];
+        }
+        check(root.unused_assignment(0,assignment)==unused,"response used miracle subtraction");
+        SearchEnv world(1,1);const std::array<std::uint64_t,1> seed{42};
+        world.load_worlds(root,row,assignment,seed);
+        check(world.world_status[0]==0,"reflection/miracle world rejected");obs_equal(root,world);
+        check(world.match(0).snapshot().batch->responses.size()==(variant==2 ? 2 : 0),"response journal changed");
+        assignment.fill(0);assignment[card_code(6)]=variant==2 ? 16 : 17;
+        (void)root.unused_assignment(0,assignment);
+        world.load_worlds(root,row,assignment,seed);check(world.world_status[0]==0,"max anchor capacity rejected");
+        ++assignment[card_code(6)];bool rejected=false;
+        try{(void)root.unused_assignment(0,assignment);}catch(const std::invalid_argument&){rejected=true;}
+        check(rejected,"launch/response selected items not counted exactly once");
+    }
+}
 void private_history() {
     gf::CardId cure=0;
     for(const auto& card:gf::catalog())if(card.ability==gf::Ability::remove_all_curses && gf::match_supported(card.id)){cure=card.id;break;}
@@ -220,6 +284,9 @@ void measurement(bool evaluation=false) {
                     if(!item.used)++loaded_unused[card_code(item.model)];
                 check(loaded_unused==unused,"loaded oracle world differs from true unused hand");
                 const auto t=env.tokens;
+                check(std::memcmp(env.obs_type.data()+i*t,worlds.obs_type.data()+i*t,t)==0,"root types changed");
+                check(std::memcmp(env.obs_valid.data()+i*t,worlds.obs_valid.data()+i*t,t)==0,"root validity changed");
+                check(std::memcmp(env.obs_aux_card.data()+i*t,worlds.obs_aux_card.data()+i*t,t*sizeof(std::int16_t))==0,"root aux changed");
                 check(std::memcmp(env.obs_num.data()+i*t*F,worlds.obs_num.data()+i*t*F,t*F*sizeof(float))==0,"self-play root numeric observation changed");
                 check(std::memcmp(env.obs_cat.data()+i*t*C,worlds.obs_cat.data()+i*t*C,t*C)==0,"self-play root categorical observation changed");
                 check(std::memcmp(env.obs_cards.data()+i*t*8,worlds.obs_cards.data()+i*t*8,t*8*sizeof(std::int16_t))==0,"self-play root cards changed");
@@ -235,4 +302,4 @@ void measurement(bool evaluation=false) {
     std::cout<<"varied self-play worlds="<<loaded<<"\n";
     std::cout<<"used-card measurement: positions="<<positions<<" with_used="<<with_used<<" fraction="<<double(with_used)/positions<<" mean="<<double(used)/positions<<" conditional_mean="<<double(used)/with_used<<"\n";
 }
-int main(){try{worlds();private_history();conversion();projection();tracking_disabled();measurement();measurement(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{worlds();response_worlds();response_conversion();private_history();conversion();projection();tracking_disabled();measurement();measurement(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -26,7 +26,7 @@ from gfrl import VecEnv
 from gfrl.actor import Actor
 from gfrl.evaluation import _policy_rng, load_policy_model
 from gfrl.runtime import configure_precision
-from gfrl.search import SearchAgent, SearchConfig, load_search_belief
+from gfrl.search import SearchAgent, SearchConfig, search_support, load_search_belief
 
 
 def mean(xs):
@@ -110,6 +110,7 @@ def main():
     p.add_argument('--worlds', type=int, nargs='+', default=[16])
     p.add_argument('--depth', type=int, nargs='+', default=[10])
     p.add_argument('--beta', type=float, nargs='+', default=[.02])
+    p.add_argument('--search-response', action='store_true', help='search supported ordinary response roots')
     p.add_argument('--leaf-view', choices=('actor', 'searcher'), default='actor')
     p.add_argument('--max-inference-batch', type=int, default=0,
                    help='search inference row limit (0: unsplit; start with 128 on a 10 GB GPU)')
@@ -126,7 +127,7 @@ def main():
     if min(args.roots, args.num_envs, args.threads) <= 0 or args.repeats < 2 or min(args.seed, args.warmup) < 0:
         p.error('positive roots/num-envs/threads, repeats >= 2, nonnegative seed/warmup required')
     try:
-        configs = [SearchConfig(worlds=w, depth=d, beta=b, alpha=args.alpha, candidates=args.candidates,
+        configs = [SearchConfig(search_response=args.search_response, worlds=w, depth=d, beta=b, alpha=args.alpha, candidates=args.candidates,
                                 candidate_samples=args.candidate_samples, leaf_view=args.leaf_view,
                                 max_inference_batch=args.max_inference_batch) for w, d, b in product(args.worlds, args.depth, args.beta)]
     except ValueError as exc:
@@ -151,7 +152,7 @@ def main():
                 raise RuntimeError('evaluation exhausted before enough supported roots')
             active = np.flatnonzero(env.stage >= 0)
             fresh = active[env.substep[active] == 0].astype(np.int32)
-            eligible = fresh[env.determinize_support(fresh) == 0] if stages >= args.warmup else fresh[:0]
+            eligible = fresh[search_support(env, fresh, args.search_response) == 0] if stages >= args.warmup else fresh[:0]
             rows = eligible[:args.roots-collected]
             if len(rows):
                 locations.extend(dict(root=collected+i, game=int(env.episode_id[r]), row=int(r), stage_step=stages)

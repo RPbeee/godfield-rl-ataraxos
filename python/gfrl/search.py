@@ -39,6 +39,7 @@ class SearchConfig:
     search_cache_device: str = 'auto'
     search_cache_mb: int = 256
     root_batch_size: int = 0  # distribution preserving; changes RNG ordering
+    search_response: bool = False
 
     def __post_init__(self):
         if min(self.worlds, self.candidates, self.candidate_samples, self.max_attempts) <= 0 or self.depth < 0:
@@ -94,7 +95,22 @@ def load_search_belief(spec, fit=None, device='cpu'):
 
 _SUPPORT = {-1: 'inside_decision', 1: 'invalid_viewer', 2: 'unsupported_players',
             3: 'not_main', 4: 'not_actor', 5: 'pending_work', 6: 'reserved_gifts',
-            7: 'replay_proof', 8: 'hidden_status', 9: 'hidden_confusion', 10: 'hidden_own_model'}
+            7: 'replay_proof', 8: 'hidden_status', 9: 'hidden_confusion', 10: 'hidden_own_model',
+            11: 'response_special', 12: 'response_random', 13: 'response_history'}
+
+
+def response_roots(env, rows):
+    """Public CLS phase (MatchPhase::response + 1), never hidden state."""
+    phase = env.obs_schema()['cat']['phase']['index']
+    return env.obs_cat[np.asarray(rows, np.int32), 0, phase] == 2
+
+
+def search_support(env, rows, search_response=False):
+    """Preserve the original main-only reason precedence when disabled."""
+    support = env.determinize_support(rows).copy()
+    if not search_response:
+        support[response_roots(env, rows) & (support != -1)] = 3  # historically not_main
+    return support
 
 
 class _SearchActor(Actor):
@@ -199,7 +215,8 @@ class SearchAgent:
         self.num_threads = num_threads
         self.actor = Actor(model, VecEnv(1, 1, eval_pairs=0), device)
         self.counts = Counter({k: 0 for k in (
-            'decisions', 'searched', 'selected', 'invalid_samples', 'resamples',
+            'decisions', 'searched', 'searched_main', 'searched_response', 'skip_response_disabled',
+            'selected', 'invalid_samples', 'resamples',
             'search_calls', 'search_batches', 'rollout_roots', 'rollout_worlds',
             'singleton_roots', 'singleton_validated_worlds', 'forced_inference_rows_skipped',
             'candidate_paths', 'batch_roots', 'max_batch_roots',
@@ -220,6 +237,9 @@ class SearchAgent:
         n = self.counts['searched']
         decisions = self.counts['decisions']
         return dict(counts=dict(self.counts), searched_fraction=n/decisions if decisions else 0,
+                    seconds_per_search_by_root={kind: self.seconds['total_'+kind]/self.counts['searched_'+kind]
+                                              if self.counts['searched_'+kind] else 0
+                                              for kind in ('main', 'response')},
                     seconds=dict(self.seconds), seconds_per_search={k: v/n if n else 0 for k, v in self.seconds.items()},
                     seconds_per_call={k: v/self.counts['search_calls'] if self.counts['search_calls'] else 0
                                       for k, v in self.seconds.items()},
@@ -345,7 +365,32 @@ class SearchAgent:
         return result
 
     @torch.inference_mode()
-    def search(self, src, roots, *, fixed_candidates=None, policy_paths=None, report_values=False):
+    def search(self, src, roots, **kwargs):
+        """Search enabled roots and measure each public root kind separately.
+
+        Main-only batches retain their original order and random draws.
+        Response substeps together complete one external policy decision.
+        """
+        roots = np.asarray(roots, np.int32)
+        roots = roots[search_support(src, roots, self.config.search_response) == 0]
+        response = response_roots(src, roots)
+        selected, reports, candidates, policies = {}, [], {}, {}
+        for kind, take in (('main', ~response), ('response', response)):
+            rows = roots[take]
+            if not len(rows):
+                continue
+            start = self._time()
+            selected.update(self._search(src, rows, **kwargs))
+            self.seconds['total_'+kind] += self._time()-start
+            self.counts['searched_'+kind] += len(rows)
+            reports.extend(self.last_search)
+            candidates.update(self.last_candidates)
+            policies.update(self.last_policy_paths)
+        self.last_search, self.last_candidates, self.last_policy_paths = reports, candidates, policies
+        return selected
+
+    @torch.inference_mode()
+    def _search(self, src, roots, *, fixed_candidates=None, policy_paths=None, report_values=False):
         """Search supported roots; return row -> full external-choice path.
 
         For repeated q measurements, pass last_candidates as fixed_candidates
@@ -359,7 +404,7 @@ class SearchAgent:
         if c.root_batch_size and len(roots) > c.root_batch_size:
             selected, reports, candidates, policies = {}, [], {}, {}
             for lo in range(0, len(roots), c.root_batch_size):
-                selected.update(self.search(src, roots[lo:lo+c.root_batch_size],
+                selected.update(self._search(src, roots[lo:lo+c.root_batch_size],
                                             fixed_candidates=fixed_candidates, policy_paths=policy_paths,
                                             report_values=report_values))
                 reports.extend(self.last_search)
@@ -552,7 +597,9 @@ class SearchAgent:
                 self.counts['real_mismatches'] += 1
             self.pending.pop(int(r), None)
         if len(fresh):
-            support = env.determinize_support(fresh)
+            support = search_support(env, fresh, self.config.search_response)
+            if not self.config.search_response:
+                self.counts['skip_response_disabled'] += int(response_roots(env, fresh).sum())
             for reason in support[support != 0]:
                 self.counts['skip_'+_SUPPORT.get(int(reason), str(reason))] += 1
             roots = fresh[support == 0]

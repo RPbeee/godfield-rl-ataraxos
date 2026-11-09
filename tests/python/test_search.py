@@ -527,6 +527,13 @@ def test_exact_pre_task_games_and_reports(cache):
     assert actions == case['actions']
     assert json.dumps(reports, sort_keys=True) == json.dumps(case['reports'], sort_keys=True)
     assert json.loads(json.dumps(summarize(env.eval_results()))) == case['summary']
+    # Frozen from HEAD parent + original (pre-response) goodfield in an isolated
+    # build. Preserve every existing counter; new counters are additive.
+    expected_counts = json.loads((Path(__file__).parent/'fixtures/search_counts_before.json').read_text())
+    assert {k: agent.counts[k] for k in expected_counts} == expected_counts
+    assert agent.counts['skip_response_disabled'] == expected_counts['skip_not_main']
+    assert agent.counts['searched_main'] == expected_counts['searched']
+    assert agent.counts['searched_response'] == 0
 
 
 @pytest.mark.parametrize('cap', [0, 5])
@@ -669,3 +676,91 @@ def test_device_cache_budget_selection(monkeypatch):
     assert actor._cache_location(encoded).type == 'cuda'
     actor.cache_device = 'host'
     assert actor._cache_location(encoded).type == 'cpu'
+
+
+def response_scene():
+    from gfrl.search import response_roots
+    env = VecEnv(16, 1, 741, track_projection=True)
+    rng = np.random.default_rng(51)
+    for _ in range(1000):
+        fresh = np.flatnonzero((env.stage >= 0) & (env.substep == 0)).astype(np.int32)
+        roots = fresh[(env.determinize_support(fresh) == 0) & response_roots(env, fresh) & (env.mask[fresh].sum(1) >= 3)]
+        if len(roots):
+            return env, roots[:1]
+        env.step(np.array([rng.choice(np.flatnonzero(m)) for m in env.mask], np.int32))
+    pytest.fail('no response fixture')
+
+
+@pytest.mark.parametrize('belief_kind', ['uniform', 'oracle', 'autoregressive', 'independent'])
+@pytest.mark.parametrize('cap', [0, 3])
+def test_response_search_observation_paths_and_depth(belief_kind, cap):
+    env, roots = response_scene()
+    if belief_kind in ('uniform', 'oracle'):
+        belief = load_search_belief(belief_kind)
+    else:
+        cls = Belief if belief_kind == 'autoregressive' else IndependentBelief
+        torch.manual_seed(34)
+        belief = cls(ModelConfig(d=16, heads=2, depth=1, ff=32), BeliefConfig(depth=1, heads=2)).eval()
+    config = SearchConfig(search_response=True, worlds=3, candidates=8, candidate_samples=32,
+                          depth=0, max_inference_batch=cap, skip_forced_inference=True)
+    agent = SearchAgent(model(), belief, config=config, seed=421)
+    with _policy_rng(42, (agent,)):
+        rr, assignments, seeds = agent._sample_worlds(env, roots)
+        world, status = agent._world_env(env, rr, assignments, seeds, 1)
+        assert not status.any() and len(rr) == 3
+        for key in OBS_FIELDS:
+            np.testing.assert_array_equal(getattr(world, key), getattr(env, key)[rr])
+        if belief_kind == 'oracle':
+            np.testing.assert_array_equal(world.label_opp_hand, assignments)
+        paths = agent.search(env, roots, report_values=True)
+    assert set(paths) == set(roots)
+    assert agent.counts['searched_main'] == 0 and agent.counts['searched_response'] == 1
+    assert agent.counts['invalid_loads'] == 0
+    # The ordinary path represents every externally selected response substep.
+    assert any(len(c['path']) > 1 for r in agent.last_search for c in r['candidates'])
+    stopped = agent._workspaces['rollout'][1]
+    assert np.all(stopped.decisions == 1)  # root response is exactly one decision
+    assert agent.counts['depth_leaves'] + agent.counts['terminal_leaves'] > 0
+    row = int(roots[0])
+    for choice in paths[row]:
+        assert env.mask[row, choice]
+        choices = env.mask.argmax(1).astype(np.int32)
+        choices[row] = choice
+        env.step(choices)
+    assert env.decision_done[row]
+
+
+def test_response_disabled_preserves_old_reason_and_rng():
+    from gfrl.search import search_support
+    env, roots = response_scene()
+    agent = SearchAgent(model(), baseline(), seed=421)
+    state = agent.rng.bit_generator.state
+    assert np.all(search_support(env, roots) == 3)
+    assert agent.search(env, roots) == {}
+    assert agent.rng.bit_generator.state == state
+    with _policy_rng(42, (agent,)):
+        choices = agent(env, roots)
+    assert env.mask[roots, choices[roots]].all()
+    assert agent.rng.bit_generator.state == state
+    assert agent.counts['skip_response_disabled'] == agent.counts['skip_not_main'] == 1
+    assert agent.counts['searched'] == 0
+
+
+@pytest.mark.parametrize('belief_kind', ['oracle', 'autoregressive'])
+def test_response_paired_games_complete(belief_kind):
+    if belief_kind == 'oracle':
+        belief = load_search_belief('oracle')
+    else:
+        torch.manual_seed(34)
+        belief = Belief(ModelConfig(d=16, heads=2, depth=1, ff=32), BeliefConfig(depth=1, heads=2)).eval()
+    agent = SearchAgent(model(), belief, config=SearchConfig(search_response=True, worlds=2,
+        candidates=3, candidate_samples=8, depth=3, skip_forced_inference=True,
+        skip_single_candidate=True), seed=221)
+    opponent = Actor(model(), VecEnv(1, 1, eval_pairs=0), 'cpu')
+    result = evaluate_policies(agent, opponent, 3, 4, 1, 98, track_projection=True)
+    assert result['games'] == 6
+    assert agent.counts['searched_main'] > 0 and agent.counts['searched_response'] > 0
+    assert agent.counts['searched'] == agent.counts['searched_main'] + agent.counts['searched_response']
+    assert agent.counts['real_mismatches'] == agent.counts['invalid_loads'] == 0
+    assert agent.counts['invalid_oracle_assignments'] == 0
+    assert agent.statistics()['seconds_per_search_by_root']['response'] > 0

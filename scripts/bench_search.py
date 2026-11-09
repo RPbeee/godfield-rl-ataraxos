@@ -56,6 +56,7 @@ def micro(args, argv):
     p.add_argument('--depth', type=int, default=3)
     p.add_argument('--candidates', type=int, default=16)
     p.add_argument('--candidate-samples', type=int, default=64)
+    p.add_argument('--search-response', action='store_true')
     p.add_argument('--max-inference-batch', type=int, default=8192)
     p.add_argument('--search-cache-mb', type=int, default=256)
     p.add_argument('--root-batch-size', type=int, default=0)
@@ -77,7 +78,7 @@ def micro(args, argv):
         # Oversample live rows, then take supported boundaries from one snapshot.
         for _ in range(1000):
             rows = np.flatnonzero((env.stage >= 0) & (env.substep == 0)).astype(np.int32)
-            roots = rows[env.determinize_support(rows) == 0]
+            roots = rows[current.search_support(env, rows, a.search_response) == 0]
             if len(roots) and (not a.roots or len(roots) >= a.roots):
                 roots = roots[:a.roots] if a.roots else roots
                 break
@@ -86,7 +87,7 @@ def micro(args, argv):
             raise RuntimeError('could not collect requested simultaneous supported roots; use --root-steps 0')
     before = load('bench_old_search', args.baseline_dir/'search.py')
     before.Actor = load('bench_old_actor', args.baseline_dir/'actor.py').Actor
-    config = current.SearchConfig(worlds=a.worlds, depth=a.depth, candidates=a.candidates,
+    config = current.SearchConfig(search_response=a.search_response, worlds=a.worlds, depth=a.depth, candidates=a.candidates,
         candidate_samples=a.candidate_samples, beta=.1, max_inference_batch=a.max_inference_batch,
         search_cache_mb=a.search_cache_mb)
     variants = [

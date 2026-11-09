@@ -4,8 +4,9 @@
 selection, automatic resolution, encoding and persistent workers with VecEnv;
 there is no second rollout engine. The mode changes lifecycle (load instead of
 reset, persistent terminal results, depth limits), while the existing training
-and evaluation paths retain their observations, labels and decisions. No
-changes to goodfield are needed. Leaf buffers are allocated on first `observe`,
+and evaluation paths retain their observations, labels and decisions. Token
+normalization uses goodfield’s optional `determinized(..., normalize_tokens=true)`
+so response replay anchors remain valid. Leaf buffers are allocated on first `observe`,
 so training environments do not allocate a second observation batch.
 
 ## Python interface
@@ -42,7 +43,11 @@ Malformed shapes/indices are batch errors, checked before modifying rows.
 by loading. Counts must be nonnegative, padding code 0 absent, total at most
 hand_limit, and every supplied model in the configured gift catalog. For each
 public opponent used model, subtract one copy, clamping at zero. Retained used
-cards plus the resulting unused cards must also fit hand_limit. Codes are
+cards plus the resulting unused cards must also fit hand_limit. At response roots,
+the launch inventory must fit too: count anchor used items and all public
+launch/response selected items once, including weapons already consumed in the
+current state. Newly used miracles are subtracted from the current label and
+retained by replay; they must not be appended a second time. Codes are
 inverted by iterating `gf::catalog()` and applying `card_code`, not by assuming
 CardId equals card code. Conversion does not read unused opponent items.
 
@@ -84,14 +89,61 @@ CPU paired smoke (S policy, same seed and search budgets for both beliefs):
   --out runs/oracle-diagnostic-smoke/b1.json
 ```
 
-The match is produced by `Match::determinized`. Fresh opponent tokens and
-`next_token` are then normalized using retained own/used tokens and the engine's
-accounting bounds (Dream/redraw counters and a retained tick revival token),
-followed by `restore` validation. This prevents a source already created with
-`determinized` from carrying its discarded unused-token allocator into the new
-world. Own slots and used objects are unchanged. Chance RNG is SplitMix64 of
-`seed ^ 0xa4093822299f31d0`; Match RNG uses `seed` directly. No source RNG or row
-index enters either stream; equal seeds intentionally reproduce equal streams.
+The match is produced by `Match::determinized(..., normalize_tokens=true)`.
+Normalization happens after discarding hidden unused items and before appending
+sampled items or replaying the response journal. The first fresh token is the
+maximum of 1, every retained token + 1, Dream/redraw accounting bounds, and any
+retained tick revival token + 1. In a response this includes the searcher's
+launch inventory and public selected opponent items; their IDs still occur in
+commands and must survive. Sorted sampled unused items receive consecutive IDs.
+Replaying the launch and reflection journal creates both current and anchor
+inventories and allocator copies consistently, then `restore` validates them.
+The optional engine argument defaults false, preserving the engine's existing
+API behavior. Doing this inside `determinized` avoids post-hoc editing of a
+replay proof and also avoids allocation from a discarded source `next_token`.
+Own slots and used objects are unchanged. Chance RNG is SplitMix64 of
+`seed ^ 0xa4093822299f31d0`; Match RNG and the response anchor/redirect RNG use
+`seed` directly. No source RNG or row index enters either stream.
+
+### Opt-in response roots
+
+`SearchConfig.search_response=False` (CLI default) keeps main-only search.
+`--search-response` enables supported ordinary responses to the opponent's
+`play`; goodfield reasons 11–13 are `response_special`, `response_random`, and
+`response_history`. Eligibility reads only the public CLS phase and support.
+Disabled responses keep the old `skip_not_main` precedence and count, including
+responses which the extended engine now rejects under a more specific reason.
+The additional `skip_response_disabled` counts those same disabled responses;
+it is a subset of `skip_not_main`, not another disjoint skip category. With the
+flag enabled, `skip_not_main` decreases because responses are searched or get
+the engine's specific rejection reason instead.
+
+Candidates still come from the current decision's policy, using complete paths
+of externally selected choices. A defense can span multiple substeps; completing
+all of them counts as **one** decision, exactly as a main action does. Worlds
+run to `depth + 1` completed external decisions including the root. Automatic
+work is not counted. Rollouts, actor-relative leaves and the search distribution
+are shared by both kinds. Belief sees the current response observation; its
+training label includes all current physical opposing items, including used
+miracles, and excludes consumed weapons. `unused_assignment` converts this to
+the current unused hand, while replay restores public selected cards only in
+the anchor. Oracle follows precisely the same conversion and validation.
+
+`searched_main` / `searched_response` count root searches (also for direct
+`search` diagnostics). Under normal agent evaluation their sum is `searched`.
+`seconds_per_search_by_root` reports wall seconds per root, including sampling,
+candidates, rollouts and leaves. Mixed batches run main then response groups,
+so each timing is measured independently; grouping changes RNG order only when
+response search is enabled. Within a kind, root batching keeps its usual rules.
+These are amortized batched costs, not serial single-root latency.
+
+Tests cover all six OBS_FIELDS at varied main and response roots, oracle labels
+and physical unused hands, anchor capacity, full snapshot equality across hidden
+source hands/allocators, and equal-size oracle vs sampled hands differing only
+in unused models. Engine tests validate normalized snapshots by `restore` and
+check seeded current/anchor RNG. The frozen `search_exact_before.json` remains
+unchanged and checks bit-exact main-only candidates, q, probabilities, choices
+and game results.
 
 `decisions` counts only completed decisions involving an external policy stage,
 including the root decision; automatic/chance decisions do not count.
@@ -268,3 +320,30 @@ candidates, values and selected paths with unsplit inference. Floating point
 roundoff can still depend on batch size/device. Start with 128 rows on a 10 GB
 GPU and reduce to 64 if other jobs leave less available memory; GPU memory and
 throughput require measurement on the target machine.
+
+### Response integration validation (2026-11-09)
+
+Release parent CTest: 17/17; standalone goodfield CTest: 165/165.
+Python: 170 passed, 1 skipped (existing NumPy read-only warning).
+An isolated pre-response engine build also reproduced the frozen exact trace
+and all original integer counters; `search_counts_before.json` retains those
+counters alongside the unchanged action/value fixture.
+
+CPU paired smoke used `runs/m4-s-ppo-v1/checkpoint.pt` (S, d128, four layers)
+and `runs/belief-b2-smoke/autoregressive/checkpoint.pt`, policy opponent,
+seed 20261111, 3 pairs, four environments, one thread, M64/D3, 16 candidates,
+64 candidate samples, alpha .002, beta .1, actor leaves, max inference batch
+8192, cache auto/8192 MiB, skip-forced-inference and skip-single-candidate.
+Only `--search-response` differs between the two runs.
+
+| Response roots | Games | Main searches | Response searches | Main s/root | Response s/root | Mismatches | Invalid loads |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| disabled | 6 | 84 | 0 | 1.8173 | — | 0 | 0 |
+| enabled | 6 | 64 | 26 | 1.6181 | 1.5304 | 0 | 0 |
+
+Total elapsed: 153.61 s disabled, 144.10 s enabled. These runs executed
+concurrently on the same CPU host, so timings include contention and are not
+a speed comparison. AR invalid samples were rejected/resampled (16,195 / 13,930);
+no invalid world reached rollout. Reports are in
+`runs/response-search-smoke/{disabled,enabled}.json` with exact CLI arguments,
+phase timings and counters. The small game sample is a completion check only.
