@@ -104,7 +104,8 @@ def markdown(results):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', required=True)
-    p.add_argument('--belief', required=True)
+    p.add_argument('--belief', required=True,
+                   help='checkpoint path, b1, uniform, or oracle (evaluation-only diagnostic; cheats using true opponent hands)')
     p.add_argument('--fit')
     p.add_argument('--worlds', type=int, nargs='+', default=[16])
     p.add_argument('--depth', type=int, nargs='+', default=[10])
@@ -189,7 +190,8 @@ def main():
         results.append(dict(config=asdict(config), metrics=result, multi_candidate_roots=len(multi),
                             multi_candidate_metrics=metrics(multi), seconds=float(elapsed[ci]),
                             phase_seconds=dict(agent.seconds), counts=dict(agent.counts), roots=data[ci]))
-    report = dict(arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+    report = dict(belief=args.belief, diagnostic_only=args.belief == 'oracle',
+                  arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   definitions=__doc__, root_locations=locations, results=results, elapsed_seconds=perf_counter()-start)
     md = markdown(results)
     args.out.parent.mkdir(parents=True, exist_ok=True)

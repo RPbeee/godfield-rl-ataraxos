@@ -1,5 +1,7 @@
 """Batched information-set search. Only public observations enter inference.
 
+OracleBelief is an evaluation-only diagnostic that cheats on root hands.
+
 Candidate paths contain externally selected choices (forced singleton stages are
 handled by the engine). Random rollout actions and belief draws use an isolated
 Torch stream seeded from this agent's NumPy RNG. Real-play fallback is pi_theta.
@@ -61,7 +63,14 @@ def search_distribution(q, log_rho, log_pi, alpha=.002, beta=.02):
     return weights/weights.sum()
 
 
+@dataclass(frozen=True)
+class OracleBelief:
+    """Evaluation-only diagnostic: use privileged root hand labels, not inference."""
+
+
 def load_search_belief(spec, fit=None, device='cpu'):
+    if spec == 'oracle':
+        return OracleBelief()
     if spec == 'b1':
         if fit is None:
             raise ValueError('--fit is required for b1')
@@ -164,7 +173,7 @@ class SearchAgent:
         self.actor = Actor(model, VecEnv(1, 1, eval_pairs=0), device)
         self.counts = Counter({k: 0 for k in (
             'decisions', 'searched', 'selected', 'invalid_samples', 'resamples',
-            'exhausted_worlds', 'invalid_loads', 'invalid_candidate_worlds',
+            'exhausted_worlds', 'invalid_loads', 'invalid_candidate_worlds', 'invalid_oracle_assignments',
             'real_mismatches', 'policy_disagreements', 'fallback_no_candidates',
             'depth_leaves', 'depth_leaves_searcher', 'depth_leaves_opponent', 'terminal_leaves')})
         self.seconds = Counter()
@@ -248,15 +257,20 @@ class SearchAgent:
 
     def _sample_worlds(self, src, roots):
         c = self.config
+        oracle = isinstance(self.belief, OracleBelief)
         rr = np.repeat(roots, c.worlds).astype(np.int32)
         assignments = np.zeros((len(rr), 297), np.int32)
         valid = np.zeros(len(rr), bool)
         attempts = np.zeros(len(rr), int)
         while True:
-            todo = np.flatnonzero(~valid & (attempts < c.max_attempts))
+            todo = np.flatnonzero(~valid & (attempts < (1 if oracle else c.max_attempts)))
             if not len(todo):
                 break
-            if isinstance(self.belief, Baseline):
+            if oracle:
+                # Includes public used cards, exactly like the training label.
+                # Keep the same validation and load conversion as sampled beliefs.
+                samples = src.label_opp_hand[rr[todo]].astype(np.int32)
+            elif isinstance(self.belief, Baseline):
                 pn, pk = self.belief.count_probs.numpy(), self.belief.card_probs.numpy()
                 samples = np.array([self.rng.multinomial(self.rng.choice(19, p=pn), pk) for _ in todo], np.int32)
             else:
@@ -267,6 +281,8 @@ class SearchAgent:
                     src.unused_assignment(int(rr[i]), sample)
                 except ValueError:
                     self.counts['invalid_samples'] += 1
+                    if oracle:
+                        self.counts['invalid_oracle_assignments'] += 1
                     continue
                 assignments[i] = sample
                 valid[i] = True

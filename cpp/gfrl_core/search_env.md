@@ -46,6 +46,44 @@ cards plus the resulting unused cards must also fit hand_limit. Codes are
 inverted by iterating `gf::catalog()` and applying `card_code`, not by assuming
 CardId equals card code. Conversion does not read unused opponent items.
 
+### Oracle diagnostic (evaluation only)
+
+`load_search_belief('oracle')`, `eval_search.py --belief oracle`, and
+`search_noise.py --belief oracle` deliberately cheat to diagnose belief error.
+They copy the root actor's privileged `label_opp_hand` (297 counts, including
+public used cards) to every sampled world. Labels and `label_opp_hand_count`
+are already populated by `encode_observation` for both training and evaluation;
+no C++ runtime or policy input change is required. The usual `unused_assignment`
+validation and `load_worlds` conversion subtract public used cards to reconstruct
+the true unused hand. Invalid assignments are rejected once per requested world
+and counted in `invalid_oracle_assignments` as well as `invalid_samples` and
+`exhausted_worlds`; they are never replaced by another belief. The expected
+invalid oracle count is zero. Chance seeds still come independently from the
+search RNG for every world; only the hand is privileged. Opponent history,
+candidate generation, rollouts, leaf evaluation and the search formula retain
+their usual behavior. JSON reports include `belief: "oracle"` and
+`diagnostic_only: true`; these results are not fair-play evaluation results.
+
+The C++ search test checks labels, converted unused counts and loaded physical
+unused hands against snapshots across thousands of training/evaluation roots.
+These are test-only C++ changes; production C++ is unchanged.
+
+CPU paired smoke (S policy, same seed and search budgets for both beliefs):
+
+```sh
+.venv/bin/python scripts/eval_search.py \
+  --checkpoint runs/m4-s-ppo-v1/checkpoint.pt --belief oracle \
+  --pairs 32 --num-envs 8 --threads 1 --seed 20261109 \
+  --worlds 64 --depth 3 --beta 0.1 --device cpu \
+  --out runs/oracle-diagnostic-smoke/oracle.json
+.venv/bin/python scripts/eval_search.py \
+  --checkpoint runs/m4-s-ppo-v1/checkpoint.pt \
+  --belief b1 --fit runs/belief-smoke/fit.pt \
+  --pairs 32 --num-envs 8 --threads 1 --seed 20261109 \
+  --worlds 64 --depth 3 --beta 0.1 --device cpu \
+  --out runs/oracle-diagnostic-smoke/b1.json
+```
+
 The match is produced by `Match::determinized`. Fresh opponent tokens and
 `next_token` are then normalized using retained own/used tokens and the engine's
 accounting bounds (Dream/redraw counters and a retained tick revival token),

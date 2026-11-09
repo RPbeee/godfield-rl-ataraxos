@@ -183,8 +183,10 @@ void tracking_disabled() {
     }
     TestAccess::no_projection(env);
 }
-void measurement() {
-    auto env=projection_root(32,4,20261108);SearchEnv worlds(32,4);std::mt19937_64 rng(101);
+void measurement(bool evaluation=false) {
+    auto env=evaluation ? VecEnv(32,4,20261108,true,{},64,{Controller::external,Controller::external},
+                                100000,Controller::external,20261108,true) : projection_root(32,4,20261108);
+    SearchEnv worlds(32,4);std::mt19937_64 rng(101);
     std::array<std::int32_t,32> indices{};std::array<std::uint64_t,32> seeds{};
     std::array<std::int32_t,32*297> assignments{};
     for(int i=0;i<32;++i){indices[i]=i;seeds[i]=10000+i;}
@@ -202,6 +204,21 @@ void measurement() {
             worlds.load_worlds(env,indices,assignments,seeds);
             for(int i=0;i<32;++i)if(support[i]==0) {
                 ++loaded;check(worlds.world_status[i]==0,"self-play root failed loading");
+                // Compare oracle labels, conversion and loaded hands to physical truth.
+                const auto seat=env.actor_seat[i];
+                const auto& items=env.match(i).snapshot().state.players[1-seat].items;
+                std::array<std::int32_t,297> hand{},unused{},loaded_unused{};
+                for(const auto& item:items) {
+                    ++hand[card_code(item.model)];
+                    if(!item.used)++unused[card_code(item.model)];
+                }
+                const auto assignment=std::span<const std::int32_t>(assignments).subspan(i*297,297);
+                check(std::equal(hand.begin(),hand.end(),assignment.begin()),"oracle label differs from true hand");
+                check(env.label_opp_hand_count[i]==items.size(),"oracle label count differs");
+                check(env.unused_assignment(i,assignment)==unused,"oracle conversion differs from true unused hand");
+                for(const auto& item:worlds.match(i).snapshot().state.players[1-seat].items)
+                    if(!item.used)++loaded_unused[card_code(item.model)];
+                check(loaded_unused==unused,"loaded oracle world differs from true unused hand");
                 const auto t=env.tokens;
                 check(std::memcmp(env.obs_num.data()+i*t*F,worlds.obs_num.data()+i*t*F,t*F*sizeof(float))==0,"self-play root numeric observation changed");
                 check(std::memcmp(env.obs_cat.data()+i*t*C,worlds.obs_cat.data()+i*t*C,t*C)==0,"self-play root categorical observation changed");
@@ -218,4 +235,4 @@ void measurement() {
     std::cout<<"varied self-play worlds="<<loaded<<"\n";
     std::cout<<"used-card measurement: positions="<<positions<<" with_used="<<with_used<<" fraction="<<double(with_used)/positions<<" mean="<<double(used)/positions<<" conditional_mean="<<double(used)/with_used<<"\n";
 }
-int main(){try{worlds();private_history();conversion();projection();tracking_disabled();measurement();}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{worlds();private_history();conversion();projection();tracking_disabled();measurement();measurement(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

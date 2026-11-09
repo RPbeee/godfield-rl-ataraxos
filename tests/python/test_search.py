@@ -120,14 +120,15 @@ def test_checkpoint_beliefs(kind, tmp_path):
     assert env.mask[np.arange(2), choices].all()
 
 
-def test_cli(tmp_path):
+@pytest.mark.parametrize('belief', ['uniform', 'oracle'])
+def test_cli(tmp_path, belief):
     checkpoint = tmp_path/'policy.pt'
     m = model()
     torch.save(dict(ema=m.state_dict(), model_config=asdict(m.config)), checkpoint)
     script = Path(__file__).resolve().parents[2]/'scripts/eval_search.py'
     for opponent in ('policy', 'greedy'):
         out = tmp_path/f'{opponent}.json'
-        run = subprocess.run([sys.executable, str(script), '--checkpoint', str(checkpoint), '--belief', 'uniform',
+        run = subprocess.run([sys.executable, str(script), '--checkpoint', str(checkpoint), '--belief', belief,
                               '--opponent', opponent, '--pairs', '1', '--num-envs', '2', '--threads', '1',
                               '--worlds', '1', '--candidates', '1', '--candidate-samples', '2', '--depth', '0',
                               '--no-tf32', '--out', str(out)], capture_output=True, text=True, check=True)
@@ -135,7 +136,54 @@ def test_cli(tmp_path):
         report = json.loads(out.read_text())
         assert report['games'] == 2 and report['search']['counts']['searched'] > 0
         assert report['config']['tf32'] is False
+        assert report['belief'] == belief
+        assert report['diagnostic_only'] is (belief == 'oracle')
+        assert report['search']['counts']['invalid_oracle_assignments'] == 0
         assert out.with_suffix('.md').exists()
+
+
+def test_oracle_many_evaluation_roots():
+    env = VecEnv(16, 2, eval_pairs=10000, opponent='external', eval_seed=741, track_projection=True)
+    agent = SearchAgent(model(), load_search_belief('oracle'), config=SearchConfig(worlds=3), seed=421)
+    rng = np.random.default_rng(51)
+    expected_rng = np.random.default_rng(421)
+    tested = 0
+    for _ in range(600):
+        fresh = np.flatnonzero((env.stage >= 0) & (env.substep == 0)).astype(np.int32)
+        roots = fresh[env.determinize_support(fresh) == 0]
+        if len(roots):
+            rr, assignments, seeds = agent._sample_worlds(env, roots)
+            np.testing.assert_array_equal(rr, np.repeat(roots, 3))
+            np.testing.assert_array_equal(assignments, env.label_opp_hand[rr])
+            np.testing.assert_array_equal(assignments.sum(1), env.label_opp_hand_count[rr])
+            # Only chance seeds consume the search RNG in oracle mode.
+            np.testing.assert_array_equal(seeds, expected_rng.integers(
+                0, np.iinfo(np.uint64).max, len(rr), dtype=np.uint64))
+            assert len(np.unique(seeds)) == len(seeds)
+            world, status = agent._world_env(env, rr, assignments, seeds, 1)
+            assert not status.any()
+            np.testing.assert_array_equal(world.label_opp_hand, assignments)
+            tested += len(roots)
+        choices = np.array([rng.choice(np.flatnonzero(m)) if s >= 0 else 0
+                            for m, s in zip(env.mask, env.stage)], np.int32)
+        env.step(choices)
+    assert tested > 1000
+    assert agent.counts['invalid_oracle_assignments'] == 0
+    assert agent.counts['invalid_samples'] == agent.counts['invalid_loads'] == 0
+
+
+def test_invalid_oracle_assignment_is_counted_once_per_world():
+    env = VecEnv(2, 1, track_projection=True)
+    class BadLabels:
+        label_opp_hand = np.zeros((2, 297), np.int32)
+        label_opp_hand[:, 0] = 1
+        unused_assignment = env.unused_assignment
+    agent = SearchAgent(model(), load_search_belief('oracle'), config=SearchConfig(worlds=3))
+    rr, assignments, seeds = agent._sample_worlds(BadLabels(), np.arange(2))
+    assert len(rr) == len(assignments) == len(seeds) == 0
+    assert agent.counts['invalid_oracle_assignments'] == agent.counts['invalid_samples'] == 6
+    assert agent.counts['exhausted_worlds'] == 6
+    assert agent.counts['resamples'] == 0
 
 
 def test_one_candidate_no_rollout_matches_policy_sampling():
@@ -312,19 +360,23 @@ def test_depth_zero_stops_at_next_policy_boundary():
             np.testing.assert_array_equal(leaf[key], boundary[key])
 
 
-def test_noise_cli_twenty_roots(tmp_path):
+@pytest.mark.parametrize('belief', ['uniform', 'oracle'])
+def test_noise_cli_twenty_roots(tmp_path, belief):
     checkpoint = tmp_path/'policy.pt'
     m = model()
     torch.save(dict(ema=m.state_dict(), model_config=asdict(m.config)), checkpoint)
     out = tmp_path/'noise.json'
     subprocess.run([sys.executable, str(Path(__file__).resolve().parents[2]/'scripts/search_noise.py'),
-                    '--checkpoint', str(checkpoint), '--belief', 'uniform', '--roots', '20', '--num-envs', '8',
+                    '--checkpoint', str(checkpoint), '--belief', belief, '--roots', '20', '--num-envs', '8',
                     '--worlds', '2', '--depth', '0', '3', '--beta', '.02', '.1', '--candidates', '3',
                     '--candidate-samples', '6', '--repeats', '3', '--out', str(out)], check=True, capture_output=True)
     report = json.loads(out.read_text())
+    assert report['belief'] == belief
+    assert report['diagnostic_only'] is (belief == 'oracle')
     assert len(report['root_locations']) == 20
     assert len(report['results']) == 4
     for result in report['results']:
+        assert result['counts']['invalid_oracle_assignments'] == 0
         assert len(result['roots']) == 20
         assert result['metrics']['failed_searches'] == 0
         assert result['metrics']['repeat_pairs'] == 60

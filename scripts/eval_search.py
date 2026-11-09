@@ -20,7 +20,8 @@ def main():
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--opponent', choices=('policy', 'greedy'), default='policy')
     p.add_argument('--opponent-checkpoint')
-    p.add_argument('--belief', required=True, help='checkpoint path, b1, or uniform')
+    p.add_argument('--belief', required=True,
+                   help='checkpoint path, b1, uniform, or oracle (evaluation-only diagnostic; cheats using true opponent hands)')
     p.add_argument('--fit', help='B1 fitting data (optional count prior for uniform)')
     for name, default in (('worlds', 16), ('candidates', 16), ('candidate-samples', 64), ('depth', 10),
                           ('pairs', 500), ('num-envs', 32), ('threads', 1), ('seed', 0)):
@@ -62,7 +63,8 @@ def main():
                 rows = np.flatnonzero(env.stage >= 0)
                 env.step(agent(env, rows))
             summary = summarize(env.eval_results())
-    report = dict(config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+    report = dict(belief=args.belief, diagnostic_only=args.belief == 'oracle',
+                  config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   **summary, search=agent.statistics(), elapsed_seconds=perf_counter()-start)
     interval = lambda v: f'{v[0]:.2%}–{v[1]:.2%}'
     md = ('| Opponent | Games | Win rate (draw=½) | Wilson 95% | Pair bootstrap 95% |\n'
