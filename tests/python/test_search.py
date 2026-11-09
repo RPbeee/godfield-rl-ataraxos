@@ -51,7 +51,8 @@ def test_formula_and_distribution():
     freq = np.bincount(rng.choice(2, 20000, p=p), minlength=2)/20000
     np.testing.assert_allclose(freq, np.sqrt(rho*pi)/np.sqrt(rho*pi).sum(), atol=.015)
     for kwargs in (dict(depth=-1), dict(worlds=0), dict(alpha=0, beta=0), dict(beta=float('nan')),
-                   dict(leaf_view='invalid'), dict(max_inference_batch=-1)):
+                   dict(leaf_view='invalid'), dict(max_inference_batch=-1), dict(search_cache_device='bad'),
+                   dict(search_cache_mb=-1), dict(root_batch_size=-1)):
         with pytest.raises(ValueError):
             SearchConfig(**kwargs)
 
@@ -121,7 +122,8 @@ def test_checkpoint_beliefs(kind, tmp_path):
 
 
 @pytest.mark.parametrize('belief', ['uniform', 'oracle'])
-def test_cli(tmp_path, belief):
+@pytest.mark.parametrize('progress_interval', ['0', '0.01'])
+def test_cli(tmp_path, belief, progress_interval):
     checkpoint = tmp_path/'policy.pt'
     m = model()
     torch.save(dict(ema=m.state_dict(), model_config=asdict(m.config)), checkpoint)
@@ -131,7 +133,8 @@ def test_cli(tmp_path, belief):
         run = subprocess.run([sys.executable, str(script), '--checkpoint', str(checkpoint), '--belief', belief,
                               '--opponent', opponent, '--pairs', '1', '--num-envs', '2', '--threads', '1',
                               '--worlds', '1', '--candidates', '1', '--candidate-samples', '2', '--depth', '0',
-                              '--no-tf32', '--out', str(out)], capture_output=True, text=True, check=True)
+                              '--no-tf32', '--progress-interval', progress_interval,
+                              '--out', str(out)], capture_output=True, text=True, check=True)
         assert 'Wilson 95%' in run.stdout
         report = json.loads(out.read_text())
         assert report['games'] == 2 and report['search']['counts']['searched'] > 0
@@ -140,6 +143,17 @@ def test_cli(tmp_path, belief):
         assert report['diagnostic_only'] is (belief == 'oracle')
         assert report['search']['counts']['invalid_oracle_assignments'] == 0
         assert out.with_suffix('.md').exists()
+        partial_path = out.with_suffix('.partial.json')
+        if progress_interval == '0':
+            assert not partial_path.exists() and 'elapsed=' not in run.stdout
+        else:
+            partial = json.loads(partial_path.read_text())
+            for key in ('games', 'wins', 'losses', 'draws', 'win_rate', 'wilson_interval',
+                        'bootstrap_interval', 'mean_decisions', 'truncation_rate',
+                        'first_win_rate', 'second_win_rate', 'search'):
+                assert partial[key] == report[key]
+            assert partial['total_games'] == 2 and partial['estimated_remaining_seconds'] == 0
+            assert 'games=2/2' in run.stdout and 'ETA=0.0s' in run.stdout
 
 
 def test_oracle_many_evaluation_roots():
@@ -186,13 +200,14 @@ def test_invalid_oracle_assignment_is_counted_once_per_world():
     assert agent.counts['resamples'] == 0
 
 
-def test_one_candidate_no_rollout_matches_policy_sampling():
+@pytest.mark.parametrize('skip', [False, True])
+def test_one_candidate_no_rollout_matches_policy_sampling(skip):
     # With one candidate sample and k=1 the search selects that full pi_theta
     # draw, regardless of the leaf value or magnet. Compare its first-stage
     # marginal against the actual policy head rather than a mirrored formula.
     env = VecEnv(1, 1, 41, track_projection=True)
     m = model()
-    agent = SearchAgent(m, baseline(), config=SearchConfig(worlds=1, candidates=1, candidate_samples=1, depth=0), seed=78)
+    agent = SearchAgent(m, baseline(), config=SearchConfig(worlds=1, candidates=1, candidate_samples=1, depth=0, skip_single_candidate=skip), seed=78)
     actor = Actor(m, env, 'cpu')
     expected = np.exp(actor.act().log_probs[0])
     count = np.zeros(21)
@@ -490,3 +505,167 @@ def test_belief_inference_chunks(cls):
             assert [c['path'] for c in a['candidates']] == [c['path'] for c in b['candidates']]
             np.testing.assert_allclose([c['q'] for c in a['candidates']],
                                        [c['q'] for c in b['candidates']], atol=2e-6, rtol=2e-6)
+
+
+@pytest.mark.parametrize('cache', ['host', 'auto', 'device'])
+def test_exact_pre_task_games_and_reports(cache):
+    # Frozen using the pre-task implementation, including its chunked actor.
+    from gfrl.evaluation import summarize
+    case = json.loads((Path(__file__).parent/'fixtures/search_exact_before.json').read_text())
+    agent = SearchAgent(model(), baseline(), config=SearchConfig(**case['config'],
+        search_cache_device=cache, skip_forced_inference=False, skip_single_candidate=False,
+        root_batch_size=0), seed=421)
+    env = VecEnv(2, 1, eval_pairs=2, opponent='greedy', eval_seed=98, track_projection=True)
+    actions, reports = [], []
+    with _policy_rng(42, (agent,)):
+        while not env.eval_done():
+            rows = np.flatnonzero(env.stage >= 0)
+            result = agent(env, rows)
+            actions.append(result.tolist())
+            reports.extend(agent.last_search if np.any(env.substep[rows] == 0) else [])
+            env.step(result)
+    assert actions == case['actions']
+    assert json.dumps(reports, sort_keys=True) == json.dumps(case['reports'], sort_keys=True)
+    assert json.loads(json.dumps(summarize(env.eval_results()))) == case['summary']
+
+
+@pytest.mark.parametrize('cap', [0, 5])
+@pytest.mark.parametrize('depth', [0, 3])
+def test_forced_inference_coupled_world_values(cap, depth):
+    # Couple rollout categorical draws by (row, decision, substep), independently
+    # of calls/batch sizes. Unused root draws cannot alter the suffix's draws.
+    # This is an explicit coupling of the SAME categorical action distributions.
+    from gfrl.actor import ActResult
+    env = VecEnv(4, 1, 741, track_projection=True)
+    reports, candidates = [], []
+    inferred = []
+    for skip in (False, True):
+        agent = SearchAgent(model(), baseline(), config=SearchConfig(worlds=3, candidates=4,
+            candidate_samples=12, depth=depth, max_inference_batch=cap,
+            skip_forced_inference=skip), seed=421)
+        original = agent._act
+        root_rows = []
+        def coupled(actor, rows, phase):
+            if phase != 'rollout':
+                return original(actor, rows, phase)
+            actor.sample = False
+            act = original(actor, rows, phase)
+            choices = act.choices.copy()
+            for r in rows:
+                d, t = int(actor.env.decisions[r]), int(actor.env.substep[r])
+                root_rows.append(d == 0)
+                rng = np.random.default_rng([91, int(r), d, t])
+                probs = np.exp(act.log_probs[r].astype(np.float64))
+                choices[r] = rng.choice(21, p=probs/probs.sum())
+            return ActResult(choices, act.log_prob, act.value_logits, act.log_probs)
+        agent._act = coupled
+        with _policy_rng(42, (agent,)):
+            agent.search(env, np.arange(4, dtype=np.int32), report_values=True)
+        reports.append(agent.last_search)
+        candidates.append(agent.last_candidates)
+        inferred.append(sum(root_rows))
+    assert candidates[0] == candidates[1]  # paths, pi_theta, rho, ordering
+    assert reports[0] == reports[1]  # every world leaf, q and search probabilities
+    assert inferred[0] > 0 and inferred[1] == 0
+
+
+@pytest.mark.parametrize('cap', [0, 5])
+def test_singleton_validates_paths_and_omits_values(cap):
+    from dataclasses import replace
+    env = VecEnv(2, 1, 741, track_projection=True)
+    config = SearchConfig(worlds=3, candidates=1, candidate_samples=1, depth=3,
+                          max_inference_batch=cap)
+    results = []
+    for skip in (False, True):
+        agent = SearchAgent(model(), baseline(), config=replace(config, skip_single_candidate=skip), seed=421)
+        with _policy_rng(42, (agent,)):
+            results.append(agent.search(env, np.arange(2, dtype=np.int32)))
+        if not skip:
+            candidates = agent.last_candidates
+        else:
+            assert agent.last_candidates == candidates
+            assert agent.counts['rollout_worlds'] == agent.counts['depth_leaves'] == 0
+            assert agent.counts['singleton_roots'] == 2
+            assert all(r['probabilities'] == [1.] and r['candidates'][0]['q'] is None
+                       and r['rollout_skipped'] == 'single_candidate' for r in agent.last_search)
+            # Even a fixed singleton must be rejected if its first choice is illegal.
+            invalid = {r: [((20,), (0., 0.))] for r in range(2)}
+            assert not env.mask[:, 20].any()
+            with _policy_rng(42, (agent,)):
+                assert agent.search(env, np.arange(2, dtype=np.int32), fixed_candidates=invalid) == {}
+            assert agent.counts['invalid_candidate_worlds'] == 6
+    assert results[0] == results[1]
+
+
+def test_bounded_root_workspaces_and_diagnostics():
+    config = SearchConfig(worlds=2, candidates=3, candidate_samples=8, depth=3,
+                          root_batch_size=2, skip_forced_inference=True, skip_single_candidate=True)
+    saved = []
+    for _ in range(2):
+        env = VecEnv(8, 1, 741, track_projection=True)
+        agent = SearchAgent(model(), baseline(), config=config, seed=421)
+        with _policy_rng(42, (agent,)):
+            result = agent.search(env, np.arange(8, dtype=np.int32), report_values=True)
+        assert len(result) == len(agent.last_candidates) == len(agent.last_search) == 8
+        assert agent.counts['max_batch_roots'] == 2
+        assert agent.counts['search_batches'] == 4
+        assert agent.counts['singleton_roots'] == 0  # report_values requires q
+        assert agent._workspaces['rollout'][1].num_envs <= 2*3*2
+        assert all(c['world_values'] for r in agent.last_search for c in r['candidates'])
+        saved.append(agent.last_search)
+    assert saved[0] == saved[1]
+
+
+def test_cache_budget_falls_back_to_host():
+    from gfrl.search import _SearchActor
+    env = VecEnv(2, 1, 741, track_projection=True)
+    actor = _SearchActor(model(), env, 'cpu', max_batch=1, cache_device='device', cache_mb=0)
+    actor.act()
+    assert actor.token_cache.device.type == 'cpu'
+
+
+def test_singleton_preserves_partial_world_rejection():
+    from dataclasses import replace
+    env = VecEnv(1, 1, track_projection=True)
+    _core._test_danger_root(env, True)
+    pn = torch.zeros(19, dtype=torch.float64)
+    pn[0] = pn[1] = .5
+    pk = torch.zeros(297, dtype=torch.float64)
+    pk[209] = 1
+    belief = Baseline(pn, pk)
+    config = SearchConfig(worlds=16, candidates=32, candidate_samples=256, depth=0)
+    probe = SearchAgent(model(), belief, config=config, seed=6)
+    with _policy_rng(77, (probe,)):
+        probe.search(env, np.array([0], np.int32), report_values=True)
+    candidate = next(c for c in probe.last_search[0]['candidates'] if c['valid_worlds'] < 16)
+    fixed = {0: [(tuple(candidate['path']), (candidate['log_pi'], candidate['log_rho']))]}
+    reports = []
+    for skip in (False, True):
+        agent = SearchAgent(model(), belief, config=replace(config, skip_single_candidate=skip), seed=6)
+        with _policy_rng(77, (agent,)):
+            agent.search(env, np.array([0], np.int32), fixed_candidates=fixed)
+        reports.append(agent.last_search[0])
+        assert agent.counts['invalid_candidate_worlds'] > 0
+    assert reports[0]['selected'] == reports[1]['selected']
+    assert reports[0]['probabilities'] == reports[1]['probabilities'] == [1.]
+    for key in ('path', 'valid_worlds', 'log_pi', 'log_rho'):
+        assert reports[0]['candidates'][0][key] == reports[1]['candidates'][0][key]
+
+
+def test_device_cache_budget_selection(monkeypatch):
+    from gfrl.search import _SearchActor
+    actor = _SearchActor(model(), VecEnv(2, 1), 'cpu', max_batch=1,
+                         cache_device='device', cache_mb=0)
+    # Exercise placement decisions without requiring a CUDA device.
+    actor.device = torch.device('cuda')
+    encoded = torch.empty(1, 7, 4)
+    assert actor._cache_location(encoded).type == 'cpu'
+    actor.cache_bytes = 1024
+    assert actor._cache_location(encoded).type == 'cuda'
+    actor.cache_device = 'auto'
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (100, 10000))
+    assert actor._cache_location(encoded).type == 'cpu'
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (10000, 10000))
+    assert actor._cache_location(encoded).type == 'cuda'
+    actor.cache_device = 'host'
+    assert actor._cache_location(encoded).type == 'cpu'

@@ -48,6 +48,50 @@ def test_summary():
     assert summarize([])['win_rate'] is None
 
 
+def test_partial_summary_uses_only_complete_pairs_for_bootstrap():
+    rows = records([1, 1, -1, -1, 0])
+    partial = summarize(rows[:3], complete_pairs_only=True)
+    assert partial['games'] == 3 and partial['win_rate'] == 2 / 3
+    assert partial['wilson_interval'] == wilson_interval(2, 3)
+    assert partial['bootstrap_interval'] == (1, 1)
+    assert partial['first_win_rate'] == .5 and partial['second_win_rate'] == 1
+    assert partial['mean_decisions'] == 10 and partial['truncation_rate'] == 0
+    assert summarize(rows[2:3], complete_pairs_only=True)['bootstrap_interval'] == (0, 1)
+    assert summarize(rows[:4], complete_pairs_only=True) == summarize(rows[:4])
+    assert summarize([], complete_pairs_only=True) == summarize([])
+    with pytest.raises(ValueError, match='complete'):
+        summarize(rows[:3])
+
+
+def test_progress_deadline_and_completion(monkeypatch):
+    import gfrl.evaluation as evaluation
+    clock = [0.0]
+    monkeypatch.setattr(evaluation, 'monotonic', lambda: clock[0])
+    rows, snapshots = [], []
+
+    class Env:
+        def eval_results(self):
+            return list(rows)
+
+    reporter = evaluation._EvaluationProgress(snapshots.append, 5)
+    rows.extend(records([1]))
+    clock[0] = 4.9
+    reporter(Env())
+    assert snapshots == []
+    clock[0] = 5
+    reporter(Env())
+    assert snapshots == [summarize(rows, complete_pairs_only=True)]
+    rows.extend(records([1, -1])[1:])
+    clock[0] = 6
+    reporter(Env(), final=True)
+    assert snapshots[-1] == summarize(rows)
+    reporter(Env(), final=True)
+    assert [s['games'] for s in snapshots] == [1, 2]
+    for interval in (0, -1, float('inf'), float('nan')):
+        with pytest.raises(ValueError, match='progress_interval_s'):
+            evaluation._EvaluationProgress(snapshots.append, interval)
+
+
 def test_policy_and_bots():
     rng = np.random.default_rng(4)
     seen = []

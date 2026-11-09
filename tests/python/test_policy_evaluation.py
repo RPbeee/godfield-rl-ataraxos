@@ -100,7 +100,7 @@ def test_load_model_and_pool(checkpoints):
         load_policy_model(f'{empty}@pool:30')
 
 
-def test_actor_sampling_reproducible_and_rng_isolated(checkpoints):
+def test_actor_sampling_reproducible_and_rng_isolated(checkpoints, monkeypatch):
     env = VecEnv(1, 1, eval_pairs=0)
     a = Actor(load_policy_model(checkpoints[0]), env, 'cpu', sample=True)
     b = Actor(load_policy_model(checkpoints[0]), env, 'cpu', sample=True)
@@ -108,6 +108,24 @@ def test_actor_sampling_reproducible_and_rng_isolated(checkpoints):
     result = evaluate_policies(a, b, 8, 16, 2, 123)
     assert torch.equal(before, torch.get_rng_state())
     assert result == evaluate_policies(a, b, 8, 16, 2, 123)
+    # A simulated clock makes periodic reporting deterministic and fast.
+    import gfrl.evaluation as evaluation
+    ticks = iter(range(1_000_000))
+    monkeypatch.setattr(evaluation, 'monotonic', lambda: next(ticks))
+    snapshots = []
+    numpy_before = np.random.get_state()
+    with_progress = evaluate_policies(a, b, 8, 16, 2, 123,
+                                      progress=snapshots.append, progress_interval_s=5)
+    assert json.dumps(result) == json.dumps(with_progress)
+    assert torch.equal(before, torch.get_rng_state())
+    numpy_after = np.random.get_state()
+    assert numpy_before[0] == numpy_after[0]
+    np.testing.assert_array_equal(numpy_before[1], numpy_after[1])
+    assert numpy_before[2:] == numpy_after[2:]
+    counts = [s['games'] for s in snapshots]
+    assert len(counts) > 1 and counts == sorted(counts)
+    assert any(0 < n < 16 for n in counts)
+    assert snapshots[-1] == result
     assert result['games'] == 16
     assert .15 <= result['win_rate'] <= .85
     # New binding resets caches, including when a different-width B is used.

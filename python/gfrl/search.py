@@ -34,6 +34,11 @@ class SearchConfig:
     max_attempts: int = 100
     leaf_view: str = 'actor'
     max_inference_batch: int = 0  # 0: no splitting
+    skip_forced_inference: bool = False
+    skip_single_candidate: bool = False
+    search_cache_device: str = 'auto'
+    search_cache_mb: int = 256
+    root_batch_size: int = 0  # distribution preserving; changes RNG ordering
 
     def __post_init__(self):
         if min(self.worlds, self.candidates, self.candidate_samples, self.max_attempts) <= 0 or self.depth < 0:
@@ -44,6 +49,10 @@ class SearchConfig:
             raise ValueError('leaf_view must be actor or searcher')
         if self.max_inference_batch < 0:
             raise ValueError('max_inference_batch must be nonnegative')
+        if self.search_cache_device not in ('auto', 'host', 'device'):
+            raise ValueError('search_cache_device must be auto, host or device')
+        if self.search_cache_mb < 0 or self.root_batch_size < 0:
+            raise ValueError('cache budget and root batch size must be nonnegative')
         if self.select not in ('sample', 'argmax'):
             raise ValueError('select must be sample or argmax')
 
@@ -89,14 +98,25 @@ _SUPPORT = {-1: 'inside_decision', 1: 'invalid_viewer', 2: 'unsupported_players'
 
 
 class _SearchActor(Actor):
-    """Bound search inference workspace, keeping decision encodings on the host.
+    """Bound search inference workspace with a budgeted decision encoding cache.
 
     Heads are collected before a single sampling call, preserving RNG ordering
     regardless of chunk size. Ordinary Actor/training/evaluation are unchanged.
     """
-    def __init__(self, *args, max_batch=0, **kwargs):
+    def __init__(self, *args, max_batch=0, cache_device="auto", cache_mb=256, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_batch = max_batch
+        self.cache_device = cache_device
+        self.cache_bytes = cache_mb * 1024**2
+
+    def _cache_location(self, encoded):
+        size = self.env.num_envs * encoded[0].numel() * encoded.element_size()
+        budget = self.cache_bytes
+        if self.device.type == 'cuda' and self.cache_device == 'auto':
+            free, _ = torch.cuda.mem_get_info(self.device)
+            budget = min(budget, free // 4)
+        return (self.device if self.cache_device != 'host' and size <= budget
+                else torch.device('cpu'))
 
     @torch.inference_mode()
     def act(self, rows=None, *, observation_groups=None, **kwargs):
@@ -116,30 +136,37 @@ class _SearchActor(Actor):
         if observation_groups is not None and len(fresh):
             _, first, inverse = np.unique(np.asarray(observation_groups)[fresh], return_index=True, return_inverse=True)
             encode_rows = fresh[first]
-        # Assign every duplicate directly into the CPU cache; never expand an
-        # entire world/candidate batch on the accelerator.
+        # Expand duplicate encodings a chunk at a time into the bounded cache.
         for lo in range(0, len(encode_rows), self.max_batch):
             rr = encode_rows[lo:lo+self.max_batch]
             since = clock()
             obs = tensor_batch({k: getattr(env, k)[rr] for k in OBS_FIELDS}, self.device)
             timings['transfer'] += clock()-since
             since = clock()
-            encoded = self.model.encode(obs).cpu()
-            timings['encoder'] += clock()-since
+            encoded = self.model.encode(obs)
             if self.token_cache is None:
-                self.token_cache = torch.empty((env.num_envs, *encoded.shape[1:]), dtype=encoded.dtype)
+                self.token_cache = torch.empty((env.num_envs, *encoded.shape[1:]), dtype=encoded.dtype,
+                                               device=self._cache_location(encoded))
+            encoded = encoded.to(self.token_cache.device)
             if observation_groups is None:
-                self.token_cache[rr] = encoded
+                dst, src = rr, np.arange(len(rr))
             else:
-                for j in range(len(rr)):
-                    self.token_cache[fresh[inverse == lo+j]] = encoded[j]
+                take = (inverse >= lo) & (inverse < lo+len(rr))
+                dst, src = fresh[take], inverse[take]-lo
+            # Gather/copy only this chunk, on the cache's device. Duplicate
+            # observations have exactly the same encoded bits.
+            location = self.token_cache.device
+            self.token_cache.index_copy_(0, torch.as_tensor(dst, device=location),
+                                        encoded.index_select(0, torch.as_tensor(src, device=location)))
+            timings['encoder'] += clock()-since
             del obs, encoded
         self._cached[fresh] = True
         lp_parts, value_parts = [], []
         for lo in range(0, len(active), self.max_batch):
             rr = active[lo:lo+self.max_batch]
             since = clock()
-            tokens = self.token_cache[rr].to(self.device)
+            tokens = self.token_cache.index_select(
+                0, torch.as_tensor(rr, device=self.token_cache.device)).to(self.device)
             prefix = tensor_batch({k: getattr(env, k)[rr] for k in PREFIX_FIELDS}, self.device)
             timings['transfer'] += clock()-since
             since = clock()
@@ -173,6 +200,10 @@ class SearchAgent:
         self.actor = Actor(model, VecEnv(1, 1, eval_pairs=0), device)
         self.counts = Counter({k: 0 for k in (
             'decisions', 'searched', 'selected', 'invalid_samples', 'resamples',
+            'search_calls', 'search_batches', 'rollout_roots', 'rollout_worlds',
+            'singleton_roots', 'singleton_validated_worlds', 'forced_inference_rows_skipped',
+            'candidate_paths', 'batch_roots', 'max_batch_roots',
+            'cache_cpu_actors', 'cache_cuda_actors', 'cache_mps_actors', 'cache_peak_bytes',
             'exhausted_worlds', 'invalid_loads', 'invalid_candidate_worlds', 'invalid_oracle_assignments',
             'real_mismatches', 'policy_disagreements', 'fallback_no_candidates',
             'depth_leaves', 'depth_leaves_searcher', 'depth_leaves_opponent', 'terminal_leaves')})
@@ -190,8 +221,11 @@ class SearchAgent:
         decisions = self.counts['decisions']
         return dict(counts=dict(self.counts), searched_fraction=n/decisions if decisions else 0,
                     seconds=dict(self.seconds), seconds_per_search={k: v/n if n else 0 for k, v in self.seconds.items()},
+                    seconds_per_call={k: v/self.counts['search_calls'] if self.counts['search_calls'] else 0
+                                      for k, v in self.seconds.items()},
                     policy_disagreement_fraction=(self.counts['policy_disagreements']/self.counts['selected']
                                                   if self.counts['selected'] else 0),
+                    roots_per_search_call=(n/self.counts['search_calls'] if self.counts['search_calls'] else 0),
                     disagreement_definition='selected path differs from the first full pi_theta candidate draw (before top-k filtering)')
 
     def _time(self):
@@ -199,6 +233,7 @@ class SearchAgent:
         return perf_counter()
 
     def _world_env(self, src, rows, assignments, seeds, depth, role=None):
+        start = perf_counter()
         key = (len(rows), src.obs_schema()['K'], depth)
         cached = self._workspaces.get(role) if role else None
         if cached is not None and cached[0] == key:
@@ -207,7 +242,10 @@ class SearchAgent:
             env = SearchEnv(key[0], self.num_threads, history_len=key[1], max_decisions=depth)
             if role:
                 self._workspaces[role] = (key, env)
+        self.seconds['world_workspace'] += perf_counter()-start
+        start = perf_counter()
         status = env.load_worlds(src, np.asarray(rows, np.int32), np.asarray(assignments, np.int32), np.asarray(seeds, np.uint64))
+        self.seconds['world_load'] += perf_counter()-start
         self.counts['invalid_loads'] += int((status != 0).sum())
         return env, status.copy()
 
@@ -295,6 +333,12 @@ class SearchAgent:
         groups = getattr(actor, '_search_root_groups', None)
         result = actor.act(rows, compact_transfer=True, observation_groups=groups)
         actor._search_root_groups = None
+        if actor.token_cache is not None and not getattr(actor, '_search_cache_recorded', False):
+            cache = actor.token_cache
+            self.counts['cache_'+cache.device.type+'_actors'] += 1
+            self.counts['cache_peak_bytes'] = max(self.counts['cache_peak_bytes'],
+                                                cache.numel()*cache.element_size())
+            actor._search_cache_recorded = True
         if self.profile:
             for key in ('transfer', 'encoder', 'heads'):
                 self.seconds[phase+'_'+key] += actor.last_profile[key]
@@ -311,6 +355,21 @@ class SearchAgent:
         The caller isolates Torch RNG (as __call__ does with _policy_rng).
         """
         c = self.config
+        roots = np.asarray(roots, np.int32)
+        if c.root_batch_size and len(roots) > c.root_batch_size:
+            selected, reports, candidates, policies = {}, [], {}, {}
+            for lo in range(0, len(roots), c.root_batch_size):
+                selected.update(self.search(src, roots[lo:lo+c.root_batch_size],
+                                            fixed_candidates=fixed_candidates, policy_paths=policy_paths,
+                                            report_values=report_values))
+                reports.extend(self.last_search)
+                candidates.update(self.last_candidates)
+                policies.update(self.last_policy_paths)
+            self.last_search, self.last_candidates, self.last_policy_paths = reports, candidates, policies
+            return selected
+        self.counts['search_batches'] += 1
+        self.counts['batch_roots'] += len(roots)
+        self.counts['max_batch_roots'] = max(self.counts['max_batch_roots'], len(roots))
         self.last_search = []
         self.last_candidates = {}
         self.last_policy_paths = {}
@@ -325,7 +384,8 @@ class SearchAgent:
         if fixed_candidates is None:
             indices = np.concatenate([np.resize(ids, c.candidate_samples) for ids in groups.values() if len(ids)])
             env, status = self._world_env(src, rr[indices], assignments[indices], seeds[indices], 1, role="candidate")
-            actor = _SearchActor(self.model, env, self.device, profile=self.profile, max_batch=c.max_inference_batch)
+            actor = _SearchActor(self.model, env, self.device, profile=self.profile, max_batch=c.max_inference_batch,
+                                 cache_device=c.search_cache_device, cache_mb=c.search_cache_mb)
             actor._search_root_groups = rr[indices]
             paths = [[] for _ in indices]
             lp, lr = np.zeros(len(indices)), np.zeros(len(indices))
@@ -348,16 +408,61 @@ class SearchAgent:
             candidates = {int(r): fixed_candidates.get(int(r), []) for r in roots}
             policy_paths = policy_paths or {}
         self.last_candidates = candidates
+        self.counts['candidate_paths'] += sum(map(len, candidates.values()))
         self.last_policy_paths = policy_paths
-        jobs = [(r, path, priors, int(w)) for r, items in candidates.items() for path, priors in items for w in groups[r]]
+        # Diagnostics requesting q/world values always execute full rollouts.
+        singleton = {r for r, items in candidates.items() if len(items) == 1
+                     and c.skip_single_candidate and not report_values}
+        jobs = [(r, path, priors, int(w)) for r, items in candidates.items()
+                for path, priors in items for w in groups[r]]
         self.seconds['candidate'] += self._time()-start
         if not jobs:
             return {}
+        self.counts['singleton_roots'] += len(singleton)
+        self.counts['rollout_roots'] += sum(bool(items) and r not in singleton for r, items in candidates.items())
+        aggregated = {}
+        for fast in (True, False):
+            subset = [j for j in jobs if (j[0] in singleton) == fast]
+            if subset:
+                if not fast:
+                    self.counts['rollout_worlds'] += len(subset)
+                aggregated.update(self._evaluate_jobs(src, rr, assignments, seeds, subset, singleton=fast))
+        selected_paths, reports = {}, []
+        for r, items in candidates.items():
+            kept = []
+            for path, priors in items:
+                samples = aggregated.get((r, path), [])
+                if samples:
+                    kept.append((path, priors, float(np.mean(samples)), len(samples)))
+            if not kept:
+                continue
+            probs = search_distribution([x[2] for x in kept], [x[1][1] for x in kept], [x[1][0] for x in kept], c.alpha, c.beta)
+            pick = int(probs.argmax()) if c.select == 'argmax' else int(self.rng.choice(len(kept), p=probs))
+            self.counts['selected'] += 1
+            self.counts['policy_disagreements'] += kept[pick][0] != policy_paths.get(r)
+            selected_paths[r] = kept[pick][0]
+            reports.append(dict(row=r, candidates=[dict(path=list(x[0]), log_pi=x[1][0], log_rho=x[1][1], q=None if r in singleton else x[2], valid_worlds=x[3]) for x in kept], probabilities=probs.tolist(), selected=list(kept[pick][0])))
+        if report_values:
+            for report in reports:
+                report['policy_path'] = list(policy_paths.get(report['row'], ()))
+                for candidate in report['candidates']:
+                    samples = aggregated[(report['row'], tuple(candidate['path']))]
+                    candidate['world_values'] = list(samples)
+                    candidate['q_se'] = float(np.std(samples, ddof=1)/np.sqrt(len(samples))) if len(samples) > 1 else None
+        for report in reports:
+            if report['row'] in singleton:
+                report['rollout_skipped'] = 'single_candidate'
+        self.last_search = reports
+        return selected_paths
+
+    def _evaluate_jobs(self, src, rr, assignments, seeds, jobs, *, singleton=False):
+        c = self.config
         start = self._time()
         wi = np.array([j[3] for j in jobs])
-        env, status = self._world_env(src, rr[wi], assignments[wi], seeds[wi], c.depth+1, role="rollout")
-        actor = _SearchActor(self.model, env, self.device, profile=self.profile, max_batch=c.max_inference_batch)
-        actor._search_root_groups = rr[wi]
+        env, status = self._world_env(src, rr[wi], assignments[wi], seeds[wi], 1 if singleton else c.depth+1, role="singleton" if singleton else "rollout")
+        actor = _SearchActor(self.model, env, self.device, profile=self.profile, max_batch=c.max_inference_batch,
+                                 cache_device=c.search_cache_device, cache_mb=c.search_cache_mb)
+        actor._search_root_groups = None if c.skip_forced_inference or singleton else rr[wi]
         valid = status == 0
         cursor = np.zeros(len(jobs), int)
         lengths = np.array([len(j[1]) for j in jobs])
@@ -368,25 +473,39 @@ class SearchAgent:
             active = np.flatnonzero((env.stage >= 0) & valid)
             if not len(active):
                 break
-            act = self._act(actor, active, "rollout")
             forcing = active[env.decisions[active] == 0]
+            infer = active[env.decisions[active] != 0] if c.skip_forced_inference or singleton else active
+            self.counts['forced_inference_rows_skipped'] += len(active)-len(infer)
+            # No cache is needed for forced root prefixes: the next external
+            # decision starts at substep zero and refreshes its encoding.
+            if len(infer):
+                action_choices = self._act(actor, infer, "rollout").choices
+            else:
+                action_choices = np.zeros(env.num_envs, np.int32)
             choices = paths[forcing, np.minimum(cursor[forcing], paths.shape[1]-1)]
             ok = (cursor[forcing] < lengths[forcing]) & env.mask[forcing, choices]
             invalid = forcing[~ok]
             valid[invalid] = False
             self.counts['invalid_candidate_worlds'] += len(invalid)
             accepted = forcing[ok]
-            act.choices[accepted] = choices[ok]
+            action_choices[accepted] = choices[ok]
             cursor[accepted] += 1
             # Invalid rows must still receive legal choices until other rows stop.
             idle_invalid = np.flatnonzero((env.stage >= 0) & ~valid)
-            act.choices[idle_invalid] = env.mask[idle_invalid].argmax(1)
+            action_choices[idle_invalid] = env.mask[idle_invalid].argmax(1)
             before = env.decisions.copy()
-            env.step(act.choices)
+            env.step(action_choices)
             invalid = forcing[valid[forcing] & (env.decisions[forcing] > before[forcing]) & (cursor[forcing] != lengths[forcing])]
             valid[invalid] = False
             self.counts['invalid_candidate_worlds'] += len(invalid)
         self.seconds['rollout'] += self._time()-start
+        if singleton:
+            self.counts['singleton_validated_worlds'] += int(valid.sum())
+            aggregated = {}
+            for i, (r, path, _, _) in enumerate(jobs):
+                if valid[i]:
+                    aggregated.setdefault((r, path), []).append(0.)
+            return aggregated
         start = self._time()
         values = env.result.astype(np.float64).copy()
         rows = np.flatnonzero(valid).astype(np.int32)
@@ -418,30 +537,7 @@ class SearchAgent:
         for i, (r, path, _, _) in enumerate(jobs):
             if valid[i]:
                 aggregated.setdefault((r, path), []).append(values[i])
-        selected_paths, reports = {}, []
-        for r, items in candidates.items():
-            kept = []
-            for path, priors in items:
-                samples = aggregated.get((r, path), [])
-                if samples:
-                    kept.append((path, priors, float(np.mean(samples)), len(samples)))
-            if not kept:
-                continue
-            probs = search_distribution([x[2] for x in kept], [x[1][1] for x in kept], [x[1][0] for x in kept], c.alpha, c.beta)
-            pick = int(probs.argmax()) if c.select == 'argmax' else int(self.rng.choice(len(kept), p=probs))
-            self.counts['selected'] += 1
-            self.counts['policy_disagreements'] += kept[pick][0] != policy_paths.get(r)
-            selected_paths[r] = kept[pick][0]
-            reports.append(dict(row=r, candidates=[dict(path=list(x[0]), log_pi=x[1][0], log_rho=x[1][1], q=x[2], valid_worlds=x[3]) for x in kept], probabilities=probs.tolist(), selected=list(kept[pick][0])))
-        if report_values:
-            for report in reports:
-                report['policy_path'] = list(policy_paths.get(report['row'], ()))
-                for candidate in report['candidates']:
-                    samples = aggregated[(report['row'], tuple(candidate['path']))]
-                    candidate['world_values'] = list(samples)
-                    candidate['q_se'] = float(np.std(samples, ddof=1)/np.sqrt(len(samples))) if len(samples) > 1 else None
-        self.last_search = reports
-        return selected_paths
+        return aggregated
 
     @torch.inference_mode()
     def __call__(self, env, rows):
@@ -462,6 +558,7 @@ class SearchAgent:
             roots = fresh[support == 0]
             if len(roots):
                 self.counts['searched'] += len(roots)
+                self.counts['search_calls'] += 1
                 start = self._time()
                 with _policy_rng(int(self.rng.integers(2**31)), (self,)):
                     paths = self.search(env, roots)

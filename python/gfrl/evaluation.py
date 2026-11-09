@@ -1,6 +1,7 @@
 """Paired-seed evaluation; truncated games count as draws."""
 from contextlib import contextmanager
 import math
+from time import monotonic
 
 import numpy as np
 
@@ -53,8 +54,12 @@ def pair_bootstrap(results, iters=2000, seed=0):
     return tuple(float(x) for x in np.quantile(means, [0.025, 0.975]))
 
 
-def summarize(results):
-    """Summarize agent-relative game records, giving draws half credit."""
+def summarize(results, *, complete_pairs_only=False):
+    """Summarize agent-relative game records, giving draws half credit.
+
+    complete_pairs_only permits partial evaluations: only the bootstrap uses
+    complete pairs; every other statistic includes all completed games.
+    """
     results = list(results)
     n = len(results)
     if any(r['result'] not in (-1, 0, 1) for r in results):
@@ -62,18 +67,49 @@ def summarize(results):
     wins = sum(r['result'] == 1 for r in results)
     losses = sum(r['result'] == -1 for r in results)
     draws = n - wins - losses
+    bootstrap_results = results
+    if complete_pairs_only:
+        seats = {}
+        for r in results:
+            seats.setdefault(r['pair'], []).append(r['agent_seat'])
+        complete = {p for p, s in seats.items() if sorted(s) == [0, 1]}
+        bootstrap_results = [r for r in results if r['pair'] in complete]
     def rate(rows):
         return sum((r['result'] + 1) / 2 for r in rows) / len(rows) if rows else None
     return {
         'games': n, 'win_rate': rate(results),
         'wilson_interval': wilson_interval(wins + draws / 2, n),
-        'bootstrap_interval': pair_bootstrap(results),
+        'bootstrap_interval': pair_bootstrap(bootstrap_results),
         'wins': wins, 'losses': losses, 'draws': draws,
         'truncation_rate': sum(r['truncated'] for r in results) / n if n else None,
         'mean_decisions': sum(r['decisions'] for r in results) / n if n else None,
         'first_win_rate': rate([r for r in results if r['agent_seat'] == 0]),
         'second_win_rate': rate([r for r in results if r['agent_seat'] == 1]),
     }
+
+
+class _EvaluationProgress:
+    """Read completed records only at reporting boundaries; never sample RNGs."""
+
+    def __init__(self, callback, interval_s):
+        if not math.isfinite(interval_s) or interval_s <= 0:
+            raise ValueError('progress_interval_s must be finite and positive')
+        self.callback = callback
+        self.interval_s = interval_s
+        self.last_time = monotonic()
+        self.last_games = None
+
+    def __call__(self, env, *, final=False):
+        now = monotonic()
+        if not final and now - self.last_time < self.interval_s:
+            return
+        # eval_results() already retains all completed games, including those
+        # whose env slots have been reset/reused. No C++ accessor is needed.
+        results = env.eval_results()
+        if not final or len(results) != self.last_games:
+            self.callback(summarize(results, complete_pairs_only=True))
+            self.last_games = len(results)
+        self.last_time = monotonic()
 
 
 def evaluate_policy(policy_fn, opponent, pairs, num_envs, num_threads, eval_seed):
@@ -96,7 +132,7 @@ def evaluate_bots(bot_a, bot_b, pairs, threads, eval_seed):
 
 
 def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_seed, *,
-                      track_projection=False):
+                      track_projection=False, progress=None, progress_interval_s=600):
     """Evaluate A against B on paired deals, returning A-relative statistics.
 
     Callbacks receive (env, rows) and return int32 choices of shape [num_envs],
@@ -105,7 +141,12 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
     track_projection enables search roots and defaults to the existing fast path.
     Results are reproducible for the same batching and devices; stochastic
     results need not be invariant to num_envs.
+    progress(summary), when provided, runs between steps at the requested wall
+    time interval and at completion. Only finished games are included; bootstrap
+    uses complete pairs. Reporting uses a local NumPy generator, leaving policy
+    RNGs untouched. The callback itself must not consume policy RNGs.
     """
+    reporter = _EvaluationProgress(progress, progress_interval_s) if progress is not None else None
     with _policy_rng(eval_seed, (policy_a, policy_b)):
         env = _core.VecEnv(num_envs, num_threads, eval_pairs=pairs,
                            opponent='external', eval_seed=eval_seed,
@@ -122,6 +163,10 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
                         raise ValueError('policy must return choices of shape [num_envs]')
                     choices[rows] = selected[rows]
             env.step(choices)
+            if reporter is not None:
+                reporter(env)
+        if reporter is not None:
+            reporter(env, final=True)
         return summarize(env.eval_results())
 
 
