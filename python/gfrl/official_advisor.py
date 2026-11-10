@@ -23,6 +23,9 @@ def advise(result, agent, *, search=False):
     # mapping, preserving all the shared card/board/action descriptions.
     presenter.who = lambda pid: ('環境' if pid is None else 'あなた' if pid == p['viewer'] else '相手')
     board = presenter.board(env.play_view(0, seat), hand=env.play_hand(0, seat))
+    if p['pending'] and p['pending']['models'][0] in (4, 5):
+        import re
+        board = re.sub(r'威力 \d+ /', '取引 /', board)
     labels = []
     search_status = 'forced_no_inference' if search and env.complete else 'disabled'
     root = None
@@ -60,7 +63,13 @@ def advise(result, agent, *, search=False):
     return dict(status='unsupported' if unsupported else 'advice', unsupported=unsupported, update=p['update'], gf=p['gf'], board=board,
                 explanation=text, selections=labels, action=semantic,
                 history_complete=result['history_complete'], search_status=search_status,
-                warnings=[] if result['history_complete'] else ['partial_history_and_decision_count'])
+                **({'detail': result['detail']} if result.get('detail') else {}),
+                warnings=([] if result['history_complete'] else ['partial_history_and_decision_count'])
+                         + p.get('warnings', [])
+                         + (['earth_moon_general_execution'] if any(
+                             x['status'] and x['status']['guardian'] in ('earth', 'moon')
+                             for x in p['players']) else [])
+                         + ([dict(replaced_events=result['replaced_events'])] if result.get('replaced_events') else []))
 
 
 def main(argv=None):
@@ -119,3 +128,117 @@ def main(argv=None):
         print('error:offline_advisor_input_or_model_error', file=sys.stderr)
         return 1
     return 0
+
+
+DREAM_REASON = 'dream_actual_execution_not_verified_from_public_faces'
+
+
+def advise_supported(result, agent, *, search=False, max_samples=16):
+    """Prefer verified actions; relax only Dream after the safe mask is exhausted."""
+    from .official import OfficialDecision, OBSERVED_UI_KINDS, KINDS as ACTION_KINDS
+    advice = _advise_supported(result, agent, search=search, max_samples=max_samples)
+    exclusions = advice.get('mask_exclusions', [])
+    if not advice.get('selection_exhausted') or not any(e['reason'] == DREAM_REASON for e in exclusions):
+        return advice
+    # Preserve every other execution gap. In particular, never restore discard
+    # (or another unobserved kind) while restoring disguised card selections.
+    hard_ids = {i for e in exclusions if e['reason'] != DREAM_REASON for i in e.get('item_ids', [])}
+    kinds = set(ACTION_KINDS) - OBSERVED_UI_KINDS
+    prune_self = any(e['reason'] == 'self_target_of_enemy_default_unobserved' for e in exclusions)
+    env = result['env']
+    try:
+        fresh = dict(result, env=OfficialDecision(env.public, env.events, env.history_len,
+            excluded_ids=hard_ids, excluded_kinds=kinds, exclude_enemy_default_self=prune_self))
+    except (ValueError, RuntimeError):
+        return advice
+    actor = agent.actor if search else agent
+    return _advise_supported(fresh, actor, max_samples=max_samples, allow_dream=True,
+        excluded_ids=hard_ids, excluded_kinds=kinds, exclude_self=prune_self,
+        initial_exclusions=exclusions)
+
+
+def _advise_supported(result, agent, *, search=False, max_samples=16, allow_dream=False,
+                      excluded_ids=(), excluded_kinds=(), exclude_self=False, initial_exclusions=()):
+    """Bot-only recovery: prune card/target/kind gaps, then retry using policy RNG."""
+    from .official import OfficialDecision
+    env = result['env']
+    def choose(position, policy, *, search=False):
+        advice = advise(position, policy, search=search)
+        if allow_dream and DREAM_REASON in advice['unsupported'] and any(
+                h['disguised'] and h['id'] in {c['item_id'] for c in advice['action']['cards']}
+                for h in env.public['hand']):
+            advice['unsupported'] = [r for r in advice['unsupported'] if r != DREAM_REASON]
+            advice['status'] = 'unsupported' if advice['unsupported'] else 'advice'
+            advice['warnings'].append(DREAM_REASON)
+            advice['dream_last_resort'] = True
+        if initial_exclusions:
+            advice['mask_exclusions'] = list(initial_exclusions)
+        return advice
+    advice = choose(result, agent, search=search)
+    if advice['status'] != 'unsupported':
+        return advice
+    actor = agent.actor if search else agent
+    excluded = set(excluded_ids)
+    excluded_kinds = set(excluded_kinds)
+    exclude_enemy_default_self = exclude_self
+    exclusions = list(initial_exclusions)
+    while advice['status'] == 'unsupported':
+        reasons = advice.get('unsupported', [])
+        selected = {c['item_id'] for c in advice['action']['cards']}
+        blocked_by_reason = []
+        if 'dream_actual_execution_not_verified_from_public_faces' in reasons:
+            blocked_by_reason.append(dict(reason='dream_actual_execution_not_verified_from_public_faces',
+                item_ids=[h['id'] for h in env.public['hand'] if h['disguised'] and h['id'] in selected]))
+        if 'danger_wide_requires_unobservable_mortar_absence' in reasons:
+            blocked_by_reason.append(dict(reason='danger_wide_requires_unobservable_mortar_absence',
+                item_ids=[c['item_id'] for c in advice['action']['cards'] if c['model'] == 232]))
+        new = {i for e in blocked_by_reason for i in e['item_ids']} - excluded
+        prune_self = ('self_target_of_enemy_default_unobserved' in reasons
+                      and not exclude_enemy_default_self)
+        kind = advice['action']['kind']
+        prune_kind = f'ui_kind_unobserved:{kind}' in reasons and kind not in excluded_kinds
+        kind_exclusions = [dict(reason=f'ui_kind_unobserved:{kind}', kind=kind)] if prune_kind else []
+        if not new and not prune_self and not prune_kind:
+            break
+        excluded.update(new)
+        if prune_kind:
+            excluded_kinds.add(kind)
+        try:
+            fresh = dict(result, env=OfficialDecision(env.public, env.events, env.history_len,
+                excluded_ids=excluded, excluded_kinds=excluded_kinds,
+                exclude_enemy_default_self=exclude_enemy_default_self or prune_self))
+        except (ValueError, RuntimeError):
+            # No completion survives the accumulated exclusions. Rolling back
+            # the last exclusion would sample that same unsupported card again.
+            advice['mask_exclusions'] = exclusions + ([dict(
+                reason='self_target_of_enemy_default_unobserved', target='self')] if prune_self else []) + [dict(reason=e['reason'],
+                item_ids=sorted(set(e['item_ids']) & new))
+                for e in blocked_by_reason if set(e['item_ids']) & new] + kind_exclusions
+            advice['selection_exhausted'] = True
+            return advice
+        exclude_enemy_default_self |= prune_self
+        if prune_self:
+            exclusions.append(dict(reason='self_target_of_enemy_default_unobserved', target='self'))
+        exclusions.extend(dict(reason=e['reason'], item_ids=sorted(set(e['item_ids']) & new))
+                          for e in blocked_by_reason if set(e['item_ids']) & new)
+        exclusions.extend(kind_exclusions)
+        advice = choose(fresh, actor)  # Retain greedy/sample; search cannot use a different mask.
+        advice['mask_exclusions'] = exclusions
+    if advice['status'] == 'advice':
+        return advice
+    original_sample = actor.sample
+    try:
+        actor.sample = True
+        for n in range(1, max_samples+1):
+            fresh = dict(result, env=OfficialDecision(env.public, env.events, env.history_len,
+                excluded_ids=excluded, excluded_kinds=excluded_kinds,
+                exclude_enemy_default_self=exclude_enemy_default_self))
+            advice = choose(fresh, actor)
+            advice['fallback_samples'] = n
+            if exclusions:
+                advice['mask_exclusions'] = exclusions
+            if advice['status'] == 'advice':
+                return advice
+        return advice
+    finally:
+        actor.sample = original_sample

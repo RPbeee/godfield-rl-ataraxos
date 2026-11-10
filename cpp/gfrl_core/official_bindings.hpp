@@ -45,8 +45,10 @@ gf::MatchView official_view(nb::dict d) {
         const auto& base=*gf::find_card(p.models.front());
         p.origin=nb::cast<std::optional<gf::PlayerId>>(a["origin"]);p.source=nb::cast<std::optional<gf::PlayerId>>(a["source"]);
         p.target=nb::cast<gf::PlayerId>(a["target"]);p.category=base.category;p.element=gf::attack_element(p.models);
-        p.ability=base.ability;p.amount=base.ability_value;
+        p.ability=base.ability;p.amount=field<std::int64_t>(a,"amount",base.ability_value);
         if(base.ability==gf::Ability::sell && p.models.size()>1)p.amount=gf::find_card(p.models[1])->price;
+        if(base.ability==gf::Ability::remove_items)p.amount=3;
+        if(base.ability==gf::Ability::remove_used_miracles)p.amount=2;
         p.power=a.contains("power")?nb::cast<std::int64_t>(a["power"]):gf::attack_power(p.models,field<std::int64_t>(a,"base_override",0));
         p.hit_rate=base.hit_rate;p.counter=field<bool>(a,"counter",false);p.death=field<bool>(a,"death",false);
         p.reflections=field<std::size_t>(a,"reflections",0);p.bounces=field<std::size_t>(a,"bounces",0);
@@ -57,6 +59,27 @@ gf::MatchView official_view(nb::dict d) {
         auto a=nb::cast<nb::dict>(d["purchase"]);auto model=nb::cast<gf::CardId>(a["model"]);
         if(!gf::find_card(model))throw std::invalid_argument("unknown public offer");
         v.purchase=gf::PurchaseOfferView{nb::cast<gf::PlayerId>(a["origin"]),nb::cast<gf::PlayerId>(a["buyer"]),nb::cast<gf::PlayerId>(a["seller"]),model,gf::find_card(model)->price};
+    }
+    if(d.contains("removal")) {
+        auto a=nb::cast<nb::dict>(d["removal"]);
+        v.last_removal=gf::RemovalEvent{nb::cast<gf::PlayerId>(a["origin"]),nb::cast<gf::PlayerId>(a["source"]),
+            nb::cast<gf::PlayerId>(a["target"]),nb::cast<gf::CardId>(a["model"]),
+            nb::cast<std::vector<gf::CardId>>(a["models"])};
+    }
+    if(d.contains("sale")) {
+        auto a=nb::cast<nb::dict>(d["sale"]);
+        v.last_sale=gf::SaleEvent{nb::cast<gf::PlayerId>(a["origin"]),nb::cast<gf::PlayerId>(a["source"]),
+            nb::cast<gf::PlayerId>(a["target"]),nb::cast<gf::CardId>(a["model"]),
+            nb::cast<int>(a["price"]),nb::cast<std::optional<gf::CardId>>(a["overflow_model"])};
+    }
+    if(d.contains("guardian_changes")) {
+        for(auto obj:nb::cast<nb::list>(d["guardian_changes"])) {
+            auto e=nb::cast<nb::dict>(obj);
+            if(nb::cast<std::string>(e["reason"])!="departure")throw std::invalid_argument("unknown guardian change reason");
+            v.last_guardian_changes.push_back({nb::cast<gf::PlayerId>(e["player"]),
+                official_enum<gf::Guardian>(nb::cast<std::string>(e["before"]),11,gf::guardian_name),
+                official_enum<gf::Guardian>(nb::cast<std::string>(e["after"]),11,gf::guardian_name),gf::GuardianChangeReason::departure});
+        }
     }
     return v;
 }
@@ -87,10 +110,57 @@ nb::dict official_observation(nb::dict d,nb::list events,std::size_t k) {
 }
 struct OfficialCursor {
     gf::PublicSelection position;Selection selection;
-    explicit OfficialCursor(nb::dict d):position(official_view(d)),selection(position) {advance();}
-    void advance() {while(!selection.complete && std::count(selection.mask.begin(),selection.mask.end(),true)==1)
-        selection.choose(position,std::find(selection.mask.begin(),selection.mask.end(),true)-selection.mask.begin(),true);}
-    void choose(int choice) {++selection.substep;selection.choose(position,choice,true);advance();}
+    std::vector<gf::ItemToken> excluded;
+    bool exclude_enemy_default_self;
+    std::vector<int> excluded_kinds;
+    explicit OfficialCursor(nb::dict d):position(official_view(d)),selection(position) {
+        excluded_kinds=field<std::vector<int>>(d,"excluded_kinds",{});
+        exclude_enemy_default_self=field<bool>(d,"exclude_enemy_default_self",false);
+        for(auto slot:field<std::vector<int>>(d,"excluded_slots",{}))
+            excluded.push_back(static_cast<gf::ItemToken>(slot+1));
+        advance();
+    }
+    bool completion(gf::CommandKind kind,std::vector<gf::ItemToken> prefix) const {
+        const auto node=position.legal_extensions(kind,prefix,{excluded.empty()});
+        if(node.can_finish)return true;
+        for(auto token:node.next)if(std::find(excluded.begin(),excluded.end(),token)==excluded.end()) {
+            auto next=prefix;next.push_back(token);
+            if(completion(kind,std::move(next)))return true;
+        }
+        return false;
+    }
+    void prune() {
+        if(selection.complete)return;
+        auto& s=selection;
+        if(exclude_enemy_default_self && s.stage==Stage::target && !s.command.items.empty()
+            && (s.command.kind==gf::CommandKind::play || s.command.kind==gf::CommandKind::sell
+                || s.command.kind==gf::CommandKind::buy)) {
+            const auto& hand=position.snapshot().state.players[s.actor_seat].items;
+            const auto base=std::find_if(hand.begin(),hand.end(),[&](const auto& h){return h.token==s.command.items.front();});
+            if(base!=hand.end() && gf::targets_enemy_by_default(base->fake_model.value_or(base->model)))s.mask[1]=false;
+        }
+        if(s.stage==Stage::kind) {
+            for(auto kind:excluded_kinds)if(kind>=0 && kind<10)s.mask[kind]=false;
+            for(int i=0;i<10;++i)if(!excluded.empty() && s.mask[i] && !completion(static_cast<gf::CommandKind>(i),{}))s.mask[i]=false;
+        } else if(!excluded.empty() && s.stage==Stage::card) {
+            const auto& hand=position.snapshot().state.players[s.actor_seat].items;
+            for(std::size_t i=0;i<hand.size();++i)if(s.mask[i]) {
+                auto prefix=s.command.items;prefix.push_back(hand[i].token);
+                if(std::find(excluded.begin(),excluded.end(),hand[i].token)!=excluded.end()
+                    || !completion(s.command.kind,std::move(prefix)))s.mask[i]=false;
+            }
+        }
+        if(std::count(s.mask.begin(),s.mask.end(),true)==0)
+            throw std::invalid_argument("no supported public selection after exclusions");
+    }
+    void advance() {
+        prune();
+        while(!selection.complete && std::count(selection.mask.begin(),selection.mask.end(),true)==1) {
+            selection.choose(position,std::find(selection.mask.begin(),selection.mask.end(),true)-selection.mask.begin(),excluded.empty());
+            prune();
+        }
+    }
+    void choose(int choice) {++selection.substep;selection.choose(position,choice,excluded.empty());advance();}
     nb::dict state() const {
         const auto& s=selection;nb::dict d;
         d["complete"]=s.complete;d["stage"]=s.complete?-1:int(s.stage);d["mask"]=nb::cast(s.mask);d["substep"]=s.substep;

@@ -67,4 +67,165 @@ void official_observe(const gf::Match& match) {
         auto line=out.str();if(seen.insert(line).second)std::cout<<line<<'\n';
     }
 }
-int main() { return upstream_wire_main(); }
+int main(int argc, char** argv) {
+    if(argc==2 && std::string_view(argv[1])=="--guardian-decisions") {
+        const auto compare=[](const gf::Match& match) {
+            auto v=match.view(*match.snapshot().actor);
+            const auto& own=match.snapshot().state.players[*v.actor==0?0:1];
+            const auto hand=v.board.hand;v.board.hand.clear();
+            for(const auto& item:own.items)v.board.hand.push_back(*std::find_if(hand.begin(),hand.end(),[&](auto h){return h.token==item.token;}));
+            gf::PublicSelection public_selection(v);
+            if(match.legal_kinds()!=public_selection.legal_kinds())throw std::runtime_error("guardian kinds mismatch");
+            for(auto kind:match.legal_kinds()) {
+                std::vector<gf::ItemToken> prefix;
+                const auto visit=[&](auto&& self)->void {
+                    auto a=match.legal_extensions(kind,prefix,{true});
+                    if(a!=public_selection.legal_extensions(kind,prefix,{true}))throw std::runtime_error("guardian prefix mismatch");
+                    for(auto token:a.next) {prefix.push_back(token);self(self);prefix.pop_back();}
+                };visit(visit);
+            }
+            official_observe(match);
+        };
+        for(auto guardian:{gf::Guardian::none,gf::Guardian::earth,gf::Guardian::moon,gf::Guardian::mars}) {
+            gf::SnapshotState state;
+            gf::PlayerState a;a.id=0;a.guardian=guardian;a.items={{0,6,{},false},{1,130,{},false},{2,235,{},false}};
+            gf::PlayerState b;b.id=7;b.items={{0,6,{},false},{1,142,{},false},{2,190,{},false},{3,223,{},false}};
+            state.players={a,b};gf::Match match;match.load_scene(state,7,0);compare(match);
+            match.step({7,gf::CommandKind::play,{0},0});compare(match);
+        }
+        for(auto guardian:{gf::Guardian::earth,gf::Guardian::moon}) {
+            std::vector<std::vector<gf::CardId>> payloads;
+            for(const auto& card:gf::catalog())if(gf::match_guardian_payload_supported(guardian,card.id))payloads.push_back({card.id});
+            if(guardian==gf::Guardian::earth)payloads.push_back({6,203});
+            for(const auto& models:payloads) {
+                gf::SnapshotState state;
+                gf::PlayerState a;a.id=0;a.guardian=guardian;
+                gf::PlayerState b;b.id=7;b.mp=99;b.items={{0,130,{},false},{1,142,{},false},{2,190,{},false},{3,223,{},false}};
+                state.players={a,b};gf::Match match;match.load_scene(state,7,0);
+                match.guardian_payload_step({0,guardian,models,7});
+                if(match.snapshot().phase==gf::MatchPhase::response)compare(match);
+            }
+        }
+        return 0;
+    }
+    if(argc==3 && std::string_view(argv[1])=="--public-events") {
+        const auto scenario=std::string_view(argv[2]);
+        gf::SnapshotState state;state.gf=1;
+        gf::PlayerState source;source.id=0;
+        gf::PlayerState target;target.id=7;
+        source.items={{0,scenario=="cp"?gf::CardId{236}:scenario=="sale"?gf::CardId{4}:gf::CardId{130},{},false}};
+        if(scenario=="sale") {
+            source.items.push_back({1,6,{},false});
+            for(unsigned i=0;i<18;++i)target.items.push_back({i,235,{},true});
+        } else target.items={{0,130,{},false}};
+        if(scenario=="disease")source.curses={gf::Curse::cold};
+        state.players={source,target};
+        unsigned seed=0;
+        if(scenario=="disease")for(;;++seed) {
+            gf::Match trial;trial.load_scene(state,0,seed);
+            trial.step({0,gf::CommandKind::pray,{},{}});
+            if(trial.snapshot().last_tick && trial.snapshot().last_tick->worsened)break;
+        }
+        gf::Match match;match.load_scene(state,0,seed);official_observe(match);
+        if(scenario=="sale") {
+            match.step({0,gf::CommandKind::sell,{0,1},7});official_observe(match);
+            match.step({7,gf::CommandKind::defend,{},{}});
+        } else if(scenario=="cp")match.step({0,gf::CommandKind::play,{0},0});
+        else match.step({0,gf::CommandKind::pray,{},{}});
+        official_observe(match);return 0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--removals") {
+        for(auto operation: {gf::CardId{205},gf::CardId{206}}) {
+            gf::SnapshotState state;
+            gf::PlayerState source;source.id=0;source.items={{0,operation,{},false}};
+            gf::PlayerState target;target.id=7;
+            for(auto model: {gf::CardId{235},gf::CardId{235},gf::CardId{223},gf::CardId{6}})
+                target.items.push_back({target.items.size(),model,{},operation==206 && model!=6});
+            state.players={source,target};
+            gf::Match match;match.load_scene(state,0,42);
+            official_observe(match);
+            match.step(gf::Command{0,gf::CommandKind::play,{0},7});
+            official_observe(match);
+            match.step(gf::Command{7,gf::CommandKind::defend,{}, {}});
+            official_observe(match);
+        }
+        return 0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--trades") {
+        for(auto operation: {gf::CardId{4},gf::CardId{5}}) {
+            gf::SnapshotState state;
+            gf::PlayerState source;source.id=0;source.items={{0,operation,{},false},{1,48,{},false}};
+            gf::PlayerState target;target.id=7;
+            for(auto model: {gf::CardId{142},gf::CardId{180},gf::CardId{189},gf::CardId{190}})
+                target.items.push_back({target.items.size(),model,{},false});
+            state.players={source,target};
+            gf::Match match;match.load_scene(state,0,42);
+            gf::Command command{0,operation==4?gf::CommandKind::sell:gf::CommandKind::buy,{0},7};
+            if(operation==4)command.items.push_back(1);
+            match.step(command);
+            official_observe(match);
+        }
+        return 0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--counter-values") {
+        for(gf::CardId model=181;model<=188;++model) for(unsigned seed=0;seed<16;++seed) {
+            gf::SnapshotState state;
+            gf::PlayerState source;source.id=0;
+            source.items={{0,48,{},false},{1,130,{},false},{2,190,{},false}};
+            gf::PlayerState target;target.id=7;target.items={{0,model,{},false}};
+            state.players={source,target};
+            gf::Match match;match.load_scene(state,0,seed);
+            match.step({0,gf::CommandKind::play,{0},7});
+            match.step({7,gf::CommandKind::defend,{0},{}});
+            official_observe(match);
+        }
+        return 0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--attack-values") {
+        // Launch every single-card attack from a real Match, plus ordered
+        // dynamic/ordinary modifier cases. No synthetic pending injection.
+        std::vector<std::vector<gf::CardId>> cases;
+        for(const auto& card:gf::catalog())
+            if(gf::match_supported(card.id) && ((card.atk>0 && !card.is_plus_atk) || card.id==58))
+                cases.push_back({card.id});
+        for(auto base:{gf::CardId{6},gf::CardId{58},gf::CardId{94}})
+            for(auto extra: {std::vector<gf::CardId>{231},std::vector<gf::CardId>{231,204},
+                             std::vector<gf::CardId>{9},std::vector<gf::CardId>{9,231}}) {
+                extra.insert(extra.begin(),base);cases.push_back(extra);
+            }
+        for(const auto& models:cases) for(unsigned seed=0;seed<16;++seed) {
+            gf::SnapshotState state;
+            gf::PlayerState source;source.id=0;source.mp=30;
+            for(auto model:models) source.items.push_back({source.items.size(),model,{},false});
+            gf::PlayerState target;target.id=7;target.mp=99;
+            for(auto model:{gf::CardId{130},gf::CardId{142},gf::CardId{180},gf::CardId{184},
+                           gf::CardId{189},gf::CardId{190},gf::CardId{223},gf::CardId{235}})
+                target.items.push_back({target.items.size(),model,{},false});
+            state.players={source,target};
+            gf::Match match;match.load_scene(state,0,seed);
+            gf::Command command{0,gf::CommandKind::play,{},7};
+            for(std::size_t i=0;i<models.size();++i)command.items.push_back(i);
+            if(!match.legal(command)) {command.target.reset();if(!match.legal(command))continue;}
+            match.step(command);official_observe(match);
+        }
+        return 0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--dynamic") {
+        for(auto model: {gf::CardId{202},gf::CardId{58},gf::CardId{94}}) {
+            for(unsigned variant=0;variant<16;++variant) {
+                gf::SnapshotState state;
+                gf::PlayerState source;source.id=0;source.mp=variant%2?10:20;
+                source.items={{0,model,{},false}};
+                gf::PlayerState target;target.id=7;
+                target.items={{0,130,{},false},{1,190,{},false}};
+                if(model==94 && variant%2) target.items.push_back({2,209,{},false});
+                state.players={source,target};
+                gf::Match match;match.load_scene(state,0,variant);
+                match.step(gf::Command{0,gf::CommandKind::play,{0},model==94?std::optional<gf::PlayerId>{}:7});
+                official_observe(match);
+            }
+        }
+        return 0;
+    }
+    return upstream_wire_main();
+}

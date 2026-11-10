@@ -17,6 +17,7 @@ from .model import OBS_FIELDS
 ROOT = Path(__file__).resolve().parents[2]
 CURSES = ('none', 'cold', 'fever', 'hell', 'heaven', 'fog', 'dream', 'flash', 'darkcloud')
 KINDS = ('play', 'defend', 'discard', 'pray', 'exchange', 'sell', 'buy', 'accept', 'decline', 'sacrifice')
+OBSERVED_UI_KINDS = frozenset(('play', 'defend', 'exchange', 'sell', 'buy', 'pray', 'accept', 'decline'))
 DTYPES = dict(obs_type=np.int8, obs_aux_card=np.int16, obs_valid=bool,
               obs_cards=np.int16, obs_cat=np.int8, obs_num=np.float32)
 
@@ -27,6 +28,61 @@ def parser_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+# Messages are never serialized: only codes owned by this boundary are allowed.
+VALUE_ERROR_CODES = frozenset({
+    'capture_failed', 'capture_integrity', 'multiple_documents', 'conflicting_update',
+    'invalid_public_integer', 'unsupported_roster', 'ambiguous_own_item_ids',
+})
+
+# Only mask/observation construction needs these facts. All other reasons
+# (including unknown future codes) remain fatal at the public-state boundary.
+DECISION_ONLY_UNSUPPORTED = frozenset({
+    'hand_over_capacity', 'confused_main', 'redirect_requires_history',
+    'dynamic_attack_value_unavailable', 'earth_moon_payload',
+    'redirect_chance_activation_unavailable',
+    'dying_players_decision_unavailable',
+})
+
+
+def exception_detail(error, parse_error_type=None, *, fixed_codes=True, local_only=True):
+    detail = dict(error=type(error).__name__)
+    if parse_error_type is not None and isinstance(error, parse_error_type):
+        detail.update(code=str(error), parser=error.detail)
+    elif (fixed_codes and type(error) is ValueError and error.args
+          and isinstance(error.args[0], str) and error.args[0] in VALUE_ERROR_CODES):
+        detail['code'] = error.args[0]
+    else:
+        frame = error.__traceback__
+        last = None
+        while frame is not None:
+            file = Path(frame.tb_frame.f_code.co_filename).resolve()
+            if (not local_only or file.is_relative_to(ROOT / 'python/gfrl')
+                    or file.is_relative_to(ROOT / 'third_party/goodfield')):
+                last = dict(file=file.name, line=frame.tb_lineno)
+            frame = frame.tb_next
+        if last:
+            detail.update(last)
+    return detail
+
+
+def unsupported_detail(public):
+    """Use only the projection, which has already discarded private inventories."""
+    facts = public.get('detail', [])
+    pending = public.get('pending') or {}
+    result = [deepcopy(d) for d in facts if d['code'] == 'multiple_pending_frames']
+    for code in public['unsupported']:
+        matches = [d for d in facts if d['code'] == code]
+        if matches:
+            result.extend(matches)
+        else:
+            d = dict(code=code, phase=public['phase'])
+            if pending:
+                d.update(models=list(pending['models']), guardian=pending['guardian'],
+                         reflections=pending['reflections'], bounces=pending['bounces'])
+            result.append(d)
+    return result
 
 
 def read_games(path, viewer, document_sequence=None):
@@ -81,7 +137,7 @@ def project_game(game, viewer, *, prior=None):
                gf=_integer(game['gf']), update=_integer(game['updateCount']),
                tiebreak_gf=game.get('tiebreakGF'), is_over=ended, players=[], hand=[],
                actor=None, phase=2 if ended else 0, pending=None, purchase=None,
-               events=[], unsupported=[])
+               events=[], unsupported=[], detail=[])
     if out['tiebreak_gf'] is not None:
         _integer(out['tiebreak_gf'])
     for p in players:
@@ -89,6 +145,7 @@ def project_game(game, viewer, *, prior=None):
         hidden = fog and pid != viewer and not dead
         if p.get('team', 0) != 0:
             out['unsupported'].append('team_game')
+            out['detail'].append(dict(code='team_game', team_present=True))
         status = None
         if not hidden:
             curses, seen = [], set()
@@ -120,6 +177,7 @@ def project_game(game, viewer, *, prior=None):
         raise ValueError('ambiguous_own_item_ids')
     if len(out['hand']) > 18:
         out['unsupported'].append('hand_over_capacity')
+        out['detail'].append(dict(code='hand_over_capacity', count=len(out['hand']), capacity=18))
     # Explicit per-event allowlist. Foreign gift/replacement payloads and their
     # counts are not forwarded, even though the transport can contain them.
     sale_target = (prior or {}).get('pending')
@@ -128,6 +186,9 @@ def project_game(game, viewer, *, prior=None):
     sale_source = sale_source.get('source') if sale_source else None
     for event in game.get('events', []):
         action = event['action']; e = dict(action=action)
+        if action == 'unknownEvent':
+            out['events'].append(dict(action='unknownEvent'))
+            continue
         if action == 'setTargetPlayer':
             sale_target = event['playerId']
             sale_source = game['attackTurnPlayerId']
@@ -136,11 +197,22 @@ def project_game(game, viewer, *, prior=None):
         if action == 'sell':
             if sale_target is None or sale_source is None:
                 out['unsupported'].append('sale_recipient_unavailable')
+                out['detail'].append(dict(code='sale_recipient_unavailable',
+                    target_missing=sale_target is None, source_missing=sale_source is None))
             else:
                 e.update(buyer=sale_target, seller=sale_source)
                 # Commodity contents are released only to the receiving viewer.
                 if sale_target == viewer:
                     e['face'] = _face(event['item'])
+                if 'overflowItem' in event:
+                    item = event['overflowItem']
+                    # Fanout of foreign unused eviction truth is unverified.
+                    e['overflow_used'] = item['used']
+                    e['overflow_unobserved'] = sale_target != viewer and not item['used']
+                    if not e['overflow_unobserved'] and not item.get('fakeModelId'):
+                        e['overflow_model'] = _face(item)
+                    if item.get('fakeModelId'):
+                        e['overflow_unobserved'] = True
         elif action in ('gift', 'replaceItems'):
             if event.get('playerId') == viewer:
                 e['faces'] = [_face(i) for i in ([event['item']] if action == 'gift' else event.get('items', [])) if i.get('modelId')]
@@ -148,15 +220,22 @@ def project_game(game, viewer, *, prior=None):
             e['faces'] = [_face(i) for i in event.get('items', [])]
             # Use is public; do not retain the item's received token or ID.
             e['reveals'] = [dict(face=_face(i), model=i['modelId']) for i in event.get('items', []) if i.get('fakeModelId')]
+        elif action in ('removeItems', 'removeUsedMiracles'):
+            # Removal displays and flips each card publicly, including foreign
+            # unused cards. Never copy the rest of that player's inventory.
+            e['models'] = [_integer(i['modelId'], 1, 296) for i in event['items']]
+            e['faces'] = [_face(i) for i in event['items']]
         elif action in ('nextAttack', 'attackByGuardian'):
             a = event['attack']
             e['attack'] = {k: deepcopy(a[k]) for k in ('playerId', 'targetPlayerId', 'itemModelIds', 'atk', 'guardian', 'reversed') if k in a}
-        elif action in ('dealDamage', 'boostHP', 'boostMP', 'exchange'):
+        elif action in ('dealDamage', 'boostHP', 'boostMP', 'exchange', 'takeCP', 'boostCP', 'boostCPOfEverybody'):
             for key in ('damage', 'hp', 'mp', 'cp'):
                 if key in event:
                     e[key] = _integer(event[key], -9007199254740991)
-        elif action in ('addCurse', 'setCurseOfEverybody'):
+        elif action in ('addCurse', 'setCurseOfEverybody', 'upgradeDisease'):
             e['curse'] = event['curse']
+            if 'natural' in event:
+                e['natural'] = event['natural']
         elif action == 'removeCurses':
             e['curses'] = list(event.get('curses', []))
         elif action == 'setGuardian':
@@ -168,26 +247,51 @@ def project_game(game, viewer, *, prior=None):
         elif action == 'phenomenon':
             e['model'] = event['itemModelId']
         elif action not in ('startGame', 'advanceGF', 'setTargetPlayer', 'disease', 'die', 'endGame',
-                             'safe', 'block', 'selfCurse', 'redraw', 'counterAttack', 'reflect', 'bounce', 'danger', 'miss'):
+                             'safe', 'block', 'selfCurse', 'redraw', 'counterAttack', 'reflect', 'bounce', 'danger', 'miss', 'hit', 'removeGuardian', 'pray'):
             out['unsupported'].append('unknown_event')
+            if isinstance(action, str) and action in parser_module().GAME_STRINGS:
+                out['detail'].append(dict(code='unknown_event', action=action))
             e = dict(action='unsupported')
         out['events'].append(e)
     attacks = game.get('attacks', [])
     if attacks and not ended:
         if len(attacks) != 1:
-            out['unsupported'].append('multiple_pending_frames')
+            # official-state-view.md, v48: the client's fresh active pane uses
+            # only attacks[0]. nextAttack supplies subsequent active payloads;
+            # do not infer execution/history from the remaining queue.
+            guardians = ('none', 'mercury', 'venus', 'earth', 'moon',
+                         'mars', 'jupiter', 'saturn', 'uranus', 'neptune', 'pluto')
+            out['detail'].append(dict(code='multiple_pending_frames', count=len(attacks),
+                frames=[dict(playerId=_integer(a.get('playerId', 0)),
+                             targetPlayerId=None if a.get('targetPlayerId') is None else _integer(a['targetPlayerId']),
+                             itemModelIds=[_integer(m, 1, 296) for m in a.get('itemModelIds', [])],
+                             has_atk='atk' in a,
+                             guardian=a.get('guardian') if a.get('guardian') in guardians else 'none')
+                        for a in attacks]))
         a = attacks[0]
         models = [_integer(m, 1, 296) for m in a.get('itemModelIds', [])]
-        source = _integer(a.get('playerId', 0)); target = a.get('targetPlayerId', 0)
-        if not models or not target or source not in [p['id'] for p in players] or target not in [p['id'] for p in players]:
+        source = _integer(a.get('playerId', 0)); target = a.get('targetPlayerId')
+        if not models or target is None or source not in [p['id'] for p in players] or target not in [p['id'] for p in players]:
             out['unsupported'].append('ambiguous_pending_actor')
+            out['detail'].append(dict(code='ambiguous_pending_actor',
+                models=models, models_empty=not models, target_missing=not bool(target),
+                source_in_roster=source in [p['id'] for p in players],
+                target_in_roster=target in [p['id'] for p in players]))
         else:
             out['phase'] = 1; out['actor'] = target
             out['pending'] = dict(origin=source, source=source, target=target, models=models,
                                   guardian=a.get('guardian') or 'none', forced_hit=False,
-                                  reflections=0, bounces=0, counter=False, death=False)
-            if a.get('atk'):
+                                  reflections=0, bounces=0, counter=181 <= models[0] <= 188, death=False)
+            # Trade values, resource counters and 202's signed HP delta
+            # are not attack power: preserve native zero-power responses.
+            if 'atk' in a and models[0] not in (4, 5, 187, 188, 202):
                 out['pending']['base_override'] = _integer(a['atk'])
+            if models[0] in (187, 188, 202):
+                out['pending']['power'] = 0
+                if 'atk' in a:
+                    out['pending']['amount'] = _integer(a['atk'], -9007199254740991)
+            if models[0] in (4, 5):
+                out['pending']['power'] = 0
             if a.get('buyingItemModelId'):
                 out['phase'] = 3; out['actor'] = source; out['pending'] = None
                 out['purchase'] = dict(origin=source, buyer=source, seller=target,
@@ -196,8 +300,20 @@ def project_game(game, viewer, *, prior=None):
                 out['unsupported'].append('redirect_requires_history')
     if out['phase'] == 0:
         out['actor'] = out['owner']
+    # Pinned v2 client tn ignores this server field. It is public roster
+    # metadata, not a dead flag or evidence of a particular 112/208 schedule.
+    # Native PendingView.death/hit_rate and the unresolved death queue cannot
+    # be reconstructed from IDs alone. Never manufacture an observation/mask.
+    dying = game.get('dyingPlayerIds', [])
+    if dying:
+        out['dying_players'] = [_integer(pid) for pid in dying]
+        out['unsupported'].append('dying_players_decision_unavailable')
+        out['detail'].append(dict(code='dying_players_decision_unavailable',
+            phase=out['phase'], dying_players=list(out['dying_players']),
+            reason='native_death_state_not_reconstructible'))
     if out['actor'] == viewer and out['phase'] == 0 and own.get('confusionCount', 0):
         out['unsupported'].append('confused_main')
+        out['detail'].append(dict(code='confused_main', phase=0, own_confused=True))
     return out
 
 
@@ -222,23 +338,28 @@ class OfficialSession:
             trial.projection_prior = deepcopy(prior)
             self.__dict__.update(trial.__dict__)
             return result
-        except Exception:
-            return dict(status='unsupported', unsupported=['invalid_or_unknown_public_state'])
+        except Exception as error:
+            return dict(status='unsupported', unsupported=['invalid_or_unknown_public_state'],
+                        detail=exception_detail(error))
 
     def ingest_public(self, public):
         p = deepcopy(public)
         if self.previous and p['update'] <= self.previous['update']:
             if p == self.previous.get('_source'):
                 return dict(status='duplicate', unsupported=[])
-            return dict(status='unsupported', unsupported=['out_of_order_or_conflicting_update'])
+            return dict(status='unsupported', unsupported=['out_of_order_or_conflicting_update'],
+                        detail=dict(code='out_of_order_or_conflicting_update', older=p['update'] < self.previous['update']))
         if self.previous and p['update'] != self.previous['update'] + 1:
             self.history_complete = False
             self.pending_meta = None
         if self.previous and any(e['action'] == 'startGame' for e in p['events']):
-            return dict(status='unsupported', unsupported=['new_game_requires_new_session'])
+            return dict(status='unsupported', unsupported=['new_game_requires_new_session'],
+                        detail=dict(code='new_game_requires_new_session', start_game=True))
         if not self.previous:
             self.history_complete = (any(e['action'] == 'startGame' for e in p['events'])
                                      and not any(e['action'] == 'useAttackItems' for e in p['events']))
+        if any(e['action'] == 'unknownEvent' for e in p['events']):
+            self.history_complete = False
         before = deepcopy(self.previous) if self.previous else deepcopy(p)
         before.pop('_source', None)
         # Wire updates can contain multiple accepted decisions. A public ledger
@@ -251,6 +372,7 @@ class OfficialSession:
         actor = before.get('pending', {}).get('target') if before.get('pending') else before['owner']
         owner = before['owner']; gf = before['gf']
         phase = before['phase']; launch = self.pending_meta
+        removal_model = (before.get('pending') or {}).get('models', [None])[0]
 
         def flush():
             nonlocal action
@@ -290,15 +412,41 @@ class OfficialSession:
                 if e['reveals']:
                     self.history_complete = False
                 if not response:
+                    working.pop('removal', None)
+                    working.pop('sale', None)
+                    working['guardian_changes'] = []
+                    removal_model = faces[0] if faces else None
                     launch = dict(origin=actor, source=actor, counter=False, death=False,
                                   reflections=0, bounces=0)
+                    # The final received MP has already been spent. Only an
+                    # observed, contiguous launch can establish pre-spend MP.
+                    if (faces and faces[0] == 58 and not e['reveals'] and self.previous
+                            and p['update'] == self.previous['update'] + 1 and pane(actor) is not None
+                            and not any(x['action'] in ('unknownEvent', 'unsupported') for x in p['events'])):
+                        remaining_mp = pane(actor)['mp'] - _core._official_magic_cost(faces)
+                        if remaining_mp >= 0:
+                            launch.update(base_override=2 * remaining_mp, value_models=list(faces))
+            elif kind == 'pray':
+                # Some clients also send an empty useAttackItems marker.
+                if action is None:
+                    action = dict(before=deepcopy(working), gf=gf, phase=0, source=0,
+                                  actor=owner, kind=3, faces=[], faces_hidden=False,
+                                  target=None, allocation=None)
+                    working.pop('removal', None)
+                    working.pop('sale', None)
+                    working['guardian_changes'] = []
+                    launch = None
+                elif action['kind'] != 3:
+                    self.history_complete = False
             elif kind == 'setTargetPlayer':
                 target = e['player']
                 if action and action['phase'] == 0 and action['kind'] in (0, 5, 6):
                     action['target'] = target
             elif kind == 'nextAttack':
                 a = e['attack']; actor = a['playerId']
-                launch = dict(origin=actor, source=actor, counter=bool(a.get('atk')), death=False,
+                removal_model = a.get('itemModelIds', [None])[0]
+                launch = dict(origin=actor, source=actor,
+                              counter=removal_model in range(181, 189), death=False,
                               reflections=0, bounces=0)
             elif kind == 'reflect' and launch:
                 launch['reflections'] += 1
@@ -312,6 +460,27 @@ class OfficialSession:
                     key = 'mp' if kind == 'boostMP' else 'hp'
                     delta = -e['damage'] if kind == 'dealDamage' else e[key]
                     s[key] = min(99, max(0, s[key] + delta))
+            elif kind in ('boostCP', 'takeCP', 'boostCPOfEverybody'):
+                recipients = ([x['id'] for x in working['players'] if not x['dead']]
+                              if kind == 'boostCPOfEverybody' else [target])
+                source = launch['source'] if launch else None
+                if action is None or (kind == 'takeCP' and source is None):
+                    self.history_complete = False
+                else:
+                    for pid in recipients:
+                        s = pane(pid)
+                        if s is not None:
+                            s['cp'] = min(99, max(0, s['cp'] + (-e['cp'] if kind == 'takeCP' else e['cp'])))
+                    if kind == 'takeCP' and pane(source) is not None:
+                        s = pane(source)
+                        s['cp'] = min(99, max(0, s['cp'] + e['cp']))
+            elif kind == 'upgradeDisease':
+                s = pane(e['player'])
+                if action is None:
+                    self.history_complete = False
+                if s is not None:
+                    s['curses'] = sorted([c for c in s['curses'] if c not in CURSES[1:5]] +
+                                         [e['curse']], key=CURSES.index)
             elif kind == 'exchange':
                 s = pane(actor)
                 if s is not None:
@@ -331,13 +500,54 @@ class OfficialSession:
                             buyer[resource] -= paid; debt -= paid
                     if seller is not None:
                         seller['cp'] = min(99, seller['cp'] + price)
+                    if launch and e.get('buyer') is not None and e.get('seller') is not None:
+                        working['sale'] = dict(origin=launch['origin'], source=e['seller'],
+                            target=e['buyer'], model=models[1], price=price,
+                            overflow_model=e.get('overflow_model'))
+                    else:
+                        self.history_complete = False
+                    if e.get('overflow_unobserved'):
+                        self.history_complete = False
+                    elif e.get('overflow_model') is not None:
+                        player = next(x for x in working['players'] if x['id'] == e['buyer'])
+                        if e.get('overflow_used') and e['overflow_model'] in player['used']:
+                            player['used'].remove(e['overflow_model'])
                 else:
                     self.history_complete = False
+            elif kind in ('removeItems', 'removeUsedMiracles'):
+                model = 205 if kind == 'removeItems' else 206
+                if action is None or e['models'] != e['faces']:
+                    self.history_complete = False
+                if launch and removal_model == model:
+                    working['removal'] = dict(origin=launch['origin'], source=launch['source'],
+                                              target=e['player'], model=model, models=e['models'])
+                else:
+                    # A midgame receipt cannot identify the origin/source from
+                    # the recipient alone. Keep the public result, omit history.
+                    self.history_complete = False
+                player = next(x for x in working['players'] if x['id'] == e['player'])
+                if kind == 'removeUsedMiracles':
+                    for face in e['faces']:
+                        if face in player['used']:
+                            player['used'].remove(face)
+                        else:
+                            self.history_complete = False
+                # Event-time own inventory order and refills are not journaled;
+                # the received final pane below remains authoritative.
+            elif kind == 'removeGuardian':
+                s = pane(e['player'])
+                if s is None or s['guardian'] == 'none' or action is None:
+                    self.history_complete = False
+                if s is not None:
+                    if s['guardian'] != 'none':
+                        working.setdefault('guardian_changes', []).append(dict(
+                            player=e['player'], before=s['guardian'], after='none', reason='departure'))
+                    s['guardian'] = 'none'
             elif kind == 'die':
                 for x in working['players']:
                     if x['id'] == e['player']:
                         x['dead'] = True
-            elif kind in ('gift', 'replaceItems', 'startGame', 'safe', 'block', 'danger', 'miss', 'counterAttack', 'disease'):
+            elif kind in ('gift', 'replaceItems', 'startGame', 'safe', 'block', 'danger', 'miss', 'hit', 'counterAttack', 'disease'):
                 pass
             elif kind in ('addCurse', 'removeCurses', 'setGuardian', 'setCurseOfEverybody'):
                 # Event-time fog changes need a full visibility journal. Do not
@@ -348,17 +558,38 @@ class OfficialSession:
             else:
                 self.history_complete = False
         flush()
+        p['guardian_changes'] = deepcopy(working.get('guardian_changes', []))
+        if 'sale' in working:
+            p['sale'] = deepcopy(working['sale'])
+        if 'removal' in working:
+            p['removal'] = deepcopy(working['removal'])
         p['decisions'] = self.decisions
         p['last_decision'] = deepcopy(self.events[-1]['decision']) if self.events else None
+        if any(d['code'] == 'multiple_pending_frames' for d in p['detail']):
+            # The event tail need not describe the head of this queue. Never
+            # transfer its redirect/provenance/dynamic value onto another frame.
+            launch = None
+            self.history_complete = False
         if p['pending']:
             pending = p['pending']
             if launch:
-                pending.update(launch)
+                pending.update({k: v for k, v in launch.items() if k not in ('base_override', 'value_models')})
+                if ('base_override' not in pending and launch.get('value_models') == pending['models']
+                        and 'base_override' in launch):
+                    pending['base_override'] = launch['base_override']
                 if 'redirect_requires_history' in p['unsupported']:
                     p['unsupported'].remove('redirect_requires_history')
-            if pending['models'][0] in (58, 94, 202) and 'base_override' not in pending:
+            # Native 202 publishes signed amount; 58 publishes launch MP power.
+            # 94 responds at catalog power 30 (plus visible modifiers); a
+            # mortar's 99-power branch resolves immediately without response.
+            if pending['models'][0] == 202 and 'amount' not in pending:
+                magnitude = abs(_core.play_catalog()[202]['ability_value'])
+                pending.update(power=0, amount=-magnitude)
+                p.setdefault('warnings', []).append('assumed_dynamic_value: 202')
+            elif pending['models'][0] == 58 and 'base_override' not in pending:
                 p['unsupported'].append('dynamic_attack_value_unavailable')
-            if pending['guardian'] in ('earth', 'moon'):
+            if pending['guardian'] in ('earth', 'moon') and not _core._official_guardian_payload_supported(
+                    pending['guardian'], pending['models']):
                 p['unsupported'].append('earth_moon_payload')
             # DarkCloud is public only when the activation target pane is visible.
             s = next((x['status'] for x in p['players'] if x['id'] == pending['target']), None)
@@ -377,18 +608,25 @@ class OfficialSession:
         self.pending_meta = launch
         self.previous = deepcopy(p)
         self.previous['_source'] = deepcopy(public)
-        if p['unsupported']:
-            return dict(status='unsupported', public=p, unsupported=p['unsupported'],
+        fatal = [code for code in p['unsupported']
+                 if p['actor'] == self.viewer or code not in DECISION_ONLY_UNSUPPORTED]
+        if fatal:
+            return dict(status='unsupported', public=p, unsupported=p['unsupported'], detail=unsupported_detail(p),
                         history_complete=self.history_complete)
         if p['actor'] != self.viewer or p['is_over']:
             return dict(status='finished' if p['is_over'] else 'waiting', public=p,
-                        unsupported=p['unsupported'], history_complete=self.history_complete)
+                        unsupported=p['unsupported'], detail=unsupported_detail(p),
+                        history_complete=self.history_complete)
         try:
             env = OfficialDecision(p, self.events, self.history_len)
-        except (ValueError, RuntimeError, IndexError):
+        except (ValueError, RuntimeError, IndexError) as error:
+            detail = exception_detail(error)
+            frames = [d for d in p['detail'] if d['code'] == 'multiple_pending_frames']
             return dict(status='unsupported', public=p, unsupported=['unsupported_selection'],
+                        detail=frames + [dict(code='unsupported_selection', **detail)] if frames else detail,
                         history_complete=self.history_complete)
         return dict(status='decision', public=p, env=env, unsupported=[],
+                    detail=unsupported_detail(p),
                     history_complete=self.history_complete)
 
 
@@ -399,11 +637,15 @@ class OfficialDecision:
     """
     num_envs = 1
 
-    def __init__(self, public, events=(), history_len=64):
+    def __init__(self, public, events=(), history_len=64, *, excluded_ids=(),
+                 exclude_enemy_default_self=False, excluded_kinds=()):
         self.public = deepcopy(public)
         self.events = deepcopy(list(events))
         self.history_len = history_len
-        self.cursor = _core._OfficialCursor(self.public)
+        self.cursor = _core._OfficialCursor(dict(self.public,
+            exclude_enemy_default_self=exclude_enemy_default_self,
+            excluded_kinds=[KINDS.index(k) for k in excluded_kinds], excluded_slots=[
+            i for i, h in enumerate(self.public['hand']) if h['id'] in excluded_ids]))
         observation = _core._official_observation(self.public, self.events, history_len)
         for key in OBS_FIELDS:
             a = np.asarray(observation[key], dtype=DTYPES[key])[None]
@@ -438,12 +680,17 @@ class OfficialDecision:
         selected = [self.public['hand'][i] for i in c['slots']]
         faces = [h['face'] for h in selected]
         reasons = []
+        kind = KINDS[c['kind']]
+        if kind not in OBSERVED_UI_KINDS:
+            reasons.append(f'ui_kind_unobserved:{kind}')
+        catalog = _core.play_catalog()
+        if c['kind'] in (0, 5, 6) and c['target'] == self.public['viewer'] and faces and (
+                catalog[faces[0]]['targets_enemy_by_default']):
+            reasons.append('self_target_of_enemy_default_unobserved')
         if 94 in faces and 232 in faces:
             reasons.append('danger_wide_requires_unobservable_mortar_absence')
         if any(h['disguised'] for h in selected):
             reasons.append('dream_actual_execution_not_verified_from_public_faces')
-        if any(p['status'] and p['status']['guardian'] in ('earth', 'moon') for p in self.public['players']):
-            reasons.append('earth_moon_general_execution')
         return reasons
 
     def semantic_action(self):
@@ -468,10 +715,13 @@ class OfficialStreams:
     Parse only changed stream snapshots, ingest each update once in ascending
     order. Cache only public projections, hashes and stream byte boundaries.
     A baseline taken before starting a new game excludes older complete frames.
-    Never skip malformed/unknown streams and continue with a subset.
+    Never skip malformed/unknown streams and continue with a subset. An
+    explicit lenient_events option discards only unrecognized event elements.
     """
-    def __init__(self, session, baseline=()):
+    def __init__(self, session, baseline=(), *, lenient_events=False):
         self.session = session
+        self.lenient_events = lenient_events
+        self.replaced_events = []
         self.parser = parser_module()
         self.baseline = {self.stream_key(c['file']): c['bytes'] for c in baseline}
         self.hashes = {}
@@ -488,7 +738,8 @@ class OfficialStreams:
 
     def poll(self, captures):
         if self.failed:
-            return dict(status='unsupported', unsupported=['stream_reader_stopped'])
+            return dict(status='unsupported', unsupported=['stream_reader_stopped'],
+                        detail=self.failure_detail)
         try:
             games = []
             for c in captures:
@@ -502,12 +753,18 @@ class OfficialStreams:
                 digest = hashlib.sha256(raw).hexdigest()
                 if len(raw) != c['bytes'] or (c.get('sha256') and digest != c['sha256']):
                     raise ValueError('capture_integrity')
-                records = self.parser.parse_prefix(raw, self.session.viewer)['games']
+                if hasattr(self.parser, 'parse_capture'):
+                    records = self.parser.parse_capture(raw, self.session.viewer, self.baseline.get(key, 0),
+                        **({'lenient_events': True} if self.lenient_events else {}))['games']
+                else:
+                    records = self.parser.parse_prefix(raw, self.session.viewer,
+                        **({'lenient_events': True} if self.lenient_events else {}))['games']
                 if len({r['document_sequence'] for r in records if r['frame_end_byte'] > self.baseline.get(key, 0)}) > 1:
                     raise ValueError('multiple_documents')
-                games += [r['game'] for r in records if r['frame_end_byte'] > self.baseline.get(key, 0)]
+                games += [(r['game'], r.get('replaced_events', [])) for r in records
+                          if r['frame_end_byte'] > self.baseline.get(key, 0)]
                 self.hashes[key] = digest
-            for game in sorted(games, key=lambda g: g['updateCount']):
+            for game, replacements in sorted(games, key=lambda pair: pair[0]['updateCount']):
                 u = _integer(game['updateCount'])
                 if u in self.seen:
                     projected = project_game(game, self.session.viewer, prior=self.context[u])
@@ -519,12 +776,17 @@ class OfficialStreams:
                 result = self.session.ingest(game)
                 if result['status'] == 'unsupported':
                     self.failed = True
+                    self.failure_detail = result.get('detail', {})
                     return result
+                if replacements:
+                    self.replaced_events.extend(dict(update=u, **e) for e in replacements)
+                result['replaced_events'] = deepcopy(self.replaced_events)
                 self.context[u] = dict(pending=deepcopy(prior.get('pending'))) if prior else None
                 self.seen[u] = projected
                 self.latest = result
             return self.latest or dict(status='waiting', unsupported=[])
-        except Exception:
-            # Parser exceptions and hostile schema never include raw diagnostics.
+        except Exception as error:
             self.failed = True
-            return dict(status='unsupported', unsupported=['invalid_or_unknown_stream'])
+            self.failure_detail = exception_detail(error, self.parser.ParseError)
+            return dict(status='unsupported', unsupported=['invalid_or_unknown_stream'],
+                        detail=self.failure_detail)

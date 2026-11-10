@@ -1,4 +1,5 @@
 #include "vec_env.hpp"
+#include <godfield/official_rules.hpp>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
@@ -109,6 +110,18 @@ nb::dict schema(std::size_t k) {
 NB_MODULE(_core, m) {
     m.def("_official_search_root",&OfficialAccess::root);
     m.def("_official_observation",&official_observation);
+    m.def("_official_magic_cost",[](const std::vector<gf::CardId>& models){return gf::magic_cost(models);});
+    // Validate only the v33 typed model domain, using a synthetic public scene.
+    // This does not sample a future guardian action or inspect any inventory.
+    m.def("_official_guardian_payload_supported",[](const std::string& name,const std::vector<gf::CardId>& models){
+        const auto guardian=official_enum<gf::Guardian>(name,11,gf::guardian_name);
+        if(guardian!=gf::Guardian::earth && guardian!=gf::Guardian::moon)return false;
+        gf::SnapshotState state;
+        gf::PlayerState source;source.id=0;source.guardian=guardian;
+        gf::PlayerState target;target.id=7;
+        state.players={source,target};gf::Match match;match.load_scene(state,0,0);
+        return match.guardian_payload_legal({0,guardian,models,7});
+    });
     m.def("_official_board",[](nb::dict d){return play_board(official_view(d));});
     nb::class_<OfficialCursor>(m,"_OfficialCursor")
         .def(nb::init<nb::dict>()).def("state",&OfficialCursor::state)
@@ -165,6 +178,7 @@ NB_MODULE(_core, m) {
             x["element"]=c.element ? nb::cast(gf::element_name(*c.element).data()) : nb::none();
             x["atk"]=c.atk;x["plus"]=c.is_plus_atk;x["defense"]=c.defense;
             x["hit_rate"]=c.hit_rate;x["cost"]=c.cost;x["price"]=c.price;
+            x["targets_enemy_by_default"]=gf::targets_enemy_by_default(c.id);
             x["ability"]=gf::ability_name(c.ability).data();x["ability_value"]=c.ability_value;
             out[nb::int_(c.id)]=x;
         }return out;

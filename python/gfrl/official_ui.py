@@ -4,20 +4,25 @@ Only public state and probe-visible geometry enter this module. Names are used
 transiently to locate the own pane and never returned in plans or diagnostics.
 """
 from collections import Counter
+from copy import deepcopy
 import json
 import re
 import time
 
-from .official import ROOT
+from .official import ROOT, OBSERVED_UI_KINDS
+from . import MatchConfig, _core
 
 
 class UIUnsupported(Exception):
-    """Fixed, non-sensitive stop code."""
+    """Fixed stop code with separately constructed public diagnostics."""
+    def __init__(self, code, detail=None):
+        super().__init__(code)
+        self.detail = detail or {}
 
 
-def require(condition, code):
+def require(condition, code, detail=None):
     if not condition:
-        raise UIUnsupported(code)
+        raise UIUnsupported(code, detail)
 
 
 def item_paths():
@@ -27,6 +32,25 @@ def item_paths():
 
 
 PATHS = item_paths()
+PUBLIC_PATHS = frozenset(PATHS.values())
+
+
+def card_detail(expected, actual, clicks=()):
+    def counts(values):
+        safe = Counter()
+        for path, count in values.items():
+            safe[path if path in PUBLIC_PATHS else '?'] += count
+        return dict(sorted(safe.items()))
+    seen = Counter(); attempted = []
+    for click in clicks:
+        path = click['path']; seen[path] += 1
+        attempted.append(dict(path=path, x=click['x'], y=click['y'],
+                              appeared=actual[path] >= seen[path]))
+    return dict(expected=counts(expected), actual=counts(actual), clicks=attempted)
+
+
+def band_detail(bands):
+    return dict(count=len(bands), x=sorted(r['x'] for r in bands))
 
 
 def point(x, y):
@@ -35,8 +59,10 @@ def point(x, y):
 
 def hand_images(state):
     return sorted([r for r in state['images'] if r['path'].startswith('/images/items/')
-                   and r['w'] == r['h'] == 80 and 190 <= r['x'] <= 846
-                   and r['y'] in (493, 595)], key=lambda r: (r['y'], r['x']))
+                   and r['path'] != '/images/items/fake.webp'
+                   and r['w'] == r['h'] == 80
+                   and 180 <= r['x'] and r['x']+r['w'] <= 930
+                   and 480 <= r['y'] and r['y']+r['h'] <= 700], key=lambda r: (r['y'], r['x']))
 
 
 def pane_x(state, name):
@@ -45,49 +71,130 @@ def pane_x(state, name):
     bands = [r for r in state.get('texts', []) if r['text'] == name
              and 55 <= r['y'] <= 95 and 195 <= r['x'] < 840]
     sides = {350 if r['x'] + r['w']/2 < 520 else 690 for r in bands}
-    require(len(bands) == len(sides) == 1, 'own_name_band_not_unique')
+    require(len(bands) == len(sides) == 1, 'own_name_band_not_unique', band_detail(bands))
     return sides.pop()
+
+
+def own_fog(public):
+    own = next(p for p in public['players'] if p['id'] == public['viewer'])
+    return bool(own['status'] and 'fog' in own['status']['curses'] and not own.get('dead', False))
 
 
 def verify_target(state, public, action, name, x):
     """Two-player target shown by the top name bands after card selection.
 
-    A foreign band across from the own band is the opponent at the arrow's
-    destination. A lone own band can mean no target or self. Do not click a
-    target to repair a mismatch: unfamiliar layouts must be recorded first.
+    A destination band across from the acting pane identifies the target.
+    With target None, either a lone own band or an opponent destination is valid;
+    the server chooses the target and both displays use the same confirmation.
+    A self destination must still stop.
     """
+    if own_fog(public) and public['phase'] == 0 and action['target'] not in (None, public['viewer']):
+        return  # Fog chooses a uniform enemy at launch; no visible arrow is required.
+    target = action['target']
     bands = [r for r in state.get('texts', []) if 55 <= r['y'] <= 95
              and 195 <= r['x'] < 840
              and min(abs(r['x'] + r['w']/2 - c) for c in (350, 690)) <= 140]
-    own = [r for r in bands if r['text'] == name]
-    foreign = [r for r in bands if r['text'] != name]
-    require(len(own) == 1 and len(foreign) <= 1, 'target_name_bands_ambiguous')
-    if foreign:
-        r = foreign[0]
-        side = 350 if r['x'] + r['w']/2 < 520 else 690
-        require(side == 1040-x, 'target_name_bands_ambiguous')
-        other = next(p['id'] for p in public['players'] if p['id'] != public['viewer'])
-        require(action['target'] == other, 'visible_target_mismatch')
+    expected = 'self' if target == public['viewer'] else 'none' if target is None else 'opponent'
+    detail = dict(expected_target=expected, bands=[dict(side='left' if r['x']+r['w']/2 < 520 else 'right',
+                  owner='self' if r['text'] == name else 'opponent', x=r['x'], y=r['y'], w=r['w'], h=r['h'])
+                  for r in bands])
+    detail.update(band_detail(bands))
+    acting = [r for r in bands if (350 if r['x']+r['w']/2 < 520 else 690) == x]
+    destination = [r for r in bands if r not in acting]
+    require(len(acting) == 1 and acting[0]['text'] == name and len(destination) <= 1,
+            'target_name_bands_ambiguous', detail)
+    if destination:
+        actual = public['viewer'] if destination[0]['text'] == name else next(
+            p['id'] for p in public['players'] if p['id'] != public['viewer'])
+        require(target == actual or (target is None and len(public['players']) == 2
+                                     and actual != public['viewer']), 'visible_target_mismatch', detail)
     else:
-        require(action['target'] in (None, public['viewer']), 'visible_target_mismatch')
+        require(target in (None, public['viewer']), 'visible_target_mismatch', detail)
+
+
+def target_point(state, public, action, name):
+    own_y = own_status_row(state, name)
+    y = own_y if action['target'] == public['viewer'] else 395-own_y
+    rows = [r for r in status_names(state) if y <= r['y'] < y+40]
+    require(len(rows) == 1 and (rows[0]['text'] == name) == (action['target'] == public['viewer']),
+            'target_switch_failed', dict(stage='status_band', target_row=y))
+    r = rows[0]
+    return point(r['x']+r['w']/2, r['y']+r['h']/2)
+
+
+def verify_switched_target(state, public, action, name, x):
+    verify_target(state, public, action, name, x)
+    bands = [r for r in state.get('texts', []) if 55 <= r['y'] <= 95 and 195 <= r['x'] < 840]
+    require(len(bands) == 2 and state.get('targetArrow') == ('right' if x == 350 else 'left'),
+            'target_switch_failed', dict(stage='arrow_and_bands', **band_detail(bands)))
+
+
+def selected_images(state, x):
+    return [r for r in state['images'] if r['path'].startswith('/images/items/')
+            and r['w'] == r['h'] == 80 and x-145 <= r['x']
+            and r['x']+r['w'] <= x+145 and 0 <= r['y'] < 480]
 
 
 def selected(state, x):
-    return Counter(r['path'] for r in state['images'] if r['path'].startswith('/images/items/')
-                   and r['w'] == r['h'] == 80 and r['x'] == x-145 and 103 <= r['y'] <= 403)
+    return Counter(r['path'] for r in selected_images(state, x))
 
 
-def preview(state):
+def confirmation_point(state, x, preferred):
+    images = selected_images(state, x)
+    # Preserve the witnessed point when clear; otherwise search the pane's
+    # inner edges. No assumption about selected-card rows or spacing is needed.
+    candidates = [preferred] + [point(cx, y) for cx in (x-140, x+140)
+                                 for y in range(103, 480)]
+    for p in candidates:
+        if not any(r['x'] <= p['x'] <= r['x']+r['w'] and
+                   r['y'] <= p['y'] <= r['y']+r['h'] for r in images):
+            return p
+    raise UIUnsupported('confirmation_point_unavailable')
+
+
+def preview(state, public=None):
     matches = re.findall(r'HP\s*(\d+)\s*MP\s*(\d+)\s*[¥￥]\s*(\d+)', state['body'])
-    require('+10' in state['body'] and len(matches) == 3, 'exchange_preview_missing')
+    groups = 2 if public is not None and own_fog(public) else 3
+    require('+10' in state['body'] and len(matches) == groups, 'exchange_preview_missing',
+            dict(expected=dict(resource_groups=groups, plus10=True),
+                 actual=dict(resources=[list(map(int, m)) for m in matches], plus10='+10' in state['body'])))
     return dict(zip(('hp', 'mp', 'cp'), map(int, matches[-1])))
 
 
-def verify_resources(state, public):
+def status_names(state):
+    return [r for r in state.get('texts', []) if 860 <= r['x'] < 1025
+            and r['w'] > 0 and r['h'] > 0
+            and any(y <= r['y'] and r['y']+r['h'] <= y+40 for y in (131, 264))]
+
+
+def own_status_row(state, name):
+    rows = [r for r in status_names(state) if r['text'] == name]
+    require(len(rows) == 1, 'own_status_band_not_unique', band_detail(rows))
+    return 131 if rows[0]['y'] < 171 else 264
+
+
+def verify_resources(state, public, name=None):
     matches = re.findall(r'HP\s*(\d+)\s*MP\s*(\d+)\s*[¥￥]\s*(\d+)', state['body'])
     actual = sorted(tuple(map(int, m)) for m in matches[:2])
-    expected = sorted(tuple(p['status'][k] for k in ('hp', 'mp', 'cp')) for p in public['players'])
-    require(actual == expected, 'visible_resources_mismatch')
+    if own_fog(public):
+        if name is None:
+            # Direct diagnostic callers can identify the sole visible status
+            # name in fog; execution always supplies the known own name.
+            rows = status_names(state)
+            require(len(rows) == 1, 'own_status_band_not_unique', band_detail(rows))
+            name = rows[0]['text']
+        y = 264 if own_status_row(state, name) == 131 else 131
+        require(any(abs(r['x']-860)<=1 and abs(r['y']-y)<=1 and
+                    abs(r['w']-340)<=1 and abs(r['h']-40)<=1 for r in state.get('fogBands', [])),
+                'fog_status_band_missing', dict(expected_y=y))
+        require(not any(860 <= r['x'] < 1200 and y <= r['y'] < y+40
+                        for r in state.get('texts', [])), 'fog_status_band_not_empty')
+        require(len(matches) == 1 or ('+10' in state['body'] and len(matches) == 2),
+                'visible_resources_mismatch', dict(resource_groups=len(matches)))
+        actual = sorted(tuple(map(int, m)) for m in matches[:1])
+    expected = sorted(tuple(p['status'][k] for k in ('hp', 'mp', 'cp'))
+                      for p in public['players'] if p['status'] is not None)
+    require(actual == expected, 'visible_resources_mismatch', dict(expected=expected, actual=actual))
 
 
 def verify_scene(state, public):
@@ -101,17 +208,50 @@ def verify_scene(state, public):
             'visible_animation')
 
 
+def purchase_button(state, public, name, kind):
+    require(public['phase'] == 3 and pane_x(state, name) == 350, 'purchase_layout_mismatch')
+    require(public.get('purchase') and public['purchase']['buyer'] == public['viewer'],
+            'purchase_buyer_mismatch')
+    buttons = {}
+    for text, top in [('買う', 100), ('買わない', 300)]:
+        rows = [r for r in state.get('texts', []) if r['text'] == text
+                and 205 <= r['x'] and r['x']+r['w'] <= 495
+                and top <= r['y'] and r['y']+r['h'] <= top+85]
+        require(len(rows) == 1, 'purchase_buttons_mismatch')
+        r = rows[0]
+        require(r['w'] > 0 and r['h'] >= 40 and abs(r['x']+r['w']/2-350) <= 5,
+                'purchase_buttons_mismatch')
+        buttons[text] = point(r['x']+r['w']/2, r['y']+r['h']/2)
+    offer = [r['path'] for r in state['images'] if 540 <= r['x'] and r['x']+r['w'] <= 840
+             and 198 <= r['y'] and r['y']+r['h'] <= 288 and r['w'] == r['h'] == 80]
+    require(offer == [PATHS.get(public['purchase']['model'])], 'purchase_offer_mismatch')
+    return buttons['買う' if kind == 'accept' else '買わない']
+
+
+def verify_attack(state, public, x):
+    expected = Counter(PATHS.get(m) for m in public['pending']['models'])
+    require(selected(state, 1040-x) == expected, 'visible_attack_mismatch',
+            card_detail(expected, selected(state, 1040-x)))
+
+
 def ready(state, public, name):
     """Visible prerequisites for converting a fresh received decision."""
     verify_scene(state, public)
-    x = pane_x(state, name)
+    try:
+        x = pane_x(state, name)
+    except UIUnsupported as error:
+        if (str(error) == 'own_name_band_not_unique' and error.detail.get('count') == 0
+                and own_fog(public) and public['phase'] == 1):
+            raise UIUnsupported('fog_response_ui_unobserved',
+                                dict(phase='response', own_name_bands=0)) from None
+        raise
     require(not selected(state, x), 'pane_already_selected')
     expected = Counter(PATHS.get(h['face']) for h in public['hand'])
-    require(Counter(r['path'] for r in hand_images(state)) == expected, 'visible_hand_mismatch')
-    verify_resources(state, public)
+    actual = Counter(r['path'] for r in hand_images(state))
+    require(actual == expected, 'visible_hand_mismatch', card_detail(expected, actual))
+    verify_resources(state, public, name)
     if public['phase'] == 1:
-        expected = Counter(PATHS.get(m) for m in public['pending']['models'])
-        require(selected(state, 1040-x) == expected, 'visible_attack_mismatch')
+        verify_attack(state, public, x)
 
 
 def wait_visible(probe, state, check, *, timeout=30, refresh=None):
@@ -148,22 +288,24 @@ def allocation_steps(start, end):
                     require(all(0 <= v <= 99 for v in current.values()), 'allocation_intermediate_out_of_range')
                     y = {10: 123, 1: 183, -1: 303, -10: 363}[sign*magnitude]
                     steps.append((point(x, y), dict(current)))
-    require(current == end, 'allocation_mismatch')
+    require(current == end, 'allocation_mismatch', dict(expected=end, actual=current))
     return steps
 
 
-def prepare(state, public, action, name):
+def prepare(state, public, action, name, *, dream_last_resort=False):
     """Validate whole semantic command before the first UI mutation."""
     require((action['expected_update'], action['expected_gf'], action['viewer']) ==
             (public['update'], public['gf'], public['viewer']), 'stale_advice')
     require(public['actor'] == public['viewer'] and len(public['players']) == 2
             and not public['is_over'], 'not_own_decision')
-    require(not public['unsupported'] and all(p['status'] is not None and
-            not p.get('fogged', False) and 'fog' not in p['status']['curses']
-            and not p['status']['confused'] for p in public['players']),
+    require(not public['unsupported'] and all(
+            (p['status'] is not None and not p['status']['confused']) or
+            (own_fog(public) and p['id'] != public['viewer'] and p.get('fogged', False))
+            for p in public['players']),
             'unobserved_screen_effect')
     kind = action['kind']
-    require(kind in ('play', 'defend', 'exchange', 'sell', 'buy', 'pray'), 'unobserved_ui_kind')
+    require(kind in OBSERVED_UI_KINDS, 'unobserved_ui_kind', dict(kind=kind))
+    require((kind in ('accept', 'decline')) == (public['phase'] == 3), 'ui_phase_mismatch')
     require((kind == 'defend') == (public['phase'] == 1), 'ui_phase_mismatch')
     other = next(p['id'] for p in public['players'] if p['id'] != public['viewer'])
     require(action['target'] in (None, other, public['viewer']), 'unknown_target')
@@ -177,8 +319,11 @@ def prepare(state, public, action, name):
         require(len(action['cards']) == {'sell': 2, 'buy': 1, 'pray': 0}[kind], 'invalid_kind_cards')
     if kind in ('sell', 'buy'):
         require(action['cards'][0]['model'] == {'sell': 4, 'buy': 5}[kind], 'invalid_trade_card')
-    require(len(action['cards']) <= 4, 'selected_pane_capacity_unverified')
-    verify_resources(state, public)
+    require(len(action['cards']) <= MatchConfig().hand_limit, 'selected_cards_over_hand_limit')
+    verify_resources(state, public, name)
+    if own_fog(public) and public['phase'] == 1:
+        x = pane_x(state, name)
+        verify_attack(state, public, x)
     expected_ops = [dict(op='kind', kind=kind)]
     expected_ops += [dict(op='select_card', **c) for c in action['cards']]
     expected_ops += [dict(op='finish_cards'), dict(op='target', player_id=action['target'])]
@@ -188,6 +333,12 @@ def prepare(state, public, action, name):
     require(action['operations'] == expected_ops, 'unknown_operations')
     x = pane_x(state, name)
     require(not selected(state, x), 'pane_already_selected')
+    if kind in ('accept', 'decline'):
+        require(not action['cards'] and action['target'] is None and action['allocation'] is None,
+                'invalid_purchase_action')
+        confirm = purchase_button(state, public, name, kind)
+        return dict(cards=[], stages=[], attempted=[], card_paths=[], allocation=[],
+                    confirm=confirm, pane=x, commands=[confirm])
     own = {h['id']: h for h in public['hand']}
     ids = [c['item_id'] for c in action['cards']]
     require(len(ids) == len(set(ids)), 'duplicate_selected_id')
@@ -197,13 +348,15 @@ def prepare(state, public, action, name):
         require(h is not None and h['face'] == card['model'], 'card_not_in_public_hand')
         require(not h['used'] or PATHS.get(h['face'], '').startswith('/images/items/miracles/'),
                 'card_not_in_public_hand')
-        require(not any(i['disguised'] for i in public['hand'] if i['face'] == h['face']), 'ambiguous_disguised_face')
+        require(dream_last_resort or not any(i['disguised'] for i in public['hand']
+                if i['face'] == h['face']), 'ambiguous_disguised_face')
         path = PATHS.get(card['model'])
         matches = [r for r in available if r['path'] == path]
         require(path and matches, 'card_image_missing')
         copies = [i for i in public['hand'] if i['face'] == h['face']]
         all_matches = [r for r in hand_images(state) if r['path'] == path]
-        require(len(all_matches) == len(copies), 'visible_hand_mismatch')
+        require(len(all_matches) == len(copies), 'visible_hand_mismatch',
+                card_detail(Counter({path: len(copies)}), Counter({path: len(all_matches)})))
         if {i['used'] for i in copies} == {False, True}:
             # auto6 and live1 after reuse: the single used miracle occupies
             # the bottom-right slot; unused overflow starts at bottom-left.
@@ -226,41 +379,72 @@ def prepare(state, public, action, name):
         require(action['allocation'] is None, 'unexpected_allocation')
         require(action['cards'] or kind in ('defend', 'pray'), 'unobserved_prayer')
     confirm = point(x, 250 if kind == 'exchange' else 193)
-    return dict(cards=clicks, stages=stages, allocation=allocation, confirm=confirm, pane=x,
+    return dict(cards=clicks, stages=stages, attempted=[], card_paths=[PATHS[c['model']] for c in action['cards']],
+                allocation=allocation, confirm=confirm, pane=x,
                 commands=clicks+[c for c, _ in allocation]+[confirm])
 
 
 def verify(state, public, name, plan, expected):
-    require(pane_x(state, name) == plan['pane'], 'own_pane_changed')
-    require(selected(state, plan['pane']) == Counter(expected), 'selected_cards_mismatch')
-    verify_resources(state, public)
+    if own_fog(public) and public['phase'] == 1:
+        verify_attack(state, public, plan['pane'])
+    if plan.get('target_switched'):
+        bands = [r for r in state.get('texts', []) if r['text'] == name
+                 and 55 <= r['y'] <= 95 and 195 <= r['x'] < 840
+                 and (350 if r['x']+r['w']/2 < 520 else 690) == plan['pane']]
+        require(len(bands) == 1, 'own_pane_changed')
+    else:
+        require(pane_x(state, name) == plan['pane'], 'own_pane_changed')
+    require(selected(state, plan['pane']) == Counter(expected), 'selected_cards_mismatch',
+            card_detail(Counter(expected), selected(state, plan['pane']), plan.get('attempted', [])))
+    verify_resources(state, public, name)
     verify_scene(state, public)
 
 
-def execute(probe, state, public, action, name, *, commands=None, settle_timeout=30, refresh=None):
+def execute(probe, state, public, action, name, *, commands=None, settle_timeout=30, refresh=None, dream_last_resort=False):
     """Send one click at a time and verify its resulting visible state.
 
     Caller owns capture/update acceptance and saving a screenshot on failure.
     commands is populated before dispatch, including a failed attempted click.
     """
-    plan = prepare(state, public, action, name)
+    plan = prepare(state, public, action, name, dream_last_resort=dream_last_resort)
     commands = commands if commands is not None else []
     expected = {}
     def settled(state, expected, values=None, initial=False, final=False):
         def check(s):
             verify(s, public, name, plan, expected)
+            if action['kind'] in ('accept', 'decline'):
+                purchase_button(s, public, name, action['kind'])
             if final and action['kind'] in ('play', 'sell', 'buy', 'pray'):
                 verify_target(s, public, action, name, plan['pane'])
             if values is not None:
-                require(preview(s) == values,
-                        'exchange_initial_mismatch' if initial else 'exchange_value_mismatch')
+                actual = preview(s, public)
+                require(actual == values,
+                        'exchange_initial_mismatch' if initial else 'exchange_value_mismatch',
+                        dict(expected=values, actual=actual))
         return wait_visible(probe, state, check, timeout=settle_timeout, refresh=refresh)
 
-    for command, expected in zip(plan['cards'], plan['stages']):
+    for index, (command, expected) in enumerate(zip(plan['cards'], plan['stages'])):
         if refresh is not None:
             refresh()
+        before = deepcopy(state)
+        previous = plan['stages'][index-1] if index else {}
+        attempt = dict(path=plan['card_paths'][index], x=command['x'], y=command['y'])
+        plan['attempted'].append(attempt)
         commands.append(command); state = probe.send(command)['state']
-        state = settled(state, expected)
+        try:
+            state = settled(state, expected)
+        except UIUnsupported as error:
+            if str(error) != 'selected_cards_mismatch' or settle_timeout <= 0:
+                raise
+            state = probe.send(dict(kind='state'))['state']
+            if not same_selection(state, before, public, name, plan, previous):
+                raise error
+            if refresh is not None:
+                refresh()
+            plan.setdefault('selection_retries', []).append(index)
+            plan['attempted'].append(dict(attempt))
+            commands.append(command); state = probe.send(command)['state']
+            state = settled(state, expected)
     if plan['allocation']:
         start = next(p['status'] for p in public['players'] if p['id'] == public['viewer'])
         state = settled(state, expected, {k: start[k] for k in ('hp', 'mp', 'cp')}, initial=True)
@@ -269,8 +453,85 @@ def execute(probe, state, public, action, name, *, commands=None, settle_timeout
                 refresh()
             commands.append(command); state = probe.send(command)['state']
             state = settled(state, expected, values)
+    state = settled(state, expected)
+    if action['kind'] in ('play', 'sell', 'buy', 'pray'):
+        try:
+            verify_target(state, public, action, name, plan['pane'])
+        except UIUnsupported as error:
+            if str(error) != 'visible_target_mismatch' or action['target'] is None:
+                raise
+            try:
+                command = target_point(state, public, action, name)
+                if refresh is not None:
+                    refresh()
+                plan['target_switched'] = True
+                plan['commands'].insert(len(plan['cards']), command)
+                commands.append(command)
+                state = probe.send(command)['state']
+                def switched(s):
+                    verify(s, public, name, plan, expected)
+                    verify_switched_target(s, public, action, name, plan['pane'])
+                state = wait_visible(probe, state, switched, timeout=settle_timeout, refresh=refresh)
+            except UIUnsupported as failed:
+                raise UIUnsupported('target_switch_failed', dict(error.detail, **failed.detail)) from None
     state = settled(state, expected, final=True)
     if action['kind'] == 'exchange':
-        require(preview(state) == action['allocation'], 'exchange_final_mismatch')
+        actual = preview(state, public)
+        require(actual == action['allocation'], 'exchange_final_mismatch',
+                dict(expected=action['allocation'], actual=actual))
+    plan['confirmation_state'] = state
+    if action['kind'] not in ('accept', 'decline'):
+        plan['confirm'] = confirmation_point(state, plan['pane'], plan['confirm'])
+        plan['commands'][-1] = plan['confirm']
     commands.append(plan['confirm']); probe.send(plan['confirm'])
     return plan
+
+
+def same_selection(state, before, public, name, plan, expected):
+    """A missing click is retryable only while the decision remains unchanged."""
+    try:
+        verify(state, public, name, plan, expected)
+        def bands(s):
+            return [r for r in s.get('texts', []) if 55 <= r['y'] <= 95
+                    and 195 <= r['x'] < 840]
+        return (hand_images(state) == hand_images(before)
+                and selected_images(state, plan['pane']) == selected_images(before, plan['pane'])
+                and selected_images(state, 1040-plan['pane']) == selected_images(before, 1040-plan['pane'])
+                and bands(state) == bands(before)
+                and state.get('targetArrow') == before.get('targetArrow'))
+    except UIUnsupported:
+        return False
+
+
+def same_confirmation(state, public, action, name, plan):
+    """Retry only a positively identical visible confirmation, never selection."""
+    try:
+        verify(state, public, name, plan, plan['stages'][-1] if plan['stages'] else {})
+        if action['kind'] in ('accept', 'decline'):
+            purchase_button(state, public, name, action['kind'])
+        elif action['kind'] in ('play', 'sell', 'buy', 'pray'):
+            verify_target(state, public, action, name, plan['pane'])
+            if plan.get('target_switched'):
+                verify_switched_target(state, public, action, name, plan['pane'])
+        if action['kind'] == 'exchange':
+            require(preview(state, public) == action['allocation'], 'exchange_final_mismatch')
+        # Tooltips, sound meters and other incidental UI can change after a
+        # click. Compare the decision geometry, not the entire probe snapshot.
+        before = plan['confirmation_state']
+        return (hand_images(state) == hand_images(before)
+                and selected(state, 1040-plan['pane']) == selected(before, 1040-plan['pane']))
+    except UIUnsupported:
+        return False
+
+
+def allow_button(state, public, action, name, plan):
+    """Only an empty response can safely use the explicit Allow control."""
+    require(public['phase'] == 1 and action['kind'] == 'defend' and not action['cards'],
+            'allow_button_not_empty_response')
+    ready(state, public, name)
+    require(plan['pane'] == pane_x(state, name) == 690, 'allow_button_scene_changed')
+    rows = [r for r in state.get('texts', []) if r['text'] == '許す'
+            and 560 <= r['x'] and r['x']+r['w'] <= 820
+            and 403 <= r['y'] and r['y']+r['h'] <= 443 and r['w'] > 0 and r['h'] > 0]
+    require(len(rows) == 1, 'allow_button_missing')
+    return point(690, 423)
