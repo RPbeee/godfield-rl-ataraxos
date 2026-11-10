@@ -154,6 +154,11 @@ void VecEnv::record_decision(std::size_t i, bool automatic) {
             e.history[seat].set_projection(projected);
         }
     }
+    if(e.play_seat) {
+        const auto seat=*e.play_seat;
+        const auto viewer=e.before[seat].board.viewer;
+        e.play_events.push_back({e.before[seat],e.match.view(viewer),*e.match.last_decision(viewer)});
+    }
     e.encoded=false;
     ++e.stats.decisions;
     if (automatic) ++e.stats.automatic_decisions;
@@ -427,4 +432,36 @@ void VecEnv::observe(std::span<const std::int32_t> rows, std::span<const std::in
     }
 }
 
+}
+
+namespace gfrl {
+gf::MatchView VecEnv::play_view(std::size_t row, int seat) const {
+    std::lock_guard lock(api_mutex_);
+    if(seat<0 || seat>1)throw std::out_of_range("seat");
+    const auto& m=envs_.at(row).match;
+    return m.view(m.snapshot().state.players.at(seat).id);
+}
+void VecEnv::enable_play_trace(std::size_t row, int seat) {
+    std::lock_guard lock(api_mutex_);
+    if(seat<0 || seat>1)throw std::out_of_range("seat");
+    auto& e=envs_.at(row);e.play_seat=seat;e.play_events.clear();
+}
+std::vector<PlayEvent> VecEnv::take_play_trace(std::size_t row) {
+    std::lock_guard lock(api_mutex_);
+    std::vector<PlayEvent> out;out.swap(envs_.at(row).play_events);return out;
+}
+std::vector<gf::HandItemView> VecEnv::play_hand(std::size_t row, int seat) const {
+    std::lock_guard lock(api_mutex_);
+    if(seat<0 || seat>1)throw std::out_of_range("seat");
+    const auto& m=envs_.at(row).match;
+    const auto& own=m.snapshot().state.players.at(seat);
+    const auto v=m.view(own.id);
+    std::vector<gf::HandItemView> out;
+    for(const auto& item:own.items) {
+        const auto it=std::find_if(v.board.hand.begin(),v.board.hand.end(),[&](const auto& h){return h.token==item.token;});
+        if(it==v.board.hand.end())throw std::runtime_error("own visible slot missing");
+        out.push_back(*it);
+    }
+    return out;
+}
 }

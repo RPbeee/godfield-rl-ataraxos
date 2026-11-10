@@ -17,6 +17,10 @@ template<class T> struct Buffer {
     T& operator[](std::size_t i) { return storage[i]; }
     const T& operator[](std::size_t i) const { return storage[i]; }
 };
+struct PlayEvent {
+    gf::MatchView before, after;
+    gf::PublicDecision decision;
+};
 struct Stats {
     std::uint64_t episodes = 0, decisions = 0, policy_stages = 0, automatic_decisions = 0,
                   truncations = 0, confusion_decisions = 0, grant_decisions = 0, history_dropped = 0, card_overflow = 0, used_overflow = 0, token_overflow = 0;
@@ -74,11 +78,18 @@ public:
     std::vector<int> next_actor_seats(std::span<const std::int32_t> rows) const;
     void observe(std::span<const std::int32_t> rows, std::span<const std::int32_t> seats);
     std::array<std::int32_t,297> unused_assignment(std::size_t row, std::span<const std::int32_t> assignment) const;
+    gf::MatchView play_view(std::size_t row, int seat) const;
+    void enable_play_trace(std::size_t row, int seat);
+    std::vector<PlayEvent> take_play_trace(std::size_t row);
+    // Own visible faces in Selection slot order, never inventory tokens.
+    std::vector<gf::HandItemView> play_hand(std::size_t row, int seat) const;
     const gf::Match& match(std::size_t i) const { return envs_.at(i).match; }
 private:
     friend struct TestAccess;
     struct Env {
         gf::Match match;
+        std::optional<int> play_seat;
+        std::vector<PlayEvent> play_events;
         std::optional<Selection> selection;
         std::uint64_t chance_rng = 0, episode = 0;
         std::array<std::uint64_t,2> policy_rng{};

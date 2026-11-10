@@ -92,3 +92,57 @@ scripts/tsubame_run.sh scripts/bench_training.py --help
 `MALLOC_TRIM_THRESHOLD_=68719476736`、`MALLOC_TOP_PAD_=1073741824` を設定し、
 `module` があれば libstdc++ 用に `gcc/14.2.0` をロードする。
 `OMP_NUM_THREADS` は未設定なら4（指定済みならその値）を使う。
+
+## ターミナルで対局
+
+```sh
+.venv/bin/python scripts/play.py --checkpoint runs/play/m-2166.pt --seat random --seed 0
+.venv/bin/python scripts/play.py --checkpoint runs/play/m-2166.pt --search --belief runs/play/belief-ar-m.pt --device cpu
+.venv/bin/python scripts/play.py --checkpoint runs/play/m-2166.pt --greedy --games 3 --log runs/play/matches.jsonl --no-color
+```
+
+チェックポイントの `ema` と `model_config` は評価と同じローダーで読み込む。
+席は `--seat 0|1|random`。番号で合法な選択肢を選び、カードを1枚ずつ追加して
+「これで決定」で確定する。`h` はヘルプ、`s` は盤面、`q` / EOF / Ctrl-C は終了。
+合法な選択肢が1つの段階、混乱、配布は評価と同じ VecEnv が自動処理する。
+各局は評価用 seed `--seed + 局番号 - 1` の最初の対局を使う。既定の規則・chance
+処理は変更しない。512決定での打切りは引き分け。
+
+表示・JSONL は人の席の `Match::view` / `last_decision` の公開情報から作る。
+霧で見えない状態は非表示とし、夢のカードは見かけの名前・性能を使う。
+選択時の手札番号は VecEnv のスロットと対応するが、物理 token や乱数は出力しない。
+`--reveal` はデバッグ用で、相手の手札も表示する。oracle belief は対局では禁止。
+JSONL は追記式で、開始・各入力・公開決定の前後の盤面・可視の結果・勝敗・中断を記録する。
+
+探索は `eval_search.py` と同じ `SearchAgent` / belief ローダーを使う。
+既定は **worlds=64 (M64)、depth=3 (D3)、beta=0.1、alpha=0.002、candidates=16、
+candidate-samples=64、leaf-view=actor、search-response 有効**。
+推論の最大バッチは128、threads=1、キャッシュは auto / 256 MiB。
+`--worlds`、`--depth`、`--candidates`、`--candidate-samples`、`--alpha`、`--beta`、
+`--select`、`--leaf-view`、`--max-inference-batch`、`--search-cache-device`、
+`--search-cache-mb`、`--root-batch-size`、`--skip-forced-inference`、
+`--skip-single-candidate`、`--search-response`、`--fit`、`--profile`、`--tf32` は
+評価スクリプトと同じ引数名。Boolean 設定は `--no-search-response` などで無効化できる。
+既定はサンプリング、`--greedy` は方策・探索選択・探索の fallback を最大確率にする。
+探索中の候補生成とロールアウトは通常のサンプリングを使う。
+
+2026-11-10、Apple Silicon (arm64) のこの実行環境で、CPU 1スレッド、
+`runs/play/m-2166.pt` + `runs/play/belief-ar-m.pt`、上記の既定、seed=0、random席、
+人側ランダム入力4局を実測した。モデルの43決定（探索対象外の方策 fallback を含む）の
+推論時間は **中央値0.47秒、平均0.53秒、範囲0.002〜3.05秒**。
+モデルの最初の推論からカード・対象等の全 substep を合計し、表示・人の待ち時間を除く。
+M64・D3 で候補上限4と16を試し、16でも実用範囲だったため上限16を採用した。
+手札と候補数で時間は変わる。遅い場合は `--worlds 16 --candidates 2` で減らせる。
+**MPS はこの実行環境で `torch.backends.mps.is_available() == False` のため未計測**。
+対応する Mac では `--device mps` を指定できる。
+
+自動対局の例:
+
+```sh
+.venv/bin/python scripts/play.py --checkpoint runs/m4-s-ppo-v1/checkpoint.pt --human-policy random --games 30 --no-color
+.venv/bin/python scripts/play.py --checkpoint runs/m4-s-ppo-v1/checkpoint.pt --search --belief uniform --human-policy random --games 12 --no-color
+```
+
+C++ の追加は対局表示用の読み取り API と、任意で有効にする席別の記録に限る。
+記録は `record_decision` の公開投影を保持するので、自動処理や自動リセット前の終局も
+欠けない。通常の学習・収集・評価では記録を有効にせず、行動・RNG・観測は変更しない。

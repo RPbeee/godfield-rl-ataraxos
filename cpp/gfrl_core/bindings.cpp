@@ -102,6 +102,8 @@ nb::dict schema(std::size_t k) {
 }
 
 }
+#include "play_bindings.hpp"
+
 NB_MODULE(_core, m) {
     m.def("_test_danger_root", &TestAccess::danger_root);
     m.def("_test_replace_hidden_hand", &TestAccess::replace_hidden_hand,
@@ -137,6 +139,27 @@ NB_MODULE(_core, m) {
         }, "choices"_a.noconvert())
         .def("stats", &stats_dict)
         .def("obs_schema", [](const VecEnv& e){return schema(e.history_len);});
+    cls.def("play_view",[](const VecEnv& e,std::size_t row,int seat){return play_board(e.play_view(row,seat));});
+    cls.def("play_hand",[](const VecEnv& e,std::size_t row,int seat){
+        nb::list out;for(const auto& h:e.play_hand(row,seat))out.append(play_item(h));return out;
+    });
+    cls.def("enable_play_trace",&VecEnv::enable_play_trace);
+    cls.def("take_play_trace",[](VecEnv& e,std::size_t row){
+        nb::list out;for(const auto& event:e.take_play_trace(row)) {
+            nb::dict x;x["before"]=play_board(event.before);x["after"]=play_board(event.after);
+            x["decision"]=play_decision(event.decision);out.append(x);
+        }return out;
+    });
+    m.def("play_catalog",[]{
+        nb::dict out;for(const auto& c:gf::catalog()) {
+            nb::dict x;x["name"]=c.name;x["category"]=gf::category_name(c.category).data();
+            x["element"]=c.element ? nb::cast(gf::element_name(*c.element).data()) : nb::none();
+            x["atk"]=c.atk;x["plus"]=c.is_plus_atk;x["defense"]=c.defense;
+            x["hit_rate"]=c.hit_rate;x["cost"]=c.cost;x["price"]=c.price;
+            x["ability"]=gf::ability_name(c.ability).data();x["ability_value"]=c.ability_value;
+            out[nb::int_(c.id)]=x;
+        }return out;
+    });
     cls.def("determinize_support",[](const VecEnv& e,Rows rows) {
         const auto values=e.determinize_support({rows.data(),rows.shape(0)});return int_array(values);
     },"rows"_a.noconvert());
