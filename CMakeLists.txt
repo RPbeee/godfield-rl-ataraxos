@@ -48,3 +48,6 @@ endforeach()
 add_executable(gfrl_search_tests tests/cpp/test_search.cpp)
 target_link_libraries(gfrl_search_tests PRIVATE gfrl_core)
 add_test(NAME gfrl_search COMMAND gfrl_search_tests)
+# Public oracle from the existing goodfield wire/native replay witnesses.
+add_executable(gfrl_official_native_dump tests/cpp/official_native_dump.cpp)
+target_link_libraries(gfrl_official_native_dump PRIVATE gfrl_core)

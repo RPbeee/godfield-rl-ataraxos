@@ -3,7 +3,9 @@
 
 namespace gfrl {
 int bucket_value(int b) { return std::min(5 * b, 99); }
-Selection::Selection(const gf::Match& match, bool canonical) {
+Selection::Selection(const gf::Match& m,bool c) {init(m,c);}
+Selection::Selection(const gf::PublicSelection& m,bool c) {init(m,c);}
+template<class M> void Selection::init(const M& match, bool canonical) {
     cards.fill(-1);
     const auto& s = match.snapshot();
     if (!s.actor || s.state.players.size() != 2)
@@ -16,7 +18,7 @@ Selection::Selection(const gf::Match& match, bool canonical) {
     command.actor = *s.actor;
     refresh(match, canonical);
 }
-void Selection::refresh(const gf::Match& match, bool canonical) {
+template<class M> void Selection::refresh(const M& match, bool canonical) {
     mask.fill(false);
     if (complete) return;
     if (stage == Stage::kind) {
@@ -51,7 +53,9 @@ void Selection::refresh(const gf::Match& match, bool canonical) {
     if (std::count(mask.begin(), mask.end(), true) == 0)
         throw std::runtime_error("empty legal mask at stage " + std::to_string(static_cast<int>(stage)));
 }
-void Selection::choose(const gf::Match& match, int choice, bool canonical) {
+void Selection::choose(const gf::Match& m,int c,bool canon) {select(m,c,canon);}
+void Selection::choose(const gf::PublicSelection& m,int c,bool canon) {select(m,c,canon);}
+template<class M> void Selection::select(const M& match, int choice, bool canonical) {
     if (complete || choice < 0 || choice >= 21 || !mask[choice])
         throw std::invalid_argument("illegal selection choice " + std::to_string(choice));
     switch (stage) {

@@ -2,6 +2,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 namespace nb = nanobind;
@@ -103,8 +104,16 @@ nb::dict schema(std::size_t k) {
 
 }
 #include "play_bindings.hpp"
+#include "official_bindings.hpp"
 
 NB_MODULE(_core, m) {
+    m.def("_official_search_root",&OfficialAccess::root);
+    m.def("_official_observation",&official_observation);
+    m.def("_official_board",[](nb::dict d){return play_board(official_view(d));});
+    nb::class_<OfficialCursor>(m,"_OfficialCursor")
+        .def(nb::init<nb::dict>()).def("state",&OfficialCursor::state)
+        .def("choose",&OfficialCursor::choose).def("command",&OfficialCursor::command);
+
     m.def("_test_danger_root", &TestAccess::danger_root);
     m.def("_test_replace_hidden_hand", &TestAccess::replace_hidden_hand,
           "env"_a, "row"_a, "seed"_a, "decisions"_a=nb::none());

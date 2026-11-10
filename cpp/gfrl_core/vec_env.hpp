@@ -86,6 +86,7 @@ public:
     const gf::Match& match(std::size_t i) const { return envs_.at(i).match; }
 private:
     friend struct TestAccess;
+    friend struct OfficialAccess;
     struct Env {
         gf::Match match;
         std::optional<int> play_seat;

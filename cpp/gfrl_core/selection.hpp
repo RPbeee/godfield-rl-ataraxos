@@ -20,10 +20,14 @@ public:
     bool complete = false;
     bool kind_chosen = false;
     explicit Selection(const gf::Match& match, bool canonical = true);
+    explicit Selection(const gf::PublicSelection& match, bool canonical = true);
     void choose(const gf::Match& match, int choice, bool canonical);
+    void choose(const gf::PublicSelection& match, int choice, bool canonical);
 private:
     std::int64_t total_ = 0;
-    void refresh(const gf::Match& match, bool canonical);
+    template<class M> void init(const M& match, bool canonical);
+    template<class M> void refresh(const M& match, bool canonical);
+    template<class M> void select(const M& match, int choice, bool canonical);
 };
 std::vector<std::int32_t> random_choices(std::span<const Mask> mask,
     std::span<const std::int8_t> stage, std::mt19937_64& rng);
