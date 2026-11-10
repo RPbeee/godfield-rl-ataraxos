@@ -1,0 +1,1957 @@
+{
+  "auto3": {
+    "state": {
+      "body": "修行\n教典\nG.F.4\nSyntheticName\nSyntheticName\n祈る\n起こした奇跡\nSyntheticOpponent\nHP\n40\nMP\n4\n¥\n20\nSyntheticName\nHP\n34\nMP\n10\n¥\n20\n攻4\n守1\n守7\n守8\n守10\n守8\n雨神刀\n50%攻9\n¥9",
+      "inputs": [],
+      "images": [
+        {
+          "path": "/images/screens/room.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/screens/fog.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/curses/small/cold.webp",
+          "x": 1054,
+          "y": 288,
+          "w": 30,
+          "h": 16
+        },
+        {
+          "path": "/images/items/weapons/spiked-belt.webp",
+          "x": 190,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/leather-cap.webp",
+          "x": 272,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/steel-helm.webp",
+          "x": 354,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/beautiful-glasswork.webp",
+          "x": 436,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/energy-helm.webp",
+          "x": 600,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/smile-shell.webp",
+          "x": 682,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/smile-shell.webp",
+          "x": 764,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/miracles/release.webp",
+          "x": 846,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/terra-armor.webp",
+          "x": 518,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/discard.webp",
+          "x": 846,
+          "y": 405,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/rain-deity-s-saber.webp",
+          "x": 955,
+          "y": 463,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/elements/water.webp",
+          "x": 1043,
+          "y": 500,
+          "w": 20,
+          "h": 20
+        }
+      ],
+      "texts": [
+        {
+          "text": "修行",
+          "x": 310,
+          "y": 11,
+          "w": 40.640625,
+          "h": 26
+        },
+        {
+          "text": "教典",
+          "x": 1141.53125,
+          "y": 11,
+          "w": 36.9375,
+          "h": 23
+        },
+        {
+          "text": "G.F.",
+          "x": 695.453125,
+          "y": 11,
+          "w": 35.984375,
+          "h": 23
+        },
+        {
+          "text": "4",
+          "x": 731.4375,
+          "y": 11,
+          "w": 13.109375,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 250.890625,
+          "y": 701,
+          "w": 78.203125,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 308.65625,
+          "y": 56,
+          "w": 82.671875,
+          "h": 23
+        },
+        {
+          "text": "祈る",
+          "x": 324.140625,
+          "y": 406,
+          "w": 51.71875,
+          "h": 33
+        },
+        {
+          "text": "起こした奇跡",
+          "x": 1000,
+          "y": 400,
+          "w": 166.21875,
+          "h": 35
+        },
+        {
+          "text": "SyntheticOpponent",
+          "x": 899.78125,
+          "y": 136,
+          "w": 115.421875,
+          "h": 29
+        },
+        {
+          "text": "HP",
+          "x": 1029.890625,
+          "y": 135,
+          "w": 20.109375,
+          "h": 17
+        },
+        {
+          "text": "40",
+          "x": 1053.796875,
+          "y": 132,
+          "w": 26.203125,
+          "h": 23
+        },
+        {
+          "text": "MP",
+          "x": 1088.171875,
+          "y": 135,
+          "w": 21.828125,
+          "h": 17
+        },
+        {
+          "text": "4",
+          "x": 1126.890625,
+          "y": 132,
+          "w": 13.109375,
+          "h": 23
+        },
+        {
+          "text": "¥",
+          "x": 1155.75,
+          "y": 135,
+          "w": 9.25,
+          "h": 17
+        },
+        {
+          "text": "20",
+          "x": 1169.671875,
+          "y": 132,
+          "w": 25.328125,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 906.09375,
+          "y": 269,
+          "w": 102.8125,
+          "h": 29
+        },
+        {
+          "text": "HP",
+          "x": 1029.890625,
+          "y": 268,
+          "w": 20.109375,
+          "h": 17
+        },
+        {
+          "text": "34",
+          "x": 1054.140625,
+          "y": 265,
+          "w": 25.859375,
+          "h": 23
+        },
+        {
+          "text": "MP",
+          "x": 1088.171875,
+          "y": 268,
+          "w": 21.828125,
+          "h": 17
+        },
+        {
+          "text": "10",
+          "x": 1117.25,
+          "y": 265,
+          "w": 22.75,
+          "h": 23
+        },
+        {
+          "text": "¥",
+          "x": 1155.75,
+          "y": 268,
+          "w": 9.25,
+          "h": 17
+        },
+        {
+          "text": "20",
+          "x": 1169.671875,
+          "y": 265,
+          "w": 25.328125,
+          "h": 23
+        },
+        {
+          "text": "攻4",
+          "x": 215.734375,
+          "y": 574,
+          "w": 28.515625,
+          "h": 21
+        },
+        {
+          "text": "守1",
+          "x": 299.3125,
+          "y": 574,
+          "w": 25.375,
+          "h": 21
+        },
+        {
+          "text": "守7",
+          "x": 380.46875,
+          "y": 574,
+          "w": 27.046875,
+          "h": 21
+        },
+        {
+          "text": "守8",
+          "x": 461.671875,
+          "y": 574,
+          "w": 28.640625,
+          "h": 21
+        },
+        {
+          "text": "守10",
+          "x": 621.375,
+          "y": 574,
+          "w": 37.234375,
+          "h": 21
+        },
+        {
+          "text": "守8",
+          "x": 543.671875,
+          "y": 574,
+          "w": 28.640625,
+          "h": 21
+        },
+        {
+          "text": "雨神刀",
+          "x": 1047,
+          "y": 468,
+          "w": 55.40625,
+          "h": 23
+        },
+        {
+          "text": "50%攻9",
+          "x": 1068,
+          "y": 499,
+          "w": 76.875,
+          "h": 23
+        },
+        {
+          "text": "¥9",
+          "x": 1211.046875,
+          "y": 509,
+          "w": 21.890625,
+          "h": 21
+        }
+      ]
+    },
+    "public": {
+      "update": 4,
+      "gf": 4,
+      "phase": 0,
+      "actor": 2,
+      "viewer": 2,
+      "is_over": false,
+      "unsupported": [],
+      "hand": [
+        {
+          "id": 1,
+          "face": 17,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 102,
+          "face": 199,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 103,
+          "face": 239,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 104,
+          "face": 149,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 105,
+          "face": 166,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 106,
+          "face": 199,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 107,
+          "face": 113,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 108,
+          "face": 155,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 109,
+          "face": 160,
+          "used": false,
+          "disguised": false
+        }
+      ],
+      "players": [
+        {
+          "id": 1,
+          "fogged": false,
+          "status": {
+            "hp": 40,
+            "mp": 4,
+            "cp": 20,
+            "curses": [],
+            "confused": false
+          }
+        },
+        {
+          "id": 2,
+          "fogged": false,
+          "status": {
+            "hp": 34,
+            "mp": 10,
+            "cp": 20,
+            "curses": [
+              "cold"
+            ],
+            "confused": false
+          }
+        }
+      ],
+      "pending": null
+    },
+    "action": {
+      "kind": "play",
+      "cards": [
+        {
+          "model": 17,
+          "item_id": 1
+        }
+      ],
+      "target": 1,
+      "allocation": null,
+      "operations": [
+        {
+          "op": "kind",
+          "kind": "play"
+        },
+        {
+          "op": "select_card",
+          "model": 17,
+          "item_id": 1
+        },
+        {
+          "op": "finish_cards"
+        },
+        {
+          "op": "target",
+          "player_id": 1
+        },
+        {
+          "op": "confirm"
+        }
+      ],
+      "expected_update": 4,
+      "expected_gf": 4,
+      "viewer": 2
+    }
+  },
+  "auto4": {
+    "state": {
+      "body": "修行\n教典\nG.F.1\nSyntheticName\nSyntheticOpponent\nいんちきスピア\n攻10\nダメージで夢\n¥10\nSyntheticName\n攻10\n許す\n起こした奇跡\nSyntheticOpponent\nHP\n40\nMP\n10\n¥\n20\nSyntheticName\nHP\n40\nMP\n10\n¥\n20\n守6\n攻5\n攻12\n攻4\n攻10\n守6\nはがねの小手\n守6\n¥6",
+      "inputs": [],
+      "images": [
+        {
+          "path": "/images/screens/room.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/screens/fog.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/items/weapons/bogus-spear.webp",
+          "x": 205,
+          "y": 103,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/heart-flower.webp",
+          "x": 846,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/steel-gauntlet.webp",
+          "x": 682,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/kusarigama.webp",
+          "x": 436,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/spiritual-staff.webp",
+          "x": 600,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/exchange.webp",
+          "x": 190,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/sell.webp",
+          "x": 272,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/hatchet.webp",
+          "x": 354,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/wonder-sword.webp",
+          "x": 518,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/steel-gauntlet.webp",
+          "x": 764,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/steel-gauntlet.webp",
+          "x": 955,
+          "y": 463,
+          "w": 80,
+          "h": 80
+        }
+      ],
+      "texts": [
+        {
+          "text": "修行",
+          "x": 310,
+          "y": 11,
+          "w": 40.640625,
+          "h": 26
+        },
+        {
+          "text": "教典",
+          "x": 1141.53125,
+          "y": 11,
+          "w": 36.9375,
+          "h": 23
+        },
+        {
+          "text": "G.F.",
+          "x": 697.5625,
+          "y": 11,
+          "w": 35.234375,
+          "h": 23
+        },
+        {
+          "text": "1",
+          "x": 732.796875,
+          "y": 11,
+          "w": 9.640625,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 250.890625,
+          "y": 701,
+          "w": 78.203125,
+          "h": 23
+        },
+        {
+          "text": "SyntheticOpponent",
+          "x": 303.828125,
+          "y": 56,
+          "w": 92.34375,
+          "h": 23
+        },
+        {
+          "text": "いんちきスピア",
+          "x": 297,
+          "y": 108,
+          "w": 129.28125,
+          "h": 23
+        },
+        {
+          "text": "攻10",
+          "x": 318,
+          "y": 139,
+          "w": 41.21875,
+          "h": 23
+        },
+        {
+          "text": "ダメージで夢",
+          "x": 295,
+          "y": 164,
+          "w": 83.109375,
+          "h": 18
+        },
+        {
+          "text": "¥10",
+          "x": 457.171875,
+          "y": 149,
+          "w": 29.65625,
+          "h": 21
+        },
+        {
+          "text": "SyntheticName",
+          "x": 648.65625,
+          "y": 56,
+          "w": 82.671875,
+          "h": 23
+        },
+        {
+          "text": "攻10",
+          "x": 320.78125,
+          "y": 406,
+          "w": 58.421875,
+          "h": 33
+        },
+        {
+          "text": "許す",
+          "x": 664.140625,
+          "y": 406,
+          "w": 51.71875,
+          "h": 33
+        },
+        {
+          "text": "起こした奇跡",
+          "x": 1000,
+          "y": 400,
+          "w": 166.21875,
+          "h": 35
+        },
+        {
+          "text": "SyntheticOpponent",
+          "x": 899.78125,
+          "y": 136,
+          "w": 115.421875,
+          "h": 29
+        },
+        {
+          "text": "HP",
+          "x": 1029.890625,
+          "y": 135,
+          "w": 20.109375,
+          "h": 17
+        },
+        {
+          "text": "40",
+          "x": 1053.796875,
+          "y": 132,
+          "w": 26.203125,
+          "h": 23
+        },
+        {
+          "text": "MP",
+          "x": 1088.171875,
+          "y": 135,
+          "w": 21.828125,
+          "h": 17
+        },
+        {
+          "text": "10",
+          "x": 1117.25,
+          "y": 132,
+          "w": 22.75,
+          "h": 23
+        },
+        {
+          "text": "¥",
+          "x": 1155.75,
+          "y": 135,
+          "w": 9.25,
+          "h": 17
+        },
+        {
+          "text": "20",
+          "x": 1169.671875,
+          "y": 132,
+          "w": 25.328125,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 906.09375,
+          "y": 269,
+          "w": 102.8125,
+          "h": 29
+        },
+        {
+          "text": "HP",
+          "x": 1029.890625,
+          "y": 268,
+          "w": 20.109375,
+          "h": 17
+        },
+        {
+          "text": "40",
+          "x": 1053.796875,
+          "y": 265,
+          "w": 26.203125,
+          "h": 23
+        },
+        {
+          "text": "MP",
+          "x": 1088.171875,
+          "y": 268,
+          "w": 21.828125,
+          "h": 17
+        },
+        {
+          "text": "10",
+          "x": 1117.25,
+          "y": 265,
+          "w": 22.75,
+          "h": 23
+        },
+        {
+          "text": "¥",
+          "x": 1155.75,
+          "y": 268,
+          "w": 9.25,
+          "h": 17
+        },
+        {
+          "text": "20",
+          "x": 1169.671875,
+          "y": 265,
+          "w": 25.328125,
+          "h": 23
+        },
+        {
+          "text": "守6",
+          "x": 707.765625,
+          "y": 574,
+          "w": 28.46875,
+          "h": 21
+        },
+        {
+          "text": "攻5",
+          "x": 461.953125,
+          "y": 574,
+          "w": 28.09375,
+          "h": 21
+        },
+        {
+          "text": "攻12",
+          "x": 621.765625,
+          "y": 574,
+          "w": 36.46875,
+          "h": 21
+        },
+        {
+          "text": "攻4",
+          "x": 379.734375,
+          "y": 574,
+          "w": 28.515625,
+          "h": 21
+        },
+        {
+          "text": "攻10",
+          "x": 539.375,
+          "y": 574,
+          "w": 37.234375,
+          "h": 21
+        },
+        {
+          "text": "守6",
+          "x": 789.765625,
+          "y": 574,
+          "w": 28.46875,
+          "h": 21
+        },
+        {
+          "text": "はがねの小手",
+          "x": 1047,
+          "y": 468,
+          "w": 110.8125,
+          "h": 23
+        },
+        {
+          "text": "守6",
+          "x": 1068,
+          "y": 499,
+          "w": 31.546875,
+          "h": 23
+        },
+        {
+          "text": "¥6",
+          "x": 1211.046875,
+          "y": 509,
+          "w": 21.890625,
+          "h": 21
+        }
+      ]
+    },
+    "public": {
+      "update": 1,
+      "gf": 1,
+      "phase": 1,
+      "actor": 2,
+      "viewer": 2,
+      "is_over": false,
+      "unsupported": [],
+      "hand": [
+        {
+          "id": 101,
+          "face": 196,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 2,
+          "face": 142,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 103,
+          "face": 19,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 104,
+          "face": 46,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 105,
+          "face": 3,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 106,
+          "face": 4,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 107,
+          "face": 16,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 108,
+          "face": 35,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 109,
+          "face": 142,
+          "used": false,
+          "disguised": false
+        }
+      ],
+      "players": [
+        {
+          "id": 1,
+          "fogged": false,
+          "status": {
+            "hp": 40,
+            "mp": 10,
+            "cp": 20,
+            "curses": [],
+            "confused": false
+          }
+        },
+        {
+          "id": 2,
+          "fogged": false,
+          "status": {
+            "hp": 40,
+            "mp": 10,
+            "cp": 20,
+            "curses": [],
+            "confused": false
+          }
+        }
+      ],
+      "pending": {
+        "models": [
+          36
+        ]
+      }
+    },
+    "action": {
+      "kind": "defend",
+      "cards": [
+        {
+          "model": 142,
+          "item_id": 2
+        }
+      ],
+      "target": null,
+      "allocation": null,
+      "operations": [
+        {
+          "op": "kind",
+          "kind": "defend"
+        },
+        {
+          "op": "select_card",
+          "model": 142,
+          "item_id": 2
+        },
+        {
+          "op": "finish_cards"
+        },
+        {
+          "op": "target",
+          "player_id": null
+        },
+        {
+          "op": "confirm"
+        }
+      ],
+      "expected_update": 1,
+      "expected_gf": 1,
+      "viewer": 2
+    }
+  },
+  "auto5": {
+    "state": {
+      "body": "修行\n教典\nG.F.3\nSyntheticName\nSyntheticOpponent\n地獄のハサミ\n攻8\nダメージで地獄病\n¥15\nクロスボウ\n+攻2\n¥2\n未知の羽根\n+攻7\n¥7\nSyntheticName\n攻17\n許す\n起こした奇跡\nSyntheticOpponent\nHP\n34\nMP\n10\n¥\n20\nSyntheticName\nHP\n35\nMP\n10\n¥\n20\n攻15\n攻1\n攻8\nスカイハープーン\n+攻9\n奇跡を弾く\n¥5",
+      "inputs": [],
+      "images": [
+        {
+          "path": "/images/screens/room.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/screens/fog.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/items/weapons/hell-scissors.webp",
+          "x": 205,
+          "y": 103,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/crossbow.webp",
+          "x": 205,
+          "y": 203,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/unknown-feather.webp",
+          "x": 205,
+          "y": 303,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/angel-axe.webp",
+          "x": 272,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/torch.webp",
+          "x": 354,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/smile-dew.webp",
+          "x": 436,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/smile-shell.webp",
+          "x": 518,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/heart-shell.webp",
+          "x": 600,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/heart-shell.webp",
+          "x": 682,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/miracles/dream.webp",
+          "x": 846,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/miracles/rock.webp",
+          "x": 764,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/sell.webp",
+          "x": 190,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/sky-harpoon.webp",
+          "x": 955,
+          "y": 463,
+          "w": 80,
+          "h": 80
+        }
+      ],
+      "texts": [
+        {
+          "text": "修行",
+          "x": 310,
+          "y": 11,
+          "w": 40.640625,
+          "h": 26
+        },
+        {
+          "text": "教典",
+          "x": 1141.53125,
+          "y": 11,
+          "w": 36.9375,
+          "h": 23
+        },
+        {
+          "text": "G.F.",
+          "x": 695.78125,
+          "y": 11,
+          "w": 35.671875,
+          "h": 23
+        },
+        {
+          "text": "3",
+          "x": 731.453125,
+          "y": 11,
+          "w": 12.75,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 250.890625,
+          "y": 701,
+          "w": 78.203125,
+          "h": 23
+        },
+        {
+          "text": "SyntheticOpponent",
+          "x": 322.296875,
+          "y": 56,
+          "w": 55.40625,
+          "h": 23
+        },
+        {
+          "text": "地獄のハサミ",
+          "x": 297,
+          "y": 108,
+          "w": 110.8125,
+          "h": 23
+        },
+        {
+          "text": "攻8",
+          "x": 318,
+          "y": 139,
+          "w": 31.6875,
+          "h": 23
+        },
+        {
+          "text": "ダメージで地獄病",
+          "x": 295,
+          "y": 164,
+          "w": 110.8125,
+          "h": 18
+        },
+        {
+          "text": "¥15",
+          "x": 457.28125,
+          "y": 149,
+          "w": 29.4375,
+          "h": 21
+        },
+        {
+          "text": "クロスボウ",
+          "x": 297,
+          "y": 208,
+          "w": 92.34375,
+          "h": 23
+        },
+        {
+          "text": "+攻2",
+          "x": 318,
+          "y": 239,
+          "w": 43.5625,
+          "h": 23
+        },
+        {
+          "text": "¥2",
+          "x": 461.359375,
+          "y": 249,
+          "w": 21.28125,
+          "h": 21
+        },
+        {
+          "text": "未知の羽根",
+          "x": 297,
+          "y": 308,
+          "w": 92.34375,
+          "h": 23
+        },
+        {
+          "text": "+攻7",
+          "x": 318,
+          "y": 339,
+          "w": 42.828125,
+          "h": 23
+        },
+        {
+          "text": "¥7",
+          "x": 461.65625,
+          "y": 349,
+          "w": 20.671875,
+          "h": 21
+        },
+        {
+          "text": "SyntheticName",
+          "x": 648.65625,
+          "y": 56,
+          "w": 82.671875,
+          "h": 23
+        },
+        {
+          "text": "攻17",
+          "x": 321.953125,
+          "y": 406,
+          "w": 56.09375,
+          "h": 33
+        },
+        {
+          "text": "許す",
+          "x": 664.140625,
+          "y": 406,
+          "w": 51.71875,
+          "h": 33
+        },
+        {
+          "text": "起こした奇跡",
+          "x": 1000,
+          "y": 400,
+          "w": 166.21875,
+          "h": 35
+        },
+        {
+          "text": "SyntheticOpponent",
+          "x": 922.859375,
+          "y": 136,
+          "w": 69.265625,
+          "h": 29
+        },
+        {
+          "text": "HP",
+          "x": 1029.890625,
+          "y": 135,
+          "w": 20.109375,
+          "h": 17
+        },
+        {
+          "text": "34",
+          "x": 1054.140625,
+          "y": 132,
+          "w": 25.859375,
+          "h": 23
+        },
+        {
+          "text": "MP",
+          "x": 1088.171875,
+          "y": 135,
+          "w": 21.828125,
+          "h": 17
+        },
+        {
+          "text": "10",
+          "x": 1117.25,
+          "y": 132,
+          "w": 22.75,
+          "h": 23
+        },
+        {
+          "text": "¥",
+          "x": 1155.75,
+          "y": 135,
+          "w": 9.25,
+          "h": 17
+        },
+        {
+          "text": "20",
+          "x": 1169.671875,
+          "y": 132,
+          "w": 25.328125,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 906.09375,
+          "y": 269,
+          "w": 102.8125,
+          "h": 29
+        },
+        {
+          "text": "HP",
+          "x": 1029.890625,
+          "y": 268,
+          "w": 20.109375,
+          "h": 17
+        },
+        {
+          "text": "35",
+          "x": 1054.609375,
+          "y": 265,
+          "w": 25.390625,
+          "h": 23
+        },
+        {
+          "text": "MP",
+          "x": 1088.171875,
+          "y": 268,
+          "w": 21.828125,
+          "h": 17
+        },
+        {
+          "text": "10",
+          "x": 1117.25,
+          "y": 265,
+          "w": 22.75,
+          "h": 23
+        },
+        {
+          "text": "¥",
+          "x": 1155.75,
+          "y": 268,
+          "w": 9.25,
+          "h": 17
+        },
+        {
+          "text": "20",
+          "x": 1169.671875,
+          "y": 265,
+          "w": 25.328125,
+          "h": 23
+        },
+        {
+          "text": "攻15",
+          "x": 293.578125,
+          "y": 574,
+          "w": 36.84375,
+          "h": 21
+        },
+        {
+          "text": "攻1",
+          "x": 381.3125,
+          "y": 574,
+          "w": 25.375,
+          "h": 21
+        },
+        {
+          "text": "攻8",
+          "x": 789.671875,
+          "y": 574,
+          "w": 28.640625,
+          "h": 21
+        },
+        {
+          "text": "スカイハープーン",
+          "x": 1047,
+          "y": 468,
+          "w": 147.75,
+          "h": 23
+        },
+        {
+          "text": "+攻9",
+          "x": 1068,
+          "y": 499,
+          "w": 44.40625,
+          "h": 23
+        },
+        {
+          "text": "奇跡を弾く",
+          "x": 1045,
+          "y": 524,
+          "w": 69.265625,
+          "h": 18
+        },
+        {
+          "text": "¥5",
+          "x": 1211.21875,
+          "y": 509,
+          "w": 21.546875,
+          "h": 21
+        }
+      ]
+    },
+    "public": {
+      "update": 3,
+      "gf": 3,
+      "phase": 1,
+      "actor": 2,
+      "viewer": 2,
+      "is_over": false,
+      "unsupported": [],
+      "hand": [
+        {
+          "id": 101,
+          "face": 200,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 102,
+          "face": 59,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 103,
+          "face": 199,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 104,
+          "face": 200,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 105,
+          "face": 55,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 106,
+          "face": 191,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 107,
+          "face": 222,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 108,
+          "face": 214,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 109,
+          "face": 4,
+          "used": false,
+          "disguised": false
+        }
+      ],
+      "players": [
+        {
+          "id": 1,
+          "fogged": false,
+          "status": {
+            "hp": 34,
+            "mp": 10,
+            "cp": 20,
+            "curses": [],
+            "confused": false
+          }
+        },
+        {
+          "id": 2,
+          "fogged": false,
+          "status": {
+            "hp": 35,
+            "mp": 10,
+            "cp": 20,
+            "curses": [],
+            "confused": false
+          }
+        }
+      ],
+      "pending": {
+        "models": [
+          30,
+          12,
+          28
+        ]
+      }
+    },
+    "action": {
+      "kind": "defend",
+      "cards": [],
+      "target": null,
+      "allocation": null,
+      "operations": [
+        {
+          "op": "kind",
+          "kind": "defend"
+        },
+        {
+          "op": "finish_cards"
+        },
+        {
+          "op": "target",
+          "player_id": null
+        },
+        {
+          "op": "confirm"
+        }
+      ],
+      "expected_update": 3,
+      "expected_gf": 3,
+      "viewer": 2
+    }
+  },
+  "auto6": {
+    "state": {
+      "body": "修行\n教典\nG.F.5\nSyntheticName\nSyntheticName\n祈る\n起こした奇跡\nSyntheticName\nHP\n25\nMP\n23\n¥\n0\nSyntheticOpponent\nHP\n30\nMP\n13\n¥\n0\n攻8\n攻9\n攻11\n攻13\n攻5\n守3\n守12\n攻25\n＜滝＞\n攻25\n消費\nMP12",
+      "inputs": [],
+      "images": [
+        {
+          "path": "/images/screens/room.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/screens/fog.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/items/weapons/final-tusk.webp",
+          "x": 190,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/power-halberd.webp",
+          "x": 272,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/hexagon-doom.webp",
+          "x": 354,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/spear-in-fine-view.webp",
+          "x": 436,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/justice-lance.webp",
+          "x": 518,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/crystal-board.webp",
+          "x": 600,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/jupiter-ring.webp",
+          "x": 764,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/smile-dew.webp",
+          "x": 846,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/moonlight-armor.webp",
+          "x": 682,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/miracles/waterfall.webp",
+          "x": 846,
+          "y": 595,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/discard.webp",
+          "x": 846,
+          "y": 405,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/miracles/waterfall.webp",
+          "x": 955,
+          "y": 463,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/elements/water.webp",
+          "x": 1043,
+          "y": 500,
+          "w": 20,
+          "h": 20
+        }
+      ],
+      "texts": [
+        {
+          "text": "修行",
+          "x": 310,
+          "y": 11,
+          "w": 40.640625,
+          "h": 26
+        },
+        {
+          "text": "教典",
+          "x": 1141.53125,
+          "y": 11,
+          "w": 36.9375,
+          "h": 23
+        },
+        {
+          "text": "G.F.",
+          "x": 695.828125,
+          "y": 11,
+          "w": 35.6875,
+          "h": 23
+        },
+        {
+          "text": "5",
+          "x": 731.515625,
+          "y": 11,
+          "w": 12.640625,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 250.890625,
+          "y": 701,
+          "w": 78.203125,
+          "h": 23
+        },
+        {
+          "text": "SyntheticName",
+          "x": 308.65625,
+          "y": 56,
+          "w": 82.671875,
+          "h": 23
+        },
+        {
+          "text": "祈る",
+          "x": 324.140625,
+          "y": 406,
+          "w": 51.71875,
+          "h": 33
+        },
+        {
+          "text": "起こした奇跡",
+          "x": 1000,
+          "y": 400,
+          "w": 166.21875,
+          "h": 35
+        },
+        {
+          "text": "SyntheticName",
+          "x": 906.09375,
+          "y": 136,
+          "w": 102.8125,
+          "h": 29
+        },
+        {
+          "text": "HP",
+          "x": 1029.890625,
+          "y": 135,
+          "w": 20.109375,
+          "h": 17
+        },
+        {
+          "text": "25",
+          "x": 1055.125,
+          "y": 132,
+          "w": 24.875,
+          "h": 23
+        },
+        {
+          "text": "MP",
+          "x": 1088.171875,
+          "y": 135,
+          "w": 21.828125,
+          "h": 17
+        },
+        {
+          "text": "23",
+          "x": 1115.015625,
+          "y": 132,
+          "w": 24.984375,
+          "h": 23
+        },
+        {
+          "text": "¥",
+          "x": 1155.75,
+          "y": 135,
+          "w": 9.25,
+          "h": 17
+        },
+        {
+          "text": "0",
+          "x": 1181.890625,
+          "y": 132,
+          "w": 13.109375,
+          "h": 23
+        },
+        {
+          "text": "SyntheticOpponent",
+          "x": 899.78125,
+          "y": 269,
+          "w": 115.421875,
+          "h": 29
+        },
+        {
+          "text": "HP",
+          "x": 1029.890625,
+          "y": 268,
+          "w": 20.109375,
+          "h": 17
+        },
+        {
+          "text": "30",
+          "x": 1054.234375,
+          "y": 265,
+          "w": 25.765625,
+          "h": 23
+        },
+        {
+          "text": "MP",
+          "x": 1088.171875,
+          "y": 268,
+          "w": 21.828125,
+          "h": 17
+        },
+        {
+          "text": "13",
+          "x": 1117.609375,
+          "y": 265,
+          "w": 22.390625,
+          "h": 23
+        },
+        {
+          "text": "¥",
+          "x": 1155.75,
+          "y": 268,
+          "w": 9.25,
+          "h": 17
+        },
+        {
+          "text": "0",
+          "x": 1181.890625,
+          "y": 265,
+          "w": 13.109375,
+          "h": 23
+        },
+        {
+          "text": "攻8",
+          "x": 215.671875,
+          "y": 574,
+          "w": 28.640625,
+          "h": 21
+        },
+        {
+          "text": "攻9",
+          "x": 297.765625,
+          "y": 574,
+          "w": 28.46875,
+          "h": 21
+        },
+        {
+          "text": "攻11",
+          "x": 376.9375,
+          "y": 574,
+          "w": 34.125,
+          "h": 21
+        },
+        {
+          "text": "攻13",
+          "x": 457.53125,
+          "y": 574,
+          "w": 36.9375,
+          "h": 21
+        },
+        {
+          "text": "攻5",
+          "x": 543.953125,
+          "y": 574,
+          "w": 28.09375,
+          "h": 21
+        },
+        {
+          "text": "守3",
+          "x": 625.90625,
+          "y": 574,
+          "w": 28.1875,
+          "h": 21
+        },
+        {
+          "text": "守12",
+          "x": 703.765625,
+          "y": 574,
+          "w": 36.46875,
+          "h": 21
+        },
+        {
+          "text": "攻25",
+          "x": 866.390625,
+          "y": 676,
+          "w": 39.203125,
+          "h": 21
+        },
+        {
+          "text": "＜滝＞",
+          "x": 1047,
+          "y": 468,
+          "w": 55.40625,
+          "h": 23
+        },
+        {
+          "text": "攻25",
+          "x": 1068,
+          "y": 499,
+          "w": 43.34375,
+          "h": 23
+        },
+        {
+          "text": "消費",
+          "x": 1203.21875,
+          "y": 503,
+          "w": 29.5625,
+          "h": 18
+        },
+        {
+          "text": "MP12",
+          "x": 1198,
+          "y": 522,
+          "w": 39.984375,
+          "h": 18
+        }
+      ]
+    },
+    "public": {
+      "update": 4,
+      "gf": 5,
+      "phase": 0,
+      "actor": 1,
+      "viewer": 1,
+      "is_over": false,
+      "unsupported": [],
+      "hand": [
+        {
+          "id": 101,
+          "face": 41,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 102,
+          "face": 191,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 103,
+          "face": 32,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 104,
+          "face": 85,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 105,
+          "face": 183,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 106,
+          "face": 47,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 107,
+          "face": 129,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 108,
+          "face": 29,
+          "used": false,
+          "disguised": false
+        },
+        {
+          "id": 7,
+          "face": 218,
+          "used": true,
+          "disguised": false
+        },
+        {
+          "id": 110,
+          "face": 174,
+          "used": false,
+          "disguised": false
+        }
+      ],
+      "players": [
+        {
+          "id": 1,
+          "fogged": false,
+          "status": {
+            "hp": 25,
+            "mp": 23,
+            "cp": 0,
+            "curses": [],
+            "confused": false
+          }
+        },
+        {
+          "id": 2,
+          "fogged": false,
+          "status": {
+            "hp": 30,
+            "mp": 13,
+            "cp": 0,
+            "curses": [],
+            "confused": false
+          }
+        }
+      ],
+      "pending": null
+    },
+    "action": {
+      "kind": "play",
+      "cards": [
+        {
+          "model": 218,
+          "item_id": 7
+        }
+      ],
+      "target": 2,
+      "allocation": null,
+      "operations": [
+        {
+          "op": "kind",
+          "kind": "play"
+        },
+        {
+          "op": "select_card",
+          "model": 218,
+          "item_id": 7
+        },
+        {
+          "op": "finish_cards"
+        },
+        {
+          "op": "target",
+          "player_id": 2
+        },
+        {
+          "op": "confirm"
+        }
+      ],
+      "expected_update": 4,
+      "expected_gf": 5,
+      "viewer": 1
+    }
+  }
+}

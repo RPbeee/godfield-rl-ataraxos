@@ -1,0 +1,706 @@
+[
+  {
+    "players": [
+      {
+        "hp": 40,
+        "items": [
+          {
+            "modelId": 3,
+            "id": 1
+          },
+          {
+            "modelId": 48,
+            "id": 2
+          },
+          {
+            "modelId": 130,
+            "id": 3
+          },
+          {
+            "id": 4,
+            "modelId": 200
+          },
+          {
+            "modelId": 218,
+            "id": 5
+          },
+          {
+            "modelId": 3,
+            "id": 6
+          },
+          {
+            "modelId": 146,
+            "id": 7
+          },
+          {
+            "id": 8,
+            "modelId": 3
+          },
+          {
+            "modelId": 29,
+            "id": 9
+          }
+        ],
+        "id": 1,
+        "mp": 10,
+        "cp": 20
+      },
+      {
+        "items": [],
+        "cp": 20,
+        "mp": 10,
+        "id": 2,
+        "isBot": true,
+        "hp": 40
+      }
+    ],
+    "events": [
+      {
+        "action": "startGame"
+      },
+      {
+        "item": {
+          "modelId": 3,
+          "id": 1
+        },
+        "playerId": 1,
+        "action": "gift"
+      },
+      {
+        "action": "gift",
+        "item": {
+          "modelId": 48,
+          "id": 2
+        },
+        "playerId": 1
+      },
+      {
+        "action": "gift",
+        "item": {
+          "modelId": 130,
+          "id": 3
+        },
+        "playerId": 1
+      },
+      {
+        "playerId": 1,
+        "item": {
+          "id": 4,
+          "modelId": 200
+        },
+        "action": "gift"
+      },
+      {
+        "action": "gift",
+        "item": {
+          "modelId": 218,
+          "id": 5
+        },
+        "playerId": 1
+      },
+      {
+        "playerId": 1,
+        "action": "gift",
+        "item": {
+          "id": 6,
+          "modelId": 3
+        }
+      },
+      {
+        "action": "gift",
+        "item": {
+          "modelId": 146,
+          "id": 7
+        },
+        "playerId": 1
+      },
+      {
+        "action": "gift",
+        "item": {
+          "id": 8,
+          "modelId": 3
+        },
+        "playerId": 1
+      },
+      {
+        "action": "gift",
+        "playerId": 1,
+        "item": {
+          "modelId": 29,
+          "id": 9
+        }
+      },
+      {
+        "playerId": 1,
+        "action": "advanceGF"
+      }
+    ],
+    "attackTurnPlayerId": 1,
+    "gf": 1,
+    "guardianPlayerIds": [
+      2
+    ],
+    "diseasePlayerId": 1,
+    "updateCount": 1
+  },
+  {
+    "attackTurnPlayerId": 2,
+    "diseasePlayerId": 2,
+    "updateCount": 2,
+    "events": [
+      {
+        "items": [
+          {
+            "modelId": 3,
+            "id": 1
+          }
+        ],
+        "action": "useAttackItems"
+      },
+      {
+        "mp": 35,
+        "action": "exchange",
+        "hp": 35
+      },
+      {
+        "playerId": 1,
+        "item": {
+          "id": 1,
+          "modelId": 4
+        },
+        "action": "gift"
+      },
+      {
+        "playerId": 2,
+        "action": "advanceGF"
+      },
+      {
+        "items": [
+          {
+            "modelId": 4,
+            "id": 5
+          },
+          {
+            "modelId": 189,
+            "id": 2
+          }
+        ],
+        "action": "useAttackItems"
+      },
+      {
+        "playerId": 1,
+        "action": "setTargetPlayer"
+      }
+    ],
+    "gf": 2,
+    "guardianPlayerIds": [
+      1
+    ],
+    "attacks": [
+      {
+        "targetPlayerId": 1,
+        "playerId": 2,
+        "itemModelIds": [
+          4,
+          189
+        ]
+      }
+    ],
+    "players": [
+      {
+        "id": 1,
+        "hp": 35,
+        "cp": 0,
+        "mp": 35,
+        "items": [
+          {
+            "id": 2,
+            "modelId": 48
+          },
+          {
+            "id": 3,
+            "modelId": 130
+          },
+          {
+            "modelId": 200,
+            "id": 4
+          },
+          {
+            "modelId": 218,
+            "id": 5
+          },
+          {
+            "id": 6,
+            "modelId": 3
+          },
+          {
+            "id": 7,
+            "modelId": 146
+          },
+          {
+            "modelId": 3,
+            "id": 8
+          },
+          {
+            "modelId": 29,
+            "id": 9
+          },
+          {
+            "modelId": 4,
+            "id": 1
+          }
+        ]
+      },
+      {
+        "mp": 10,
+        "isBot": true,
+        "cp": 20,
+        "id": 2,
+        "items": [],
+        "hp": 40
+      }
+    ]
+  },
+  {
+    "guardianPlayerIds": [
+      2
+    ],
+    "players": [
+      {
+        "mp": 20,
+        "cp": 0,
+        "items": [
+          {
+            "modelId": 48,
+            "id": 2
+          },
+          {
+            "modelId": 130,
+            "id": 3
+          },
+          {
+            "id": 4,
+            "modelId": 200
+          },
+          {
+            "modelId": 218,
+            "id": 5
+          },
+          {
+            "modelId": 3,
+            "id": 6
+          },
+          {
+            "modelId": 146,
+            "id": 7
+          },
+          {
+            "modelId": 3,
+            "id": 8
+          },
+          {
+            "modelId": 29,
+            "id": 9
+          },
+          {
+            "id": 1,
+            "modelId": 4
+          },
+          {
+            "modelId": 189,
+            "id": 10
+          }
+        ],
+        "hp": 35,
+        "id": 1
+      },
+      {
+        "cp": 35,
+        "mp": 10,
+        "isBot": true,
+        "items": [],
+        "id": 2,
+        "hp": 40
+      }
+    ],
+    "diseasePlayerId": 1,
+    "events": [
+      {
+        "action": "useDefenseItems"
+      },
+      {
+        "item": {
+          "modelId": 189,
+          "id": 10
+        },
+        "action": "sell"
+      },
+      {
+        "playerId": 1,
+        "action": "advanceGF"
+      }
+    ],
+    "gf": 3,
+    "attackTurnPlayerId": 1,
+    "updateCount": 3
+  },
+  {
+    "guardianPlayerIds": [
+      2
+    ],
+    "updateCount": 4,
+    "attackTurnPlayerId": 1,
+    "attacks": [
+      {
+        "targetPlayerId": 1,
+        "reversed": true,
+        "itemModelIds": [
+          218
+        ],
+        "playerId": 2
+      }
+    ],
+    "players": [
+      {
+        "id": 1,
+        "hp": 35,
+        "items": [
+          {
+            "modelId": 48,
+            "id": 2
+          },
+          {
+            "modelId": 130,
+            "id": 3
+          },
+          {
+            "modelId": 200,
+            "id": 4
+          },
+          {
+            "id": 6,
+            "modelId": 3
+          },
+          {
+            "modelId": 146,
+            "id": 7
+          },
+          {
+            "modelId": 3,
+            "id": 8
+          },
+          {
+            "modelId": 29,
+            "id": 9
+          },
+          {
+            "id": 1,
+            "modelId": 4
+          },
+          {
+            "modelId": 189,
+            "id": 10
+          },
+          {
+            "id": 5,
+            "modelId": 218,
+            "used": true
+          },
+          {
+            "modelId": 0,
+            "id": 0
+          }
+        ],
+        "cp": 0,
+        "mp": 8
+      },
+      {
+        "hp": 40,
+        "isBot": true,
+        "id": 2,
+        "items": [],
+        "cp": 35,
+        "mp": 10
+      }
+    ],
+    "diseasePlayerId": 1,
+    "events": [
+      {
+        "items": [
+          {
+            "id": 5,
+            "modelId": 218
+          }
+        ],
+        "action": "useAttackItems"
+      },
+      {
+        "playerId": 2,
+        "action": "setTargetPlayer"
+      },
+      {
+        "items": [
+          {
+            "id": 7,
+            "modelId": 39
+          }
+        ],
+        "action": "useDefenseItems"
+      },
+      {
+        "action": "reflect"
+      }
+    ],
+    "gf": 3
+  },
+  {
+    "attacks": [
+      {
+        "playerId": 2,
+        "targetPlayerId": 1,
+        "atk": 20,
+        "itemModelIds": [
+          58,
+          74,
+          56
+        ]
+      }
+    ],
+    "players": [
+      {
+        "id": 1,
+        "hp": 20,
+        "items": [
+          {
+            "modelId": 48,
+            "id": 2
+          },
+          {
+            "modelId": 200,
+            "id": 4
+          },
+          {
+            "id": 6,
+            "modelId": 3
+          },
+          {
+            "modelId": 3,
+            "id": 8
+          },
+          {
+            "modelId": 29,
+            "id": 9
+          },
+          {
+            "modelId": 4,
+            "id": 1
+          },
+          {
+            "id": 5,
+            "used": true,
+            "modelId": 218
+          },
+          {
+            "modelId": 32,
+            "id": 3
+          },
+          {
+            "id": 7,
+            "modelId": 189
+          },
+          {
+            "modelId": 206,
+            "id": 10
+          },
+          {
+            "modelId": 191,
+            "id": 11
+          }
+        ],
+        "mp": 8,
+        "cp": 0
+      },
+      {
+        "id": 2,
+        "isBot": true,
+        "hp": 40,
+        "mp": 0,
+        "items": [],
+        "cp": 35
+      }
+    ],
+    "updateCount": 5,
+    "events": [
+      {
+        "action": "useDefenseItems",
+        "items": [
+          {
+            "modelId": 189,
+            "id": 10
+          },
+          {
+            "modelId": 130,
+            "id": 3
+          },
+          {
+            "modelId": 146,
+            "id": 7
+          }
+        ]
+      },
+      {
+        "damage": 15,
+        "action": "dealDamage"
+      },
+      {
+        "action": "gift",
+        "playerId": 1,
+        "item": {
+          "id": 3,
+          "modelId": 32
+        }
+      },
+      {
+        "action": "gift",
+        "item": {
+          "id": 7,
+          "modelId": 189
+        },
+        "playerId": 1
+      },
+      {
+        "item": {
+          "modelId": 206,
+          "id": 10
+        },
+        "playerId": 1,
+        "action": "gift"
+      },
+      {
+        "playerId": 1,
+        "item": {
+          "modelId": 191,
+          "id": 11
+        },
+        "action": "gift"
+      },
+      {
+        "playerId": 2,
+        "action": "advanceGF"
+      },
+      {
+        "action": "useAttackItems",
+        "items": [
+          {
+            "modelId": 58,
+            "id": 1
+          },
+          {
+            "id": 3,
+            "modelId": 74
+          },
+          {
+            "modelId": 56,
+            "id": 2
+          }
+        ]
+      },
+      {
+        "playerId": 1,
+        "action": "setTargetPlayer"
+      }
+    ],
+    "attackTurnPlayerId": 2,
+    "gf": 4,
+    "diseasePlayerId": 2,
+    "guardianPlayerIds": [
+      1
+    ]
+  },
+  {
+    "updateCount": 6,
+    "isOver": true,
+    "players": [
+      {
+        "items": [
+          {
+            "modelId": 48,
+            "id": 2
+          },
+          {
+            "modelId": 200,
+            "id": 4
+          },
+          {
+            "modelId": 3,
+            "id": 6
+          },
+          {
+            "modelId": 3,
+            "id": 8
+          },
+          {
+            "modelId": 29,
+            "id": 9
+          },
+          {
+            "modelId": 4,
+            "id": 1
+          },
+          {
+            "id": 5,
+            "used": true,
+            "modelId": 218
+          },
+          {
+            "modelId": 32,
+            "id": 3
+          },
+          {
+            "modelId": 189,
+            "id": 7
+          },
+          {
+            "modelId": 206,
+            "id": 10
+          },
+          {
+            "id": 11,
+            "modelId": 191
+          }
+        ],
+        "cp": 0,
+        "mp": 8,
+        "id": 1,
+        "dead": true,
+        "hp": 0
+      },
+      {
+        "isBot": true,
+        "id": 2,
+        "hp": 40,
+        "items": [],
+        "cp": 35,
+        "mp": 0
+      }
+    ],
+    "events": [
+      {
+        "action": "useDefenseItems"
+      },
+      {
+        "damage": 38,
+        "action": "dealDamage"
+      },
+      {
+        "playerId": 1,
+        "action": "die"
+      },
+      {
+        "action": "endGame"
+      }
+    ],
+    "attackTurnPlayerId": 2,
+    "gf": 4
+  }
+]

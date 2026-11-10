@@ -1,0 +1,608 @@
+{
+  "4": {
+    "state": {
+      "body": "修行\n教典\nG.F.3\nSyntheticName\n＜滝＞\n攻25\n消費\nMP12\nSyntheticOpponent\nSyntheticName\n虹のカーテン\n攻撃の属性を\nこし取る\n¥15\n攻25\n守0\n起こした奇跡\nSyntheticName\nHP\n35\nMP\n8\n¥\n0\nSyntheticOpponent\nHP\n40\nMP\n10\n¥\n35\n攻8\n攻13\n守4\n守6\n攻25\n虹のカーテン\n攻撃の属性を\nこし取る\n¥15",
+      "inputs": [],
+      "images": [
+        {
+          "path": "/images/screens/room.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/screens/fog.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/items/miracles/waterfall.webp",
+          "x": 545,
+          "y": 103,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/elements/water.webp",
+          "x": 633,
+          "y": 140,
+          "w": 20,
+          "h": 20
+        },
+        {
+          "path": "/images/items/trade/exchange.webp",
+          "x": 190,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/exchange.webp",
+          "x": 272,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/sell.webp",
+          "x": 354,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/final-tusk.webp",
+          "x": 436,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/severe-gale-sword.webp",
+          "x": 518,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/iron-shield.webp",
+          "x": 600,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/forest-shield.webp",
+          "x": 682,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/rainbow-curtain.webp",
+          "x": 764,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/heart-shell.webp",
+          "x": 846,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/miracles/waterfall.webp",
+          "x": 846,
+          "y": 595,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/rainbow-curtain.webp",
+          "x": 955,
+          "y": 463,
+          "w": 80,
+          "h": 80
+        }
+      ],
+      "texts": [
+        {
+          "text": "SyntheticName",
+          "x": 320,
+          "y": 60,
+          "w": 60,
+          "h": 20
+        }
+      ]
+    },
+    "public": {
+      "viewer": 1,
+      "owner": 1,
+      "gf": 3,
+      "update": 4,
+      "tiebreak_gf": null,
+      "is_over": false,
+      "players": [
+        {
+          "id": 1,
+          "dead": false,
+          "fogged": false,
+          "status": {
+            "hp": 35,
+            "mp": 8,
+            "cp": 0,
+            "curses": [],
+            "guardian": "none",
+            "confused": false
+          },
+          "used": [
+            218
+          ]
+        },
+        {
+          "id": 2,
+          "dead": false,
+          "fogged": false,
+          "status": {
+            "hp": 40,
+            "mp": 10,
+            "cp": 35,
+            "curses": [],
+            "guardian": "none",
+            "confused": false
+          },
+          "used": []
+        }
+      ],
+      "hand": [
+        {
+          "id": 2,
+          "face": 48,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 3,
+          "face": 130,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 4,
+          "face": 200,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 6,
+          "face": 3,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 7,
+          "face": 146,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 8,
+          "face": 3,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 9,
+          "face": 29,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 1,
+          "face": 4,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 10,
+          "face": 189,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 5,
+          "face": 218,
+          "disguised": false,
+          "used": true
+        }
+      ],
+      "actor": 1,
+      "phase": 1,
+      "pending": {
+        "origin": 2,
+        "source": 2,
+        "target": 1,
+        "models": [
+          218
+        ],
+        "guardian": "none",
+        "forced_hit": false,
+        "reflections": 0,
+        "bounces": 0,
+        "counter": false,
+        "death": false
+      },
+      "purchase": null,
+      "events": [
+        {
+          "action": "useAttackItems",
+          "faces": [
+            218
+          ],
+          "reveals": []
+        },
+        {
+          "action": "setTargetPlayer",
+          "player": 2
+        },
+        {
+          "action": "useDefenseItems",
+          "faces": [
+            39
+          ],
+          "reveals": []
+        },
+        {
+          "action": "reflect"
+        }
+      ],
+      "unsupported": [
+        "redirect_requires_history"
+      ]
+    }
+  },
+  "5": {
+    "state": {
+      "body": "修行\n教典\nG.F.4\nSyntheticName\nSyntheticOpponent\nマジカルステッキ\n攻20\nMPをすべて消費する\n¥10\n熟成ゴムの弓\n+攻3\n¥6\nエンゼルの弓\n+攻15\n奇跡を止める\n¥15\nSyntheticName\n攻38\n許す\n起こした奇跡\nSyntheticName\nHP\n20\nMP\n8\n¥\n0\nSyntheticOpponent\nHP\n40\nMP\n0\n¥\n35\n攻8\n攻13\n攻9\n攻25\n熟成ゴムの弓\n+攻3\n¥6",
+      "inputs": [],
+      "images": [
+        {
+          "path": "/images/screens/room.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/screens/fog.webp",
+          "x": 180,
+          "y": 38,
+          "w": 1080,
+          "h": 660
+        },
+        {
+          "path": "/images/items/weapons/magical-stick.webp",
+          "x": 205,
+          "y": 103,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/mature-rubber-bow.webp",
+          "x": 205,
+          "y": 203,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/elements/wood.webp",
+          "x": 293,
+          "y": 240,
+          "w": 20,
+          "h": 20
+        },
+        {
+          "path": "/images/items/weapons/angel-bow.webp",
+          "x": 205,
+          "y": 303,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/exchange.webp",
+          "x": 190,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/exchange.webp",
+          "x": 272,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/trade/sell.webp",
+          "x": 354,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/final-tusk.webp",
+          "x": 436,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/severe-gale-sword.webp",
+          "x": 600,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/heart-shell.webp",
+          "x": 846,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/power-halberd.webp",
+          "x": 518,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/armor/rainbow-curtain.webp",
+          "x": 682,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/goddess-s-soap.webp",
+          "x": 190,
+          "y": 595,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/sundries/smile-dew.webp",
+          "x": 764,
+          "y": 493,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/miracles/waterfall.webp",
+          "x": 846,
+          "y": 595,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/items/weapons/mature-rubber-bow.webp",
+          "x": 955,
+          "y": 463,
+          "w": 80,
+          "h": 80
+        },
+        {
+          "path": "/images/elements/wood.webp",
+          "x": 1043,
+          "y": 500,
+          "w": 20,
+          "h": 20
+        }
+      ],
+      "texts": [
+        {
+          "text": "SyntheticName",
+          "x": 660,
+          "y": 60,
+          "w": 60,
+          "h": 20
+        }
+      ]
+    },
+    "public": {
+      "viewer": 1,
+      "owner": 2,
+      "gf": 4,
+      "update": 5,
+      "tiebreak_gf": null,
+      "is_over": false,
+      "players": [
+        {
+          "id": 1,
+          "dead": false,
+          "fogged": false,
+          "status": {
+            "hp": 20,
+            "mp": 8,
+            "cp": 0,
+            "curses": [],
+            "guardian": "none",
+            "confused": false
+          },
+          "used": [
+            218
+          ]
+        },
+        {
+          "id": 2,
+          "dead": false,
+          "fogged": false,
+          "status": {
+            "hp": 40,
+            "mp": 0,
+            "cp": 35,
+            "curses": [],
+            "guardian": "none",
+            "confused": false
+          },
+          "used": []
+        }
+      ],
+      "hand": [
+        {
+          "id": 2,
+          "face": 48,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 4,
+          "face": 200,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 6,
+          "face": 3,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 8,
+          "face": 3,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 9,
+          "face": 29,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 1,
+          "face": 4,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 5,
+          "face": 218,
+          "disguised": false,
+          "used": true
+        },
+        {
+          "id": 3,
+          "face": 32,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 7,
+          "face": 189,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 10,
+          "face": 206,
+          "disguised": false,
+          "used": false
+        },
+        {
+          "id": 11,
+          "face": 191,
+          "disguised": false,
+          "used": false
+        }
+      ],
+      "actor": 1,
+      "phase": 1,
+      "pending": {
+        "origin": 2,
+        "source": 2,
+        "target": 1,
+        "models": [
+          58,
+          74,
+          56
+        ],
+        "guardian": "none",
+        "forced_hit": false,
+        "reflections": 0,
+        "bounces": 0,
+        "counter": false,
+        "death": false,
+        "base_override": 20
+      },
+      "purchase": null,
+      "events": [
+        {
+          "action": "useDefenseItems",
+          "faces": [
+            189,
+            130,
+            146
+          ],
+          "reveals": []
+        },
+        {
+          "action": "dealDamage",
+          "damage": 15
+        },
+        {
+          "action": "gift",
+          "player": 1,
+          "faces": [
+            32
+          ]
+        },
+        {
+          "action": "gift",
+          "player": 1,
+          "faces": [
+            189
+          ]
+        },
+        {
+          "action": "gift",
+          "player": 1,
+          "faces": [
+            206
+          ]
+        },
+        {
+          "action": "gift",
+          "player": 1,
+          "faces": [
+            191
+          ]
+        },
+        {
+          "action": "advanceGF",
+          "player": 2
+        },
+        {
+          "action": "useAttackItems",
+          "faces": [
+            58,
+            74,
+            56
+          ],
+          "reveals": []
+        },
+        {
+          "action": "setTargetPlayer",
+          "player": 1
+        }
+      ],
+      "unsupported": []
+    }
+  }
+}

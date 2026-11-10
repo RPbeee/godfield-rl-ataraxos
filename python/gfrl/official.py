@@ -64,7 +64,7 @@ def _face(item):
     return _integer(item.get('fakeModelId') or item['modelId'], 1, 296)
 
 
-def project_game(game, viewer):
+def project_game(game, viewer, *, prior=None):
     """Destructive information boundary by construction (no raw references escape).
 
     Never copy foreign unused items, IDs, lengths, fake flags, or placeholders.
@@ -122,11 +122,26 @@ def project_game(game, viewer):
         out['unsupported'].append('hand_over_capacity')
     # Explicit per-event allowlist. Foreign gift/replacement payloads and their
     # counts are not forwarded, even though the transport can contain them.
+    sale_target = (prior or {}).get('pending')
+    sale_target = sale_target.get('target') if sale_target else None
+    sale_source = (prior or {}).get('pending')
+    sale_source = sale_source.get('source') if sale_source else None
     for event in game.get('events', []):
         action = event['action']; e = dict(action=action)
+        if action == 'setTargetPlayer':
+            sale_target = event['playerId']
+            sale_source = game['attackTurnPlayerId']
         if 'playerId' in event:
             e['player'] = _integer(event['playerId'])
-        if action in ('gift', 'replaceItems'):
+        if action == 'sell':
+            if sale_target is None or sale_source is None:
+                out['unsupported'].append('sale_recipient_unavailable')
+            else:
+                e.update(buyer=sale_target, seller=sale_source)
+                # Commodity contents are released only to the receiving viewer.
+                if sale_target == viewer:
+                    e['face'] = _face(event['item'])
+        elif action in ('gift', 'replaceItems'):
             if event.get('playerId') == viewer:
                 e['faces'] = [_face(i) for i in ([event['item']] if action == 'gift' else event.get('items', [])) if i.get('modelId')]
         elif action in ('useAttackItems', 'useDefenseItems', 'removeSomething'):
@@ -198,12 +213,16 @@ class OfficialSession:
 
     def ingest(self, game):
         try:
-            public = project_game(game, self.viewer)
+            prior = self.previous
+            if prior and isinstance(game, dict) and game.get('updateCount') == prior['update']:
+                prior = self.projection_prior
+            public = project_game(game, self.viewer, prior=prior)
             trial = deepcopy(self)
             result = trial.ingest_public(public)
+            trial.projection_prior = deepcopy(prior)
             self.__dict__.update(trial.__dict__)
             return result
-        except (ValueError, KeyError, TypeError, StopIteration, IndexError, RuntimeError):
+        except Exception:
             return dict(status='unsupported', unsupported=['invalid_or_unknown_public_state'])
 
     def ingest_public(self, public):
@@ -300,6 +319,20 @@ class OfficialSession:
                     s.update(alloc)
                     if action:
                         action['allocation'] = alloc; action['target'] = actor
+            elif kind == 'sell':
+                models = before.get('pending', {}).get('models', []) if before.get('pending') else []
+                if len(models) >= 2 and models[0] == 4:
+                    price = _core.play_catalog()[models[1]]['price']
+                    buyer, seller = pane(e.get('buyer')), pane(e.get('seller'))
+                    if buyer is not None:
+                        debt = price
+                        for resource in ('cp', 'mp', 'hp'):
+                            paid = min(buyer[resource], debt)
+                            buyer[resource] -= paid; debt -= paid
+                    if seller is not None:
+                        seller['cp'] = min(99, seller['cp'] + price)
+                else:
+                    self.history_complete = False
             elif kind == 'die':
                 for x in working['players']:
                     if x['id'] == e['player']:
@@ -344,12 +377,12 @@ class OfficialSession:
         self.pending_meta = launch
         self.previous = deepcopy(p)
         self.previous['_source'] = deepcopy(public)
-        if p['actor'] != self.viewer or p['is_over']:
-            return dict(status='finished' if p['is_over'] else 'waiting', public=p,
-                        unsupported=p['unsupported'], history_complete=self.history_complete)
         if p['unsupported']:
             return dict(status='unsupported', public=p, unsupported=p['unsupported'],
                         history_complete=self.history_complete)
+        if p['actor'] != self.viewer or p['is_over']:
+            return dict(status='finished' if p['is_over'] else 'waiting', public=p,
+                        unsupported=p['unsupported'], history_complete=self.history_complete)
         try:
             env = OfficialDecision(p, self.events, self.history_len)
         except (ValueError, RuntimeError, IndexError):
@@ -427,3 +460,71 @@ class OfficialDecision:
                     target=c['target'], allocation=c['allocation'], operations=operations,
                     expected_update=self.public['update'], expected_gf=self.public['gf'],
                     viewer=self.public['viewer'])
+
+
+class OfficialStreams:
+    """Merge cumulative prefixes from every probe stream into one session.
+
+    Parse only changed stream snapshots, ingest each update once in ascending
+    order. Cache only public projections, hashes and stream byte boundaries.
+    A baseline taken before starting a new game excludes older complete frames.
+    Never skip malformed/unknown streams and continue with a subset.
+    """
+    def __init__(self, session, baseline=()):
+        self.session = session
+        self.parser = parser_module()
+        self.baseline = {self.stream_key(c['file']): c['bytes'] for c in baseline}
+        self.hashes = {}
+        self.seen = {}
+        self.context = {}
+        self.latest = None
+        self.failed = False
+
+    @staticmethod
+    def stream_key(file):
+        import re
+        match = re.search(r'^(.*)-\d+-stream-(\d+)-prefix\.bin$', Path(file).name)
+        return match.groups() if match else (str(file), '')
+
+    def poll(self, captures):
+        if self.failed:
+            return dict(status='unsupported', unsupported=['stream_reader_stopped'])
+        try:
+            games = []
+            for c in captures:
+                if c.get('capture_error'):
+                    raise ValueError('capture_failed')
+                key = self.stream_key(c['file'])
+                if self.hashes.get(key) == c.get('sha256') and c.get('sha256'):
+                    continue
+                raw = Path(c['file']).read_bytes()
+                import hashlib
+                digest = hashlib.sha256(raw).hexdigest()
+                if len(raw) != c['bytes'] or (c.get('sha256') and digest != c['sha256']):
+                    raise ValueError('capture_integrity')
+                records = self.parser.parse_prefix(raw, self.session.viewer)['games']
+                if len({r['document_sequence'] for r in records if r['frame_end_byte'] > self.baseline.get(key, 0)}) > 1:
+                    raise ValueError('multiple_documents')
+                games += [r['game'] for r in records if r['frame_end_byte'] > self.baseline.get(key, 0)]
+                self.hashes[key] = digest
+            for game in sorted(games, key=lambda g: g['updateCount']):
+                u = _integer(game['updateCount'])
+                if u in self.seen:
+                    projected = project_game(game, self.session.viewer, prior=self.context[u])
+                    if projected != self.seen[u]:
+                        raise ValueError('conflicting_update')
+                    continue
+                prior = self.session.previous
+                projected = project_game(game, self.session.viewer, prior=prior)
+                result = self.session.ingest(game)
+                if result['status'] == 'unsupported':
+                    self.failed = True
+                    return result
+                self.context[u] = dict(pending=deepcopy(prior.get('pending'))) if prior else None
+                self.seen[u] = projected
+                self.latest = result
+            return self.latest or dict(status='waiting', unsupported=[])
+        except Exception:
+            # Parser exceptions and hostile schema never include raw diagnostics.
+            self.failed = True
+            return dict(status='unsupported', unsupported=['invalid_or_unknown_stream'])
