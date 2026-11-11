@@ -16,8 +16,9 @@ bool forbidden_pair(const gf::MatchSnapshot& s, std::span<const gf::ItemToken> t
     return danger && wide;
 }
 int bucket_value(int b) { return std::min(5 * b, 99); }
-Selection::Selection(const gf::Match& m,bool c) {init(m,c);}
-Selection::Selection(const gf::PublicSelection& m,bool c) {init(m,c);}
+Selection::Selection(const gf::Match& m,bool c,SelectionExclusions x,
+        std::shared_ptr<const gf::PublicSelection> check):exclusions(std::move(x)),public_root(std::move(check)) {init(m,c);}
+Selection::Selection(const gf::PublicSelection& m,bool c,SelectionExclusions x):exclusions(std::move(x)) {init(m,c);}
 template<class M> void Selection::init(const M& match, bool canonical) {
     cards.fill(-1);
     const auto& s = match.snapshot();
@@ -29,9 +30,55 @@ template<class M> void Selection::init(const M& match, bool canonical) {
         if (s.state.players[seat].id == *s.actor) actor_seat = seat;
     }
     command.actor = *s.actor;
+    if constexpr(std::is_same_v<M,gf::Match>) {
+        if(public_root) {
+            const auto& actual=match.snapshot().state.players[actor_seat].items;
+            const auto& expected=public_root->snapshot().state.players[actor_seat].items;
+            if(actual.size()!=expected.size())throw std::invalid_argument("restricted_root_slot_mismatch");
+            for(std::size_t i=0;i<actual.size();++i)
+                if(actual[i].token!=expected[i].token || actual[i].fake_model.value_or(actual[i].model)!=expected[i].fake_model.value_or(expected[i].model)
+                        || actual[i].used!=expected[i].used || actual[i].fake_model.has_value()!=expected[i].fake_model.has_value())
+                    throw std::invalid_argument("restricted_root_slot_mismatch");
+        }
+    }
     refresh(match, canonical);
 }
+template<class M> bool Selection::completion(const M& position,gf::CommandKind kind,std::vector<gf::ItemToken> prefix) const {
+    const auto node=position.legal_extensions(kind,prefix,{exclusions.tokens.empty()});
+    if(node.can_finish)return true;
+    for(auto token:node.next)if(std::find(exclusions.tokens.begin(),exclusions.tokens.end(),token)==exclusions.tokens.end()) {
+        auto next=prefix;next.push_back(token);
+        if(completion(position,kind,std::move(next)))return true;
+    }
+    return false;
+}
+template<class M> void Selection::prune(const M& position) {
+    if(complete)return;
+    auto& s=*this;
+    if(exclusions.enemy_default_self && s.stage==Stage::target && !s.command.items.empty()
+        && (s.command.kind==gf::CommandKind::play || s.command.kind==gf::CommandKind::sell
+            || s.command.kind==gf::CommandKind::buy)) {
+        const auto& hand=position.snapshot().state.players[s.actor_seat].items;
+        const auto base=std::find_if(hand.begin(),hand.end(),[&](const auto& h){return h.token==s.command.items.front();});
+        if(base!=hand.end() && gf::targets_enemy_by_default(base->fake_model.value_or(base->model)))s.mask[1]=false;
+    }
+    if(s.stage==Stage::kind) {
+        for(auto kind:exclusions.kinds)if(kind>=0 && kind<10)s.mask[kind]=false;
+        for(int i=0;i<10;++i)if(!exclusions.tokens.empty() && s.mask[i] && !completion(position,static_cast<gf::CommandKind>(i),{}))s.mask[i]=false;
+    } else if(!exclusions.tokens.empty() && s.stage==Stage::card) {
+        const auto& hand=position.snapshot().state.players[s.actor_seat].items;
+        for(std::size_t i=0;i<hand.size();++i)if(s.mask[i]) {
+            auto prefix=s.command.items;prefix.push_back(hand[i].token);
+            if(std::find(exclusions.tokens.begin(),exclusions.tokens.end(),hand[i].token)!=exclusions.tokens.end()
+                || !completion(position,s.command.kind,std::move(prefix)))s.mask[i]=false;
+        }
+    }
+    if(std::count(s.mask.begin(),s.mask.end(),true)==0)
+        throw std::invalid_argument("no supported public selection after exclusions");
+}
+
 template<class M> void Selection::refresh(const M& match, bool canonical) {
+    canonical = canonical && exclusions.tokens.empty();
     mask.fill(false);
     if (complete) return;
     if (stage == Stage::kind) {
@@ -61,6 +108,20 @@ template<class M> void Selection::refresh(const M& match, bool canonical) {
                 const auto cp = total_ - command.allocation->hp - v;
                 mask[b] = cp >= 0 && cp <= 99;
             }
+        }
+    }
+    try {prune(match);}
+    catch(const std::invalid_argument&) {
+        if constexpr(std::is_same_v<M,gf::Match>) {
+            if(public_root)throw std::invalid_argument("restricted_root_world_mismatch");
+        }
+        throw;
+    }
+    if constexpr(std::is_same_v<M,gf::Match>) {
+        if(public_root) {
+            auto expected=*this;
+            expected.refresh(*public_root,canonical);
+            if(mask!=expected.mask)throw std::invalid_argument("restricted_root_world_mismatch");
         }
     }
     if (std::count(mask.begin(), mask.end(), true) == 0)

@@ -780,10 +780,11 @@ class OfficialDecision:
         self.public = deepcopy(public)
         self.events = deepcopy(list(events))
         self.history_len = history_len
-        self.cursor = _core._OfficialCursor(dict(self.public,
+        self.restrictions = dict(
             exclude_enemy_default_self=exclude_enemy_default_self,
             excluded_kinds=[KINDS.index(k) for k in excluded_kinds], excluded_slots=[
-            i for i, h in enumerate(self.public['hand']) if h['id'] in excluded_ids]))
+            i for i, h in enumerate(self.public['hand']) if h['id'] in excluded_ids])
+        self.cursor = _core._OfficialCursor(dict(self.public, **self.restrictions))
         observation = _core._official_observation(self.public, self.events, history_len)
         for key in OBS_FIELDS:
             a = np.asarray(observation[key], dtype=DTYPES[key])[None]

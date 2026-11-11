@@ -14,7 +14,7 @@ import torch
 from gfrl.actor import synchronize
 from gfrl.evaluation import load_policy_model, _policy_rng
 from gfrl.official import OfficialSession
-from gfrl.official_advisor import advise
+from gfrl.official_advisor import advise, advise_supported
 from gfrl.search import SearchAgent, SearchConfig, load_search_belief
 
 
@@ -28,7 +28,8 @@ def main():
     p.add_argument('--candidates', type=int, default=16)
     p.add_argument('--candidate-samples', type=int, default=64)
     p.add_argument('--threads', type=int, default=1)
-    p.add_argument('--position', choices=('fixture', 'wide', 'response'), default='fixture')
+    p.add_argument('--position', choices=('fixture', 'wide', 'response', 'ui-research'), default='fixture')
+    p.add_argument('--seed', type=int, default=421)
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--out', type=Path, required=True)
     args = p.parse_args()
@@ -50,6 +51,10 @@ def main():
         # Synthetic main: diverse own public cards and resources, no private enemy inventory.
         game['players'][0].update(hp=70, mp=60, cp=30)
         game['events'] = [dict(action='startGame'), dict(action='advanceGF', playerId=1)]
+    if args.position == 'ui-research':
+        game['players'][0]['items'] = [dict(id=991, modelId=60, fakeModelId=60),
+                                       dict(id=992, modelId=6)]
+        game['players'][0]['curses'] = ['dream']
     if args.position == 'response':
         game['attackTurnPlayerId'] = 2
         game['events'][-1]['playerId'] = 2
@@ -71,18 +76,22 @@ def main():
                 session = OfficialSession(1)
                 for received in sequence:
                     result = session.ingest(deepcopy(received))
-                agent = SearchAgent(model, belief, args.device, config=config, seed=421, num_threads=args.threads)
+                agent = SearchAgent(model, belief, args.device, config=config, seed=args.seed, num_threads=args.threads)
                 agent.actor.sample = False
                 synchronize(agent.device); started = perf_counter()
-                with _policy_rng(421, (agent,)):
-                    advice = advise(result, agent, search=True)
+                with _policy_rng(args.seed, (agent,)):
+                    advice = (advise_supported if args.position == 'ui-research' else advise)(result, agent, search=True)
                 synchronize(agent.device); seconds = perf_counter()-started
                 expected = 'response_public_worlds' if args.position == 'response' else 'main_public_worlds'
+                if args.position == 'ui-research':
+                    expected = 'ui_mask_search'
+                    if agent.counts['searched'] != 2:
+                        raise RuntimeError('benchmark fixture must require exactly one re-search')
                 if advice['search_status'] != expected or advice['search_worlds'] < 1:
                     raise RuntimeError('benchmark root was not searched')
                 if repeat:
                     elapsed.append(seconds)
-                    reports.append({k: advice[k] for k in ('search_status', 'search_worlds', 'search_candidates')})
+                    reports.append({k: advice[k] for k in ('search_status', 'search_worlds', 'search_candidates', 'search_seconds')})
             row = dict(worlds=worlds, depth=depth, seconds=elapsed, median=median(elapsed),
                        maximum=max(elapsed), diagnostics=reports)
             metadata['rows'].append(row)

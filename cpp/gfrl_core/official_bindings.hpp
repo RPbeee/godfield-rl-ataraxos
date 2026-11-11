@@ -110,57 +110,20 @@ nb::dict official_observation(nb::dict d,nb::list events,std::size_t k) {
 }
 struct OfficialCursor {
     gf::PublicSelection position;Selection selection;
-    std::vector<gf::ItemToken> excluded;
-    bool exclude_enemy_default_self;
-    std::vector<int> excluded_kinds;
-    explicit OfficialCursor(nb::dict d):position(official_view(d)),selection(position) {
-        excluded_kinds=field<std::vector<int>>(d,"excluded_kinds",{});
-        exclude_enemy_default_self=field<bool>(d,"exclude_enemy_default_self",false);
+    static SelectionExclusions restrictions(nb::dict d) {
+        SelectionExclusions x;
+        x.kinds=field<std::vector<int>>(d,"excluded_kinds",{});
+        x.enemy_default_self=field<bool>(d,"exclude_enemy_default_self",false);
         for(auto slot:field<std::vector<int>>(d,"excluded_slots",{}))
-            excluded.push_back(static_cast<gf::ItemToken>(slot+1));
-        advance();
+            x.tokens.push_back(static_cast<gf::ItemToken>(slot+1));
+        return x;
     }
-    bool completion(gf::CommandKind kind,std::vector<gf::ItemToken> prefix) const {
-        const auto node=position.legal_extensions(kind,prefix,{excluded.empty()});
-        if(node.can_finish)return true;
-        for(auto token:node.next)if(std::find(excluded.begin(),excluded.end(),token)==excluded.end()) {
-            auto next=prefix;next.push_back(token);
-            if(completion(kind,std::move(next)))return true;
-        }
-        return false;
-    }
-    void prune() {
-        if(selection.complete)return;
-        auto& s=selection;
-        if(exclude_enemy_default_self && s.stage==Stage::target && !s.command.items.empty()
-            && (s.command.kind==gf::CommandKind::play || s.command.kind==gf::CommandKind::sell
-                || s.command.kind==gf::CommandKind::buy)) {
-            const auto& hand=position.snapshot().state.players[s.actor_seat].items;
-            const auto base=std::find_if(hand.begin(),hand.end(),[&](const auto& h){return h.token==s.command.items.front();});
-            if(base!=hand.end() && gf::targets_enemy_by_default(base->fake_model.value_or(base->model)))s.mask[1]=false;
-        }
-        if(s.stage==Stage::kind) {
-            for(auto kind:excluded_kinds)if(kind>=0 && kind<10)s.mask[kind]=false;
-            for(int i=0;i<10;++i)if(!excluded.empty() && s.mask[i] && !completion(static_cast<gf::CommandKind>(i),{}))s.mask[i]=false;
-        } else if(!excluded.empty() && s.stage==Stage::card) {
-            const auto& hand=position.snapshot().state.players[s.actor_seat].items;
-            for(std::size_t i=0;i<hand.size();++i)if(s.mask[i]) {
-                auto prefix=s.command.items;prefix.push_back(hand[i].token);
-                if(std::find(excluded.begin(),excluded.end(),hand[i].token)!=excluded.end()
-                    || !completion(s.command.kind,std::move(prefix)))s.mask[i]=false;
-            }
-        }
-        if(std::count(s.mask.begin(),s.mask.end(),true)==0)
-            throw std::invalid_argument("no supported public selection after exclusions");
-    }
+    explicit OfficialCursor(nb::dict d):position(official_view(d)),selection(position,true,restrictions(d)) {advance();}
     void advance() {
-        prune();
-        while(!selection.complete && std::count(selection.mask.begin(),selection.mask.end(),true)==1) {
-            selection.choose(position,std::find(selection.mask.begin(),selection.mask.end(),true)-selection.mask.begin(),excluded.empty());
-            prune();
-        }
+        while(!selection.complete && std::count(selection.mask.begin(),selection.mask.end(),true)==1)
+            selection.choose(position,std::find(selection.mask.begin(),selection.mask.end(),true)-selection.mask.begin(),true);
     }
-    void choose(int choice) {++selection.substep;selection.choose(position,choice,excluded.empty());advance();}
+    void choose(int choice) {++selection.substep;selection.choose(position,choice,true);advance();}
     nb::dict state() const {
         const auto& s=selection;nb::dict d;
         d["complete"]=s.complete;d["stage"]=s.complete?-1:int(s.stage);d["mask"]=nb::cast(s.mask);d["substep"]=s.substep;
@@ -180,7 +143,7 @@ struct OfficialCursor {
 
 namespace gfrl {
 struct OfficialAccess {
-    static std::unique_ptr<VecEnv> root(nb::dict public_view,nb::list events,std::size_t k) {
+    static std::unique_ptr<VecEnv> root(nb::dict public_view,nb::list events,std::size_t k,nb::dict restrictions) {
         auto v=official_view(public_view);
         if(!v.board.viewer || v.actor!=v.board.viewer)
             throw std::invalid_argument("search_requires_viewer_root");
@@ -281,7 +244,8 @@ struct OfficialAccess {
             e.history[seat]=History(k);
             if(snap.state.players[seat].id==*v.board.viewer)e.history[seat]=official_history(events,k);
         }
-        e.selection.emplace(e.match,true);e.encoded=false;e.waiting=false;
+        e.selection.emplace(e.match,true,OfficialCursor::restrictions(restrictions),
+            std::make_shared<const gf::PublicSelection>(v));e.encoded=false;e.waiting=false;
         // A fully forced command must not execute while constructing a root.
         while(!e.selection->complete && std::count(e.selection->mask.begin(),e.selection->mask.end(),true)==1)
             e.selection->choose(e.match,std::find(e.selection->mask.begin(),e.selection->mask.end(),true)-e.selection->mask.begin(),true);

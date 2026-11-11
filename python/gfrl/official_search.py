@@ -41,7 +41,7 @@ def search_agent(model, args, *, seed=0):
 
 def root_matches(root, env):
     return all(np.array_equal(getattr(root, k), getattr(env, k))
-               for k in (*OBS_FIELDS, *PREFIX_FIELDS, 'substep'))
+               for k in (*OBS_FIELDS, *PREFIX_FIELDS, 'actor_seat', 'substep'))
 
 
 def empty_diagnostics():
@@ -57,11 +57,16 @@ def public_report(agent, env):
     report = reports[0]; candidates = report['candidates']
     lp = np.array([c['log_pi'] for c in candidates]); pi = np.exp(lp-lp.max()); pi /= pi.sum()
     def top(probs):
-        from .official import OfficialDecision
+        from .official import OfficialDecision, KINDS
         output = []
         for i in np.argsort(-np.asarray(probs), kind='stable')[:3]:
             path = candidates[i]['path']
-            cursor = OfficialDecision(env.public, env.events, env.history_len)
+            cursor = OfficialDecision(env.public, env.events, env.history_len,
+                excluded_ids=[h['id'] for i,h in enumerate(env.public['hand'])
+                              if i in env.restrictions['excluded_slots']],
+                excluded_kinds=[KINDS[k]
+                                for k in env.restrictions['excluded_kinds']],
+                exclude_enemy_default_self=env.restrictions['exclude_enemy_default_self'])
             for choice in path:
                 cursor.step(np.array([choice], np.int32))
             if not cursor.complete:

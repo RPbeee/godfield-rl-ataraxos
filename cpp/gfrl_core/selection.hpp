@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <random>
+#include <memory>
+#include <type_traits>
 
 namespace gfrl {
 namespace gf = godfield::official;
@@ -24,6 +26,11 @@ template<class M> gf::SelectionNode policy_extensions(const M& match, gf::Comman
     });
     return node;
 }
+struct SelectionExclusions {
+    std::vector<gf::ItemToken> tokens;
+    std::vector<int> kinds;
+    bool enemy_default_self = false;
+};
 // A pure selection cursor over one immutable Match. Does not execute Commands.
 class Selection {
 public:
@@ -34,12 +41,19 @@ public:
     int actor_seat = 0, count = 0, substep = 0;
     bool complete = false;
     bool kind_chosen = false;
-    explicit Selection(const gf::Match& match, bool canonical = true);
-    explicit Selection(const gf::PublicSelection& match, bool canonical = true);
+    SelectionExclusions exclusions;
+    // Immutable public oracle for the first decision only; copied into worlds.
+    std::shared_ptr<const gf::PublicSelection> public_root;
+    explicit Selection(const gf::Match& match, bool canonical = true,
+                       SelectionExclusions excluded = {},
+                       std::shared_ptr<const gf::PublicSelection> public_check = {});
+    explicit Selection(const gf::PublicSelection& match, bool canonical = true, SelectionExclusions excluded = {});
     void choose(const gf::Match& match, int choice, bool canonical);
     void choose(const gf::PublicSelection& match, int choice, bool canonical);
 private:
     std::int64_t total_ = 0;
+    template<class M> bool completion(const M&, gf::CommandKind, std::vector<gf::ItemToken>) const;
+    template<class M> void prune(const M&);
     template<class M> void init(const M& match, bool canonical);
     template<class M> void refresh(const M& match, bool canonical);
     template<class M> void select(const M& match, int choice, bool canonical);

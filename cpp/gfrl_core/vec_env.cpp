@@ -404,7 +404,12 @@ void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
           catch(const gf::MatchError& error) {if(error.code==gf::MatchErrorCode::invalid)continue;throw;}
         e.history[seat]=root.history[seat];e.history[1-seat]=root.history[seat].projected();
         e.chance_rng=mix(seeds[i]^0xa4093822299f31d0ULL);e.encoded=false;e.waiting=false;
-        e.selection.reset();searcher_seat[i]=seat;episode_done[i]=false;world_status[i]=int(WorldStatus::ok);
+        e.selection.reset();
+        // Rebuild the first cursor with the same public slot exclusions. Once
+        // its command executes, record_decision drops it; rollout cursors are free.
+        if(root.selection->public_root)
+            e.selection.emplace(e.match,canonical_,root.selection->exclusions,root.selection->public_root);
+        searcher_seat[i]=seat;episode_done[i]=false;world_status[i]=int(WorldStatus::ok);
         drive(i);
     }});
 }

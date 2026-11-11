@@ -40,7 +40,7 @@ def advise(result, agent, *, search=False):
             search_status = 'response_search_disabled_policy_fallback'
         else:
             try:
-                root = _core._official_search_root(p, env.events, env.history_len)
+                root = _core._official_search_root(p, env.events, env.history_len, env.restrictions)
                 support = int(root.determinize_support(np.array([0], np.int32))[0])
                 if support != 0:
                     search_status = _SUPPORT.get(support, 'unsupported_root') + '_policy_fallback'
@@ -55,7 +55,10 @@ def advise(result, agent, *, search=False):
                 # Only fixed local codes may cross the diagnostic boundary.
                 reason = {'hidden_launch_status': 'response_hidden_launch_status',
                           'unsupported_public_launch': 'response_special_launch',
-                          'public_launch_decision_mismatch': 'response_public_decision_mismatch'}.get(str(error))
+                          'public_launch_decision_mismatch': 'response_public_decision_mismatch',
+                          'restricted_root_slot_mismatch': 'restricted_root_slot_mismatch',
+                          'restricted_root_world_mismatch': 'restricted_root_world_mismatch',
+                          'search_forced_root': 'search_forced_root'}.get(str(error))
                 search_status = (reason or (p.get('_search_fallback', 'response_public_journal_unavailable')
                                  if p['phase'] != 0 else 'unsupported_root')) + '_policy_fallback'
     while not env.complete:
@@ -71,11 +74,18 @@ def advise(result, agent, *, search=False):
                 if device is not None:
                     synchronize(device)
                 started = perf_counter()
-                choice = int(agent(root, np.array([0], np.int32))[0])
+                try:
+                    choice = int(agent(root, np.array([0], np.int32))[0])
+                except (ValueError, RuntimeError) as error:
+                    if str(error) not in ('restricted_root_slot_mismatch', 'restricted_root_world_mismatch'):
+                        raise
+                    root = None
+                    search_status = str(error) + '_policy_fallback'
+                    choice = int(policy_at_prefix(agent.actor, env, np.array([0], np.int32))[0])
                 if device is not None:
                     synchronize(device)
                 diagnostics['search_seconds'] += perf_counter()-started
-                if first:
+                if first and root is not None:
                     diagnostics.update(public_report(agent, env))
                     if not diagnostics['search_candidates']:
                         search_status = 'no_candidates_policy_fallback'
@@ -165,7 +175,8 @@ DREAM_RELAXABLE_REASONS = (DREAM_REASON, AMBIGUOUS_REASON)
 def advise_supported(result, agent, *, search=False, max_samples=16):
     """Prefer verified actions; relax Dream gaps only after the safe mask is exhausted."""
     from .official import OfficialDecision, OBSERVED_UI_KINDS, KINDS as ACTION_KINDS
-    advice = _advise_supported(result, agent, search=search, max_samples=max_samples)
+    budget = [2]
+    advice = _advise_supported(result, agent, search=search, max_samples=max_samples, search_budget=budget)
     exclusions = advice.get('mask_exclusions', [])
     if not advice.get('selection_exhausted') or not any(e['reason'] in DREAM_RELAXABLE_REASONS for e in exclusions):
         return advice
@@ -180,24 +191,49 @@ def advise_supported(result, agent, *, search=False, max_samples=16):
             excluded_ids=hard_ids, excluded_kinds=kinds, exclude_enemy_default_self=prune_self))
     except (ValueError, RuntimeError):
         return advice
-    actor = agent.actor if search else agent
-    recovered = _advise_supported(fresh, actor, max_samples=max_samples, allow_dream=True,
+    recovered = _advise_supported(fresh, agent, search=search, search_budget=budget,
+        prior_diagnostics={k: advice[k] for k in empty_diagnostics()},
+        max_samples=max_samples, allow_dream=True,
         excluded_ids=hard_ids, excluded_kinds=kinds, exclude_self=prune_self,
         initial_exclusions=exclusions)
     if search:
-        recovered.update({k: advice[k] for k in empty_diagnostics()},
-                         search_status='dream_last_resort_policy_fallback',
-                         initial_search_status=advice['search_status'])
+        recovered['initial_search_status'] = advice['search_status']
+        recovered['search_status'] = ('dream_last_resort_search' if recovered['search_status'] in (
+            'main_public_worlds', 'response_public_worlds', 'ui_mask_search', 'ui_retry_search')
+            else 'dream_last_resort_policy_fallback')
     return recovered
 
 
 def _advise_supported(result, agent, *, search=False, max_samples=16, allow_dream=False,
-                      excluded_ids=(), excluded_kinds=(), exclude_self=False, initial_exclusions=()):
-    """Bot-only recovery: prune card/target/kind gaps, then retry using policy RNG."""
+                      excluded_ids=(), excluded_kinds=(), exclude_self=False, initial_exclusions=(),
+                      search_budget=None, prior_diagnostics=None):
+    """Prune UI gaps; search at most twice across all recovery paths."""
     from .official import OfficialDecision
     env = result['env']
-    def choose(position, policy, *, search=False):
-        advice = advise(position, policy, search=search)
+    budget = search_budget if search_budget is not None else [2]
+    totals = dict(prior_diagnostics or empty_diagnostics())
+    actor = agent.actor if search else agent
+    def choose(position, *, recovery=None):
+        use_search = search and budget[0] > 0
+        if use_search:
+            budget[0] -= 1
+        advice = advise(position, agent if use_search else actor, search=use_search)
+        if search:
+            seconds = totals['search_seconds'] + advice['search_seconds']
+            if use_search:
+                totals.update({k: advice[k] for k in empty_diagnostics()})
+            totals['search_seconds'] = seconds
+            advice.update(totals)
+            if not use_search:
+                advice['search_fallback_reason'] = 'search_limit'
+            elif advice['search_status'].endswith('_policy_fallback'):
+                advice['search_fallback_reason'] = advice['search_status']
+            if recovery:
+                status = advice['search_status']
+                success = use_search and status in ('main_public_worlds', 'response_public_worlds')
+                advice['search_status'] = recovery + ('_search' if success else '_policy_fallback')
+                if not success:
+                    advice['search_fallback_reason'] = (status if use_search else 'search_limit')
         relaxed = [r for r in advice['unsupported'] if r in DREAM_RELAXABLE_REASONS]
         if allow_dream and relaxed:
             advice['unsupported'] = [r for r in advice['unsupported'] if r not in DREAM_RELAXABLE_REASONS]
@@ -207,12 +243,10 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
         if initial_exclusions:
             advice['mask_exclusions'] = list(initial_exclusions)
         return advice
-    advice = choose(result, agent, search=search)
+    advice = choose(result)
     if advice['status'] != 'unsupported':
         return advice
-    search_diagnostics = {k: advice[k] for k in empty_diagnostics()}
     searched_status = advice['search_status']
-    actor = agent.actor if search else agent
     excluded = set(excluded_ids)
     excluded_kinds = set(excluded_kinds)
     exclude_enemy_default_self = exclude_self
@@ -262,10 +296,9 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
         exclusions.extend(dict(reason=e['reason'], item_ids=sorted(set(e['item_ids']) & new))
                           for e in blocked_by_reason if set(e['item_ids']) & new)
         exclusions.extend(kind_exclusions)
-        advice = choose(fresh, actor)  # Search cannot use a different mask.
+        advice = choose(fresh, recovery='ui_mask')
         if search:
-            advice.update(search_diagnostics, search_status='ui_mask_policy_fallback',
-                          initial_search_status=searched_status)
+            advice['initial_search_status'] = searched_status
         advice['mask_exclusions'] = exclusions
     if advice['status'] == 'advice':
         return advice
@@ -276,10 +309,9 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
             fresh = dict(result, env=OfficialDecision(env.public, env.events, env.history_len,
                 excluded_ids=excluded, excluded_kinds=excluded_kinds,
                 exclude_enemy_default_self=exclude_enemy_default_self))
-            advice = choose(fresh, actor)
+            advice = choose(fresh, recovery='ui_retry')
             if search:
-                advice.update(search_diagnostics, search_status='ui_retry_policy_fallback',
-                              initial_search_status=searched_status)
+                advice['initial_search_status'] = searched_status
             advice['fallback_samples'] = n
             if exclusions:
                 advice['mask_exclusions'] = exclusions

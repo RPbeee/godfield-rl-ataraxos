@@ -254,6 +254,11 @@ Nodeもブラウザも起動せず、元資料は変更しない。5つの自分
 - Dream は元の公開手札を保持したまま mask を作り直し、偽装カードと未観測の kind を
   除外する。合法な祈り・空応答が残るなら、それを優先する。武器を選択から除外しても、
   手札に武器があるため禁止される祈りを新たに合法にはしない。
+- `--search` では UI 除外を根の全 substep に適用して1回だけ再探索する。
+  成功は `ui_mask_search` / `ui_retry_search`。Dream 最終手段も同じ予算を共有し、
+  初回を含め最大2探索。以降の retry は方策を使う。非対応・公開マスク不一致は
+  従来の fallback 状態と `search_fallback_reason` を残し、`search_seconds` は累積する。
+  世界内の後続決定には UI 除外を持ち越さない。計測条件・結果は `official_advisor.md` 参照。
 - 安全な mask が尽きた場合に限り、偽装カードの除外だけを戻す。その他のカード・対象の
   除外は維持し、discard・sacrifice は常に禁止する。Dream の未検証理由は警告に下げ、
   `moves.jsonl` の行と助言に `dream_last_resort: true`、助言の `warnings` に

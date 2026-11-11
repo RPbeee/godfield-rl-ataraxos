@@ -226,3 +226,184 @@ def test_prefix_mismatch_reencodes_policy_without_executing_root(models, monkeyp
     assert max(calls) > 0
     assert advice['search_status'] == 'public_prefix_mismatch_policy_fallback'
     assert advice['action']
+
+
+def research_game():
+    game = games()[0]
+    game['players'][0]['items'] = [dict(id=991, modelId=55, fakeModelId=55),
+                                    dict(id=992, modelId=19)]
+    game['players'][0]['curses'] = ['dream']
+    return game
+
+
+def small_search(model, seed=7):
+    agent = SearchAgent(model, load_search_belief('uniform'), config=SearchConfig(
+        worlds=2, depth=1, candidates=3, candidate_samples=8, select='argmax'), seed=seed)
+    agent.actor.sample = False
+    return agent
+
+
+def test_ui_exclusion_searches_again(models, monkeypatch):
+    from gfrl.official_advisor import advise_supported
+    agent = small_search(models[0])
+    with _policy_rng(7, (agent,)):
+        initial = advise(result_for([research_game()]), agent, search=True)
+    assert initial['action']['cards'] == [dict(model=55, item_id=991)]
+    import gfrl.official_advisor as advisor
+    seconds = []
+    original = advisor.advise
+    def timed(*args, **kwargs):
+        advice = original(*args, **kwargs)
+        seconds.append(advice['search_seconds'])
+        return advice
+    monkeypatch.setattr(advisor, 'advise', timed)
+    agent = small_search(models[0])
+    with _policy_rng(7, (agent,)):
+        advice = advise_supported(result_for([research_game()]), agent, search=True)
+    assert advice['search_status'] == 'ui_mask_search'
+    assert advice['status'] == 'advice'
+    assert advice['action']['cards'] == [dict(model=19, item_id=992)]
+    assert agent.counts['searched'] == 2
+    assert len(seconds) == 2 and min(seconds) > 0
+    assert advice['search_seconds'] == pytest.approx(sum(seconds))
+    assert all(c['action']['cards'] != [dict(model=55, item_id=991)] for c in advice['pi_search_top'])
+
+
+@pytest.mark.parametrize('response', [False, True])
+def test_restricted_root_equals_cursor_at_every_branch(response):
+    result = result_for(games(response))
+    public = result['public']
+    public['hand'] = [dict(id=900, face=6, used=False, disguised=False),
+                      dict(id=901, face=6, used=False, disguised=True),
+                      dict(id=902, face=7, used=False, disguised=False),
+                      dict(id=903, face=190, used=False, disguised=False),
+                      dict(id=904, face=55, used=False, disguised=False),
+                      dict(id=905, face=130, used=False, disguised=False),
+                      dict(id=906, face=138, used=False, disguised=False),
+                      dict(id=907, face=3, used=False, disguised=False)]
+    # Response roots must retain the journal's identical own hand and tokens.
+    if response:
+        public['_search_launch']['before']['hand'] = deepcopy(public['hand'])
+    public['players'][0]['status']['curses'] = ['dream']
+    if response:
+        public['_search_launch']['before']['players'][0]['status']['curses'] = ['dream']
+    restrictions = dict(excluded_ids=[900, 901], excluded_kinds=['discard'], exclude_enemy_default_self=True)
+    pending = [()]; visited = 0
+    while pending:
+        path = pending.pop()
+        env = OfficialDecision(public, **restrictions)
+        root = _core._official_search_root(public, [], 64, env.restrictions)
+        for choice in path:
+            env.step(np.array([choice], np.int32))
+            if not env.complete:
+                root.step(np.array([choice], np.int32))
+        if env.complete:
+            assert not {900, 901} & {c['item_id'] for c in env.semantic_action()['cards']}
+            continue
+        assert root_matches(root, env)
+        visited += 1
+        pending.extend(path + (int(c),) for c in np.flatnonzero(env.mask[0]))
+    assert visited > 2
+
+
+@pytest.mark.parametrize('kind', ['uniform', 'ar'])
+def test_restricted_search_does_not_see_hidden_own_or_opponent_truth(models, kind):
+    from gfrl.official_advisor import advise_supported
+    outcomes = []; inputs = []
+    for changed in (False, True):
+        game = research_game()
+        game['players'][0]['items'].append(dict(id=993, modelId=60))
+        if changed:
+            game['players'][0]['items'][0]['modelId'] = 60
+            game['players'][1]['items'] = [dict(id=880+i, modelId=m, fakeModelId=6)
+                                           for i,m in enumerate((94,232,207))]
+        result = result_for([game])
+        env = OfficialDecision(result['public'], excluded_ids=[991], excluded_kinds=['discard'],
+                               exclude_enemy_default_self=True)
+        root = _core._official_search_root(env.public, [], 64, env.restrictions)
+        snapshots = [{k: getattr(root, k).copy() for k in (*OBS_FIELDS, *PREFIX_FIELDS, 'substep')}]
+        agent = small_search(models[0])
+        if kind == 'ar':
+            agent.belief = load_search_belief(str(models[1]))
+        original = agent._world_env
+        def spy(src, rows, assignments, seeds, depth, role=None):
+            world, status = original(src, rows, assignments, seeds, depth, role)
+            snapshots.append(dict(assignments=np.array(assignments), seeds=np.array(seeds), status=status,
+                **{k: getattr(world, k).copy() for k in (*OBS_FIELDS, *PREFIX_FIELDS)}))
+            return world, status
+        agent._world_env = spy
+        with _policy_rng(7, (agent,)):
+            advice = advise(dict(result, env=env), agent, search=True)
+        assert advice['search_status'] == 'main_public_worlds'
+        assert agent.counts['invalid_loads'] == 0
+        outcomes.append((advice['action'], agent.last_search)); inputs.append(snapshots)
+    assert outcomes[0] == outcomes[1]
+    assert len(inputs[0]) == len(inputs[1]) > 1
+    for left, right in zip(*inputs):
+        assert left.keys() == right.keys()
+        for key in left:
+            np.testing.assert_array_equal(left[key], right[key])
+
+
+@pytest.mark.parametrize('reason', ['restricted_root_slot_mismatch', 'restricted_root_world_mismatch'])
+@pytest.mark.parametrize('failure_at', ['root', 'world'])
+def test_research_unsupported_reason(models, monkeypatch, reason, failure_at):
+    from gfrl.official_advisor import advise_supported
+    original = _core._official_search_root
+    calls = []
+    def root(public, events, k, restrictions):
+        calls.append(restrictions)
+        if restrictions['excluded_slots'] and failure_at == 'root':
+            raise ValueError(reason)
+        return original(public, events, k, restrictions)
+    monkeypatch.setattr(_core, '_official_search_root', root)
+    agent = small_search(models[0])
+    if failure_at == 'world':
+        original_world = agent._world_env
+        def worlds(*args, **kwargs):
+            if calls[-1]['excluded_slots']:
+                raise ValueError(reason)
+            return original_world(*args, **kwargs)
+        monkeypatch.setattr(agent, '_world_env', worlds)
+    with _policy_rng(7, (agent,)):
+        advice = advise_supported(result_for([research_game()]), agent, search=True)
+    assert advice['status'] == 'advice'
+    assert advice['search_status'] == 'ui_mask_policy_fallback'
+    assert advice['search_fallback_reason'] == reason + '_policy_fallback'
+    assert len(calls) == 2
+
+
+def test_search_cap_includes_further_retries(models, monkeypatch):
+    from gfrl.official_advisor import advise_supported
+    calls = []
+    original = OfficialDecision.action_support
+    def support(env):
+        calls.append(env.semantic_action())
+        return original(env) if len(calls) < 3 else []
+    # A genuine Dream exclusion followed by an unmaskable gap needs a third
+    # selection; only the first two may invoke search.
+    def gaps(env):
+        if len(calls) == 1:
+            calls.append(env.semantic_action())
+            return ['synthetic_unmaskable_gap']
+        return support(env)
+    monkeypatch.setattr(OfficialDecision, 'action_support', gaps)
+    agent = small_search(models[0])
+    with _policy_rng(7, (agent,)):
+        advice = advise_supported(result_for([research_game()]), agent, search=True)
+    assert advice['status'] == 'advice'
+    assert agent.counts['searched'] == 2
+    assert advice['search_status'] == 'ui_retry_policy_fallback'
+    assert advice['search_fallback_reason'] == 'search_limit'
+
+
+def test_dream_last_resort_uses_remaining_search_budget(models):
+    from gfrl.official_advisor import advise_supported
+    game = research_game()
+    game['players'][0]['items'] = [dict(id=991, modelId=6, fakeModelId=6)]
+    agent = small_search(models[0], seed=0)
+    with _policy_rng(0, (agent,)):
+        advice = advise_supported(result_for([game]), agent, search=True)
+    assert advice['search_status'] == 'dream_last_resort_search'
+    assert advice['dream_last_resort'] and advice['status'] == 'advice'
+    assert agent.counts['searched'] == 2

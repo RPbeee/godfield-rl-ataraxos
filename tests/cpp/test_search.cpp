@@ -31,6 +31,26 @@ struct TestAccess {
                 check(!event.opposite,"projection recorded while disabled");
         }
     }
+    static void restrict_root(VecEnv& env,bool prune_self=true) {
+        auto& e=env.envs_[0];
+        const auto id=*e.match.snapshot().actor;
+        const auto& items=e.match.snapshot().state.players[e.selection->actor_seat].items;
+        SelectionExclusions x;x.tokens={items.front().token};x.kinds={int(gf::CommandKind::sell)};x.enemy_default_self=prune_self;
+        auto v=e.match.view(id);auto hand=v.board.hand;v.board.hand.clear();
+        for(const auto& item:items)v.board.hand.push_back(*std::find_if(hand.begin(),hand.end(),[&](const auto& h){return h.token==item.token;}));
+        e.selection.emplace(e.match,true,x,std::make_shared<const gf::PublicSelection>(v));
+        env.drive(0);
+    }
+    static void invalidate_root_slots(VecEnv& env) {
+        auto& e=env.envs_[0];auto v=e.match.view(e.selection->command.actor);
+        std::swap(v.board.hand[0],v.board.hand[1]);
+        e.selection->public_root=std::make_shared<const gf::PublicSelection>(v);
+    }
+    static void check_restrictions(const VecEnv& env,bool restricted) {
+        const auto& s=*env.envs_[0].selection;
+        check(bool(s.public_root)==restricted,"public oracle persisted beyond root");
+        check((!s.exclusions.tokens.empty())==restricted,"exclusions persisted beyond root");
+    }
     static std::uint64_t chance(const VecEnv& env){return env.envs_[0].chance_rng;}
 };
 }
@@ -312,7 +332,7 @@ void measurement(bool evaluation=false) {
     std::cout<<"varied self-play worlds="<<loaded<<"\n";
     std::cout<<"used-card measurement: positions="<<positions<<" with_used="<<with_used<<" fraction="<<double(with_used)/positions<<" mean="<<double(used)/positions<<" conditional_mean="<<double(used)/with_used<<"\n";
 }
-void own_dream_worlds() {
+void own_dream_worlds(bool restricted=false) {
     for(bool response:{false,true}) {
         auto m=scene({6,7},{6,190,118});auto state=m.snapshot().state;
         const auto seat=response?1:0;
@@ -329,6 +349,7 @@ void own_dream_worlds() {
                 TestAccess::accept(*env,{0,gf::CommandKind::play,{100},1});TestAccess::drive(*env);
             }
         }
+        if(restricted) {TestAccess::restrict_root(root,false);TestAccess::restrict_root(other,false);}
         obs_equal(root,other);equal(root.mask,other.mask);
         check(root.determinize_support(row)[0]==0,"Dream root not enabled");
         SearchEnv a(1,1,64,4,true),b(1,1,64,4,true);
@@ -366,6 +387,27 @@ void own_dream_worlds() {
         }
     }
 }
-int main(){try{own_dream_worlds();worlds();response_worlds();response_worlds(6,true);response_worlds(202);response_worlds(202,true);
+void restricted_world_root_only() {
+    auto root=projection_root();TestAccess::inject(root,scene({6,7,190},{8,8}));
+    TestAccess::restrict_root(root);
+    SearchEnv world(1,1,64,4,true);
+    std::array<std::int32_t,297> assignment{};assignment[card_code(8)]=2;
+    world.load_worlds(root,row,assignment,std::array<std::uint64_t,1>{42});
+    check(world.world_status[0]==0,"restricted world rejected");
+    equal(root.mask,world.mask);TestAccess::check_restrictions(world,true);
+    world.step(std::array<std::int32_t,1>{int(gf::CommandKind::play)});
+    // Excluding the first weapon forces selection of slot 1 and its enemy
+    // target; the next external decision must have no root restrictions.
+    check(world.decisions[0]==1,"restricted root did not execute once");
+    TestAccess::check_restrictions(world,false);
+    // A public slot/token mapping that cannot survive determinization must
+    // produce the fixed fallback reason before any candidate is evaluated.
+    TestAccess::invalidate_root_slots(root);
+    bool rejected=false;
+    try {world.load_worlds(root,row,assignment,std::array<std::uint64_t,1>{42});}
+    catch(const std::invalid_argument& error) {rejected=std::string(error.what())=="restricted_root_slot_mismatch";}
+    check(rejected,"inconsistent public slots were accepted");
+}
+int main(){try{restricted_world_root_only();own_dream_worlds();own_dream_worlds(true);worlds();response_worlds();response_worlds(6,true);response_worlds(202);response_worlds(202,true);
     for(const auto& card:gf::catalog()) if(gf::match_supported(card.id) && card.hit_rate && card.gift_rate && card.category==gf::Category::weapons) response_worlds(card.id);
     response_conversion();private_history();conversion();projection();tracking_disabled();measurement();measurement(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

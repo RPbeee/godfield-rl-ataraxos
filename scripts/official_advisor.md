@@ -84,8 +84,22 @@ C++ は公開 used 品と既に出されたカードだけを相手の anchor �
 
 根の全 `OBS_FIELDS`・mask・prefix・substep が `OfficialDecision` と完全一致する場合だけ
 探索し、各 substep の選択前にも再照合する。根の構築で強制コマンドは実行しない。
-探索状態は `main_public_worlds` / `response_public_worlds`。UI 用の mask 除外後は
-`ui_mask_policy_fallback` などで方策を使い、最初の探索の費用と `initial_search_status` を残す。
+探索状態は `main_public_worlds` / `response_public_worlds`。UI 除外後も、同じ手札スロット・kind・
+敵既定カードの自己対象除外を根に適用して再探索し、`ui_mask_search` / `ui_retry_search` を返す。
+除外は最初の決定の全 substep だけに適用し、後続 rollout は通常の合法手を使う。
+世界生成では公開面・used・偽装有無・スロットの token を検証し、各 substep の制限後 mask を
+公開カーソルと照合する。不一致なら `restricted_root_slot_mismatch` /
+`restricted_root_world_mismatch` を理由に方策へ戻す。非対応時は従来の
+`ui_mask_policy_fallback` 等と `search_fallback_reason` を残す。
+Dream 最終手段も残り予算内で探索する（`dream_last_resort_search`）。1決定の探索は
+初回＋再探索の最大2回で、それ以降は `search_limit` による方策 fallback とする。
+`search_seconds` は初回と再探索の合計、`initial_search_status` は初回の状態。
+
+再探索1回を要する固定 fixture の計測（CPU 1 thread、M `runs/play/m-2166.pt`、
+AR `runs/play/belief-ar-m.pt`、worlds=16、depth=3、candidates=8、candidate-samples=64）：
+ウォームアップ1回を除く5回の中央値 **0.419秒**、観測最大 **0.421秒**。
+探索部分の累積最大は0.411秒（macOS arm64、PyTorch 2.15.0）。一般局面の上限を保証する値ではない。
+再現: `.venv/bin/python scripts/bench_official_search.py --position ui-research --worlds 16 --depth 3 --candidates 8 --repeats 5 --out /tmp/ui-search.json`。
 
 途中参加・欠番・不完全な前段イベントには anchor の証拠がなく、
 `response_public_journal_unavailable_policy_fallback`。

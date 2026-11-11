@@ -202,7 +202,7 @@ nb::dict schema(std::size_t k) {
 NB_MODULE(_core, m) {
     m.def("_measure_danger_probe", &TestAccess::danger_probe);
     m.def("_measure_danger_selected", &TestAccess::danger_selected);
-    m.def("_official_search_root",&OfficialAccess::root);
+    m.def("_official_search_root",&OfficialAccess::root,nb::arg("public_view"),nb::arg("events"),nb::arg("history_len"),nb::arg("restrictions")=nb::dict());
     m.def("_official_observation",&official_observation);
     m.def("_official_magic_cost",[](const std::vector<gf::CardId>& models){return gf::magic_cost(models);});
     // Validate only the v33 typed model domain, using a synthetic public scene.
