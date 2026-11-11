@@ -78,10 +78,10 @@ class OracleBelief:
     """Evaluation-only diagnostic: use privileged root hand labels, not inference."""
 
 
-def load_search_belief(spec, fit=None, device='cpu', *, temperature=1., mix=0.):
+def load_search_belief(spec, fit=None, device='cpu', *, temperature=1., mix=0., hybrid=False, count_temperature=1.):
     from .search_belief import validate_variants, wrap_belief
-    validate_variants(temperature, mix)
-    if spec in ('oracle', 'b1', 'uniform') and (temperature != 1 or mix):
+    validate_variants(temperature, mix, hybrid, count_temperature)
+    if spec in ('oracle', 'b1', 'uniform') and (temperature != 1 or mix or hybrid):
         raise ValueError('belief variants require an autoregressive checkpoint')
     if spec == 'oracle':
         return OracleBelief()
@@ -95,8 +95,8 @@ def load_search_belief(spec, fit=None, device='cpu', *, temperature=1., mix=0.):
               if fit else torch.full((19,), 1/19, dtype=torch.float64))
         return Baseline(pn, gift_probabilities())
     model = belief_from_checkpoint(torch.load(spec, map_location='cpu', weights_only=False)).to(device).eval().requires_grad_(False)
-    baseline = fit_baselines(torch.load(fit, map_location='cpu', weights_only=False))['B1'] if mix and fit else None
-    return wrap_belief(model, temperature, mix, baseline)
+    baseline = fit_baselines(torch.load(fit, map_location='cpu', weights_only=False))['B1'] if (mix or hybrid) and fit else None
+    return wrap_belief(model, temperature, mix, baseline, hybrid=hybrid, count_temperature=count_temperature)
 
 
 _SUPPORT = {-1: 'inside_decision', 1: 'invalid_viewer', 2: 'unsupported_players',
@@ -333,7 +333,8 @@ class SearchAgent:
         c = self.config
         oracle = isinstance(self.belief, OracleBelief)
         rr = np.repeat(roots, c.worlds).astype(np.int32)
-        from .search_belief import MixedBelief
+        from .search_belief import MixedBelief, HybridBelief
+        hybrid = isinstance(self.belief, HybridBelief)
         mixed = isinstance(self.belief, MixedBelief)
         use_b1 = self.belief.choose(self.rng, len(rr)) if mixed else None
         assignments = np.zeros((len(rr), 297), np.int32)
@@ -347,6 +348,23 @@ class SearchAgent:
                 # Includes public used cards, exactly like the training label.
                 # Keep the same validation and load conversion as sampled beliefs.
                 samples = src.label_opp_hand[rr[todo]].astype(np.int32)
+            elif hybrid:
+                cap = c.max_inference_batch or len(todo)
+                probabilities = []
+                for lo in range(0, len(todo), cap):
+                    rows = rr[todo[lo:lo+cap]]
+                    obs = tensor_batch({k: getattr(src, k)[rows] for k in OBS_FIELDS}, self.device)
+                    probabilities.append(self.belief.count_probs(obs))
+                counts = torch.multinomial(torch.cat(probabilities), 1).flatten().cpu().numpy()
+                pk = self.belief.baseline.card_probs.numpy()
+                samples = np.array([self.rng.multinomial(int(n), pk) for n in counts], np.int32)
+                # World loading subtracts public used cards. Restore those in
+                # the assignment so the sampled n remains the unused size.
+                p = src.obs_schema()['positions']
+                for j, row in enumerate(rr[todo]):
+                    codes = src.obs_cards[row, p['opponent_used_start']:p['history_start'], 0]
+                    codes = codes[codes > 0]
+                    np.add.at(samples[j], codes, 1)
             elif mixed:
                 samples = np.zeros((len(todo), 297), np.int32)
                 mask = use_b1[todo]

@@ -20,6 +20,9 @@ class DiagnosticSearchAgent(SearchAgent):
         self.diagnostic_models = dict(ar_T1=ar,
             ar_tempered=wrap_belief(ar, getattr(args, 'belief_temperature', 1.)),
             b1=fit_baselines(torch.load(args.fit, map_location='cpu', weights_only=False))['B1'])
+        self.diagnostic_models['hybrid'] = wrap_belief(ar, hybrid=True,
+            count_temperature=getattr(args, 'belief_count_temperature', 1.),
+            baseline=self.diagnostic_models['b1'])
         self.diagnostic_values = {k: [[], []] for k in self.diagnostic_models}
         self.diagnostic_cap = args.max_inference_batch or 128
 

@@ -60,7 +60,7 @@ only its AR arm receives transforms.
 an AR checkpoint and `--fit`. When searching with B1, use `--diagnostic-belief AR`
 to supply the AR diagnostic model. JSON/Markdown section
 `diagnostic_true_hand_nll` reports log likelihood, NLL, and hand-size accuracy
-for untempered AR, AR at the selected T, and B1 on searched decisions, with means
+for untempered AR, AR at the selected T, B1, and hybrid on searched decisions, with means
 and 95% normal intervals over decisions. These intervals are descriptive and do
 not adjust for within-game correlation. NLL uses the existing belief metrics and
 model likelihood implementations; B1 retains their 1e-12 card-probability floor.
@@ -88,3 +88,31 @@ OUT_DIR=measurements/session-smoke scripts/session_search_tuning.sh
 
 Other overrides: `PYTHON`, `SEARCH_CACHE_MB`, `PROGRESS_INTERVAL`. Rerunning the
 same command skips completed matching results without modifying their reports.
+
+
+## Hybrid belief (no training)
+
+Use `--belief AR_CHECKPOINT --fit FIT --belief-hybrid` in offline evaluation or
+in the official bot/advisor. `--belief-hybrid 0` disables it (the default).
+Each proposal samples the unused count from the AR count head at T=1, then draws
+that many cards from B1's multinomial composition. Public used cards are added
+to the assignment before the existing world-loading conversion subtracts them.
+Capacity and legality rejection still apply, so accepted worlds may differ from
+the raw proposal distribution. No privileged labels enter this sampler.
+
+`--belief-count-temperature 1.5` tempers only the hybrid count logits; composition
+is unchanged. Hybrid requires an AR checkpoint and `--fit` and cannot combine
+with nondefault `--belief-temperature` or `--belief-mix`. Sweep grid keys are
+`belief_hybrid=0|1` and `belief_count_temperature=T`. Absent/off options retain
+legacy sampling and RNG behavior.
+
+The offline `hybrid` diagnostic reports AR count log probability plus B1's
+conditional multinomial composition log probability (including the multinomial
+coefficient), and AR count argmax accuracy. It uses the selected count temperature
+(default 1), including on control runs, and B1's existing card-probability floor.
+
+`scripts/session_hybrid_belief.sh` runs one resumable step: hybrid T=1, hybrid
+count T=1.5, AR T=1, and B1, at 1000 pairs each, 16 worlds, depth 3, alpha .002,
+beta .1, actor leaves, and true-hand diagnostics. It uses the same `PYTHON`,
+`OUT_DIR`, checkpoint, device, and budget environment overrides shown above.
+For a tiny CPU run use the CPU smoke command with this script (omit FINAL_PAIRS).

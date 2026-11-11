@@ -27,8 +27,8 @@ def run_pair(args, left, right):
             agent = Actor(model, VecEnv(1, 1, eval_pairs=0), args.device)
         else:
             belief = load_search_belief(spec, args.fit, args.device, **(variant_options(args) if name == 'B' else {}))
-            from gfrl.search_belief import MixedBelief, TemperedBelief
-            if name == 'B' and not isinstance(belief, (Belief, MixedBelief, TemperedBelief)):
+            from gfrl.search_belief import MixedBelief, TemperedBelief, HybridBelief
+            if name == 'B' and not isinstance(belief, (Belief, MixedBelief, TemperedBelief, HybridBelief)):
                 raise ValueError('--belief must be an autoregressive belief checkpoint')
             agent_class = SearchAgent
             if getattr(args, 'diagnostic_true_hand_nll', False):

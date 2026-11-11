@@ -12,7 +12,7 @@ from gfrl.belief import Belief, BeliefConfig
 from gfrl.belief_metrics import Baseline
 from gfrl.model import Model, ModelConfig, OBS_FIELDS
 from gfrl.search import SearchAgent, SearchConfig, load_search_belief
-from gfrl.search_belief import TemperedBelief, MixedBelief, wrap_belief
+from gfrl.search_belief import TemperedBelief, MixedBelief, HybridBelief, wrap_belief
 from gfrl.official_search import add_search_arguments, search_config, search_agent
 
 SCRIPTS = Path(__file__).resolve().parents[2] / 'scripts'
@@ -59,7 +59,7 @@ def test_neutral_exactness_and_rng(tmp_path, cap):
     torch.save(dict(model=ar.state_dict(), model_config=asdict(config),
                     belief_config=asdict(ar.belief_config)), path)
     default = load_search_belief(path)
-    neutral = load_search_belief(path, temperature=1, mix=0)
+    neutral = load_search_belief(path, temperature=1, mix=0, hybrid=False, count_temperature=1)
     assert type(default) is type(neutral) is Belief
     assert wrap_belief(ar, 1, 0) is ar
     env = VecEnv(3, 1, 17)
@@ -173,7 +173,8 @@ def test_diagnostic_scores_unused_hand_without_rng_changes(monkeypatch):
     pn = torch.zeros(19, dtype=torch.float64); pn[1] = 1
     pk = torch.zeros(297, dtype=torch.float64); pk[295] = .75; pk[296] = .25
     agent = DiagnosticSearchAgent(Model(ModelConfig(d=16, heads=2, depth=1, ff=32)), ar)
-    agent.diagnostic_models = dict(ar_T1=ar, ar_tempered=wrap_belief(ar, .5), b1=Baseline(pn, pk))
+    agent.diagnostic_models = dict(ar_T1=ar, ar_tempered=wrap_belief(ar, .5), b1=Baseline(pn, pk),
+        hybrid=wrap_belief(ar, hybrid=True, baseline=Baseline(pn, pk)))
     agent.diagnostic_values = {k: [[], []] for k in agent.diagnostic_models}
     agent.diagnostic_cap = 1
     class Source:
@@ -195,7 +196,7 @@ def test_diagnostic_scores_unused_hand_without_rng_changes(monkeypatch):
     assert np_state == agent.rng.bit_generator.state
     report = agent.diagnostic_report()
     assert report['positions'] == 2 and report['privileged']
-    for key, probability in [('ar_T1', .75), ('ar_tempered', .9), ('b1', .25)]:
+    for key, probability in [('ar_T1', .75), ('ar_tempered', .9), ('b1', .25), ('hybrid', .25)]:
         result = report['models'][key]
         assert result['nll']['mean'] == pytest.approx(-np.log(probability), abs=1e-6)
         assert result['multiset_nll'] == result['nll']['mean']
@@ -212,3 +213,96 @@ def test_official_entrypoints_reject_diagnostic(module_name, capsys):
         import_module(module_name).main([*required, '--diagnostic-true-hand-nll'])
     assert error.value.code == 2
     assert 'unrecognized arguments: --diagnostic-true-hand-nll' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('cap', [0, 137])
+@pytest.mark.parametrize('temperature', [1., 1.5])
+def test_hybrid_count_composition_and_public_used(cap, temperature):
+    class CountsAR(ToyAR):
+        def count_head(self, cls):
+            logits = torch.full((len(cls), 19), -torch.inf)
+            logits[:, 0] = 0
+            logits[:, 2] = np.log(3)
+            return logits
+    pn = torch.zeros(19, dtype=torch.float64); pn[1] = 1
+    pk = torch.zeros(297, dtype=torch.float64); pk[295] = .8; pk[296] = .2
+    baseline = Baseline(pn, pk)
+    hybrid = wrap_belief(CountsAR(), hybrid=True, baseline=baseline,
+                         count_temperature=temperature)
+    class Source:
+        def obs_schema(self):
+            return dict(positions=dict(opponent_used_start=39, history_start=55))
+        def unused_assignment(self, row, hand):
+            result = hand.copy()
+            result[295] -= 1
+            assert result[295] >= 0
+            return result
+    src = Source()
+    size = 12000
+    for field in OBS_FIELDS:
+        setattr(src, field, np.zeros((size, 55), dtype=np.int32))
+    src.obs_cards = np.zeros((size, 55, 8), dtype=np.int32)
+    src.obs_cards[:, 39, 0] = 295  # public used card, restored for world loading
+    agent = SearchAgent(Model(ModelConfig(d=16, heads=2, depth=1, ff=32)), hybrid,
+        config=SearchConfig(worlds=1, max_inference_batch=cap), seed=31)
+    torch.manual_seed(37)
+    rows, hands, _ = agent._sample_worlds(src, np.arange(size))
+    assert len(rows) == size
+    hands[:, 295] -= 1
+    counts = hands.sum(1)
+    expected = 3**(1/temperature) / (1+3**(1/temperature))
+    assert (counts == 2).mean() == pytest.approx(expected, abs=.015)
+    assert set(counts) == {0, 2}
+    nonempty = hands[counts == 2]
+    assert nonempty[:, 296].mean()/2 == pytest.approx(.2, abs=.015)
+    assert (nonempty[:, 296] == 2).mean() == pytest.approx(.04, abs=.01)
+    labels = torch.zeros(2, 297, dtype=torch.long)
+    labels[1, 295:297] = 1
+    obs = dict(obs_type=torch.zeros(2, 1))
+    lp, count_lp, composition_lp = hybrid.log_prob(obs, labels)
+    assert count_lp.exp().tolist() == pytest.approx([1-expected, expected])
+    assert composition_lp.exp().tolist() == pytest.approx([1, 2*.8*.2])
+    assert lp.exp().tolist() == pytest.approx([1-expected, expected*2*.8*.2])
+
+
+def test_hybrid_diagnostic_registration(monkeypatch):
+    import search_diagnostics
+    ar = ToyAR()
+    baseline = Baseline(torch.ones(19)/19, torch.ones(297)/297)
+    monkeypatch.setattr(search_diagnostics, 'load_search_belief', lambda *a, **kw: ar)
+    monkeypatch.setattr(search_diagnostics.torch, 'load', lambda *a, **kw: {})
+    monkeypatch.setattr(search_diagnostics, 'fit_baselines', lambda data: dict(B1=baseline))
+    agent = DiagnosticSearchAgent(Model(ModelConfig(d=16, heads=2, depth=1, ff=32)), ar)
+    agent.enable_diagnostic(argparse.Namespace(fit='fit.pt', belief='ar.pt', device='cpu',
+        max_inference_batch=2, belief_count_temperature=1.5))
+    assert isinstance(agent.diagnostic_models['hybrid'], HybridBelief)
+    assert agent.diagnostic_models['hybrid'].count_temperature == 1.5
+    assert 'hybrid' in agent.diagnostic_report()['models']
+
+
+@pytest.mark.parametrize('advisor', [False, True])
+def test_official_hybrid_options(advisor):
+    parser = argparse.ArgumentParser()
+    add_search_arguments(parser, advisor=advisor)
+    args = parser.parse_args(['--belief-hybrid', '--belief-count-temperature', '1.5'])
+    assert args.belief_hybrid == 1 and args.belief_count_temperature == 1.5
+
+
+def test_hybrid_sweep_grid(tmp_path):
+    parser = eval_search.build_parser(sweep=True)
+    parser.add_argument('--grid', nargs='+', type=sweep_search.grid_pair)
+    parser.add_argument('--out-dir', type=Path)
+    args = parser.parse_args(['--checkpoint', 'policy.pt', '--belief', 'ar.pt',
+        '--out-dir', str(tmp_path), '--grid',
+        'belief_hybrid=1,belief_count_temperature=1',
+        'belief_hybrid=1,belief_count_temperature=1.5', 'belief_hybrid=0',
+        'belief_hybrid=0,belief=b1'])
+    settings, keys = sweep_search.make_settings(args)
+    assert len(settings) == len({s.out for s in settings}) == 4
+    assert 'belief_hybrid' in keys and 'belief_count_temperature' in keys
+    assert [s.belief_hybrid for s in settings] == [1, 1, 0, 0]
+    for kwargs in (dict(hybrid=2), dict(hybrid=True, mix=.5),
+                   dict(hybrid=True, temperature=2), dict(count_temperature=1.5),
+                   dict(hybrid=True, count_temperature=0)):
+        with pytest.raises(ValueError):
+            wrap_belief(ToyAR(), **kwargs)

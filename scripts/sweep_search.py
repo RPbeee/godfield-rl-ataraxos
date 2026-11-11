@@ -22,8 +22,9 @@ TIMING_DEFINITION = (
 
 
 GRID_TYPES = dict(worlds=int, depth=int, alpha=float, beta=float, leaf_view=str,
-                  belief_temperature=float, belief_mix=float, belief=str)
-GRID_DEFAULTS = dict(belief_temperature=1., belief_mix=0.)
+                  belief_temperature=float, belief_mix=float, belief=str,
+                  belief_hybrid=int, belief_count_temperature=float)
+GRID_DEFAULTS = dict(belief_temperature=1., belief_mix=0., belief_hybrid=0, belief_count_temperature=1.)
 
 
 def grid_pair(value):
