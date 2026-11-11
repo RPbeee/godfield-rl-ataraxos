@@ -580,3 +580,111 @@ The pre-change 12 root output records compare exactly equal after the final
 build. The legacy `--measure 1000` also reproduces every pre-change count and
 detail, including sample capacity rejection totals, under the changed engine.
 Logs and raw comparison outputs are under `measurements/dream-*`.
+
+## P4 paired comparison and legal-mask measurement (2026-11-11)
+
+`scripts/eval_p4.py` runs B vs A, C vs A and B vs C using the existing
+`evaluate_policies` loop, which already dispatches separate agents by the
+current actor and paired-game seat. A is the checkpoint policy without search;
+B loads an autoregressive checkpoint through `load_search_belief`; C loads
+`fit_baselines(fit_data)['B1']`. All searches share the same `SearchConfig`,
+policy checkpoint, seed and batching. Optional `--with-oracle` adds D vs A,
+explicitly marked as a cheating evaluation-only upper-bound diagnostic.
+Each comparison uses the same `--seed` and `--pairs` paired deals with seats
+reversed. Stochastic trajectories and policy draws can differ between matches.
+
+Per-match JSON files and `summary.json` / `summary.md` contain left-agent win
+rates (draw=half), Wilson 95% and complete-pair bootstrap 95% intervals, both
+agents' search coverage, synchronized decision timings, search counters and
+the full configuration. Elapsed match time excludes checkpoint loading.
+`--resume` reuses completed matches, reruns incomplete matches and rejects
+changed arguments or input file size/mtime. Adding/removing the optional oracle
+does not invalidate the three fair comparisons. Interrupted matches restart
+from their beginning. B and C settings are recorded independently and checked
+equal in the integration test. A separate B-vs-C test changes true hidden hands
+and source RNG while preserving all six acting-seat observation fields, then
+checks identical choices, search reports and counters for **both absolute
+seats of each agent**. This test excludes the separately measured known mask
+exception below.
+
+TSUBAME example (use an independent fitting split for B1):
+
+```sh
+scripts/tsubame_run.sh scripts/eval_p4.py \
+  --checkpoint runs/play/m-2166.pt --belief runs/play/belief-ar-m.pt \
+  --fit runs/belief-data/fit.pt --device cuda --threads 4 \
+  --pairs 500 --num-envs 32 --seed 0 \
+  --worlds 64 --depth 3 --beta 0.02 --search-response \
+  --candidates 16 --candidate-samples 64 --max-inference-batch 128 \
+  --out-dir measurements/p4-m --resume
+```
+
+The fitting file path is an example; supply the actual collected fit split.
+Add `--with-oracle` to include D. This change adds no training/collection or
+goodfield transition changes. Existing eval_search/sweep_search CLI behavior
+is retained.
+
+### Frequency of the 94 + 232 mask exception
+
+Reproduction from this worktree, using only the allowed read-only M checkpoint
+and interpreter in the original repository:
+
+```sh
+/Users/yuto/godfield-rl-ataraxos/.venv/bin/python scripts/measure_mask_leak.py \
+  --checkpoint /Users/yuto/godfield-rl-ataraxos/runs/play/m-2166.pt \
+  --games 1000 --num-envs 32 --threads 4 --seed 20261111 \
+  --out measurements/mask-leak.json
+```
+
+CPU, fixed policy, no search; 1,000 games (500 paired deals), both seats.
+Elapsed time was 221.38 s including contention from concurrent validation.
+Truncations: 0. Raw JSON and execution log are work artifacts under
+`measurements/mask-leak.{json,log}`; this summary is retained here.
+
+| Quantity | Count / rate |
+| --- | ---: |
+| Fresh external policy decisions, both seats | 49,430 |
+| Decisions holding unused displayed 94 and 232 | 17 (0.03439% of all decisions) |
+| Main decisions with an observation-preserving pair of counterfactual worlds | 10 |
+| Decisions whose reachable play mask changes with opponent 209 | 8 |
+| Changed / holding decisions | 8 / 17 = 47.0588% |
+| Changed / testable decisions | 8 / 10 = 80.0000% |
+| Changed / all external decisions | 8 / 49,430 = 0.01618% |
+| Holding decisions with a true opponent 209 in the actual game | 0 |
+| Completed plays selecting exactly 94 + 232 | 0 / 17 holding decisions; 0 / 49,430 overall |
+| Selected plays from mask-sensitive decisions | 0 / 8 |
+
+“Holding” uses the actor's unused displayed faces, including Dream faces,
+because these define the selectable combination. Counts are per fresh
+external decision, not per card substep or per game; automatic/confused engine
+decisions are excluded. Holding is counted in every phase. Mask probes examine
+main roots only. The other seven holding decisions have no tested pair of
+main-root counterfactuals; they are not evidence that the full hidden-world
+space is invariant.
+
+The private read-only measurement binding copies the live match into an
+opponent-209-present and opponent-209-absent world. It preserves opponent hand
+count, item tokens, used cards and every public face, and asserts exact typed
+`MatchView` equality with the original for the actor. Used/public 209 cannot be
+replaced; an empty opponent hand or incompatible Dream faces cannot acquire
+209 without changing the observation. It compares play extension masks at the
+root and all shared one-card prefixes; the known exact 94+232 exception is
+exposed there. This tests the reachable mask tree even when the actual policy
+does not visit the revealing prefix. The live match and RNG are never changed.
+A separate command probe includes forced singleton stages and counts only a
+completed play of exactly the pair, once.
+
+Always forbidding this combination would remove an action actually chosen on
+**0% of the measured external decisions**. That is the measured direct action
+removal rate, not a measured win-rate effect: masking also changes policy
+normalization and potentially future trajectories. The sample is small for
+this rare combination, and zero selections does not establish a zero
+population rate. No decision to forbid the combination is made here.
+
+Validation: Release cmake builds succeeded for parent and standalone goodfield;
+CTest **17/17** and **166/166**; full Python suite **282 passed / 1 skipped**.
+The P4 smoke covers all four comparisons, equal B/C search settings, resume and
+configuration mismatch handling, plus both-seat hidden-hand invariance. The
+measurement fixture checks read-only observations/masks/labels, the known
+209-sensitive case, the untestable empty-hand case, and completed-play counting
+through forced stages.

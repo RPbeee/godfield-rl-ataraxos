@@ -12,6 +12,65 @@ using namespace gfrl;
 // calls this; replacement is restricted to supported decision boundaries.
 namespace gfrl {
 struct TestAccess {
+    // Read-only measurement helpers: copies never enter live play or training.
+    static std::array<bool,4> danger_probe(const VecEnv& env, std::size_t row) {
+        const auto& e=env.envs_.at(row);
+        if(!e.selection || env.substep[row]!=0)throw std::invalid_argument("not a root");
+        const auto seat=e.selection->actor_seat;
+        const auto original=e.match.snapshot();
+        const auto& own=original.state.players[seat];
+        bool danger=false,wide=false;
+        for(const auto& item:own.items)if(!item.used) {
+            danger|=item.fake_model.value_or(item.model)==94;
+            wide|=item.fake_model.value_or(item.model)==232;
+        }
+        std::array<bool,4> out{danger&&wide,false,false,false};
+        for(const auto& item:original.state.players[1-seat].items)out[3]|=item.model==209;
+        if(!out[0] || original.phase!=gf::MatchPhase::main)return out;
+        auto absent=original;
+        auto& hidden=absent.state.players[1-seat].items;
+        for(auto& item:hidden)if(item.model==209) {
+            if(item.used)return out; // Public used cards cannot be counterfactually changed.
+            item.model=item.fake_model.value_or(19);
+            if(item.model==209)return out;
+        }
+        auto present=absent;
+        bool inserted=false;
+        for(auto& item:present.state.players[1-seat].items)
+            if(!item.used && (!item.fake_model || gf::match_dream_compatible(209,*item.fake_model))) {
+                item.model=209;inserted=true;break;
+            }
+        if(!inserted)return out; // Keep hand count and every public face fixed.
+        auto a=e.match,b=e.match;
+        a.restore(absent);b.restore(present);
+        if(a.view(own.id)!=e.match.view(own.id) || b.view(own.id)!=e.match.view(own.id))
+            throw std::runtime_error("danger probe changed viewer observation");
+        out[1]=true;
+        const auto kind=gf::CommandKind::play;
+        const auto an=a.legal_extensions(kind,{}, {env.canonical_});
+        const auto bn=b.legal_extensions(kind,{}, {env.canonical_});
+        out[2]=an!=bn;
+        // The known exception is exact 94+232. Root and every shared one-card
+        // prefix locate its mask difference without factorial discard traversal.
+        for(auto token:an.next)if(std::find(bn.next.begin(),bn.next.end(),token)!=bn.next.end()) {
+            const std::array<gf::ItemToken,1> prefix{token};
+            out[2]|=a.legal_extensions(kind,prefix,{env.canonical_})!=b.legal_extensions(kind,prefix,{env.canonical_});
+        }
+        return out;
+    }
+    static bool danger_selected(const VecEnv& env, std::size_t row, int choice) {
+        const auto& e=env.envs_.at(row);
+        auto cursor=*e.selection;
+        cursor.choose(e.match,choice,env.canonical_);
+        while(!cursor.complete && std::count(cursor.mask.begin(),cursor.mask.end(),true)==1)
+            cursor.choose(e.match,std::find(cursor.mask.begin(),cursor.mask.end(),true)-cursor.mask.begin(),env.canonical_);
+        if(!cursor.complete || cursor.command.kind!=gf::CommandKind::play || cursor.count!=2)return false;
+        std::array<gf::CardId,2> models{};
+        const auto& hand=e.match.snapshot().state.players[cursor.actor_seat].items;
+        for(int i=0;i<2;++i)models[i]=hand[cursor.cards[i]].fake_model.value_or(hand[cursor.cards[i]].model);
+        std::sort(models.begin(),models.end());
+        return models==std::array<gf::CardId,2>{94,232};
+    }
     static void danger_root(VecEnv& env, bool opponent_209) {
         auto& e=env.envs_.at(0);
         auto state=e.match.snapshot().state;
@@ -140,6 +199,8 @@ nb::dict schema(std::size_t k) {
 #include "official_bindings.hpp"
 
 NB_MODULE(_core, m) {
+    m.def("_measure_danger_probe", &TestAccess::danger_probe);
+    m.def("_measure_danger_selected", &TestAccess::danger_selected);
     m.def("_official_search_root",&OfficialAccess::root);
     m.def("_official_observation",&official_observation);
     m.def("_official_board",[](nb::dict d){return play_board(official_view(d));});

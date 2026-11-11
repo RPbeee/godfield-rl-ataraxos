@@ -95,6 +95,23 @@ scripts/tsubame_run.sh scripts/bench_training.py --help
 
 ## 探索予算と勝率・推論時間
 
+P4 の固定予算比較は `scripts/eval_p4.py` で一括実行する。A は探索なし、B は
+学習済み AR belief、C は `--fit` のデータから推定した B1。同じ paired deals で
+B vs A、C vs A、B vs C を評価する。`--with-oracle` の場合だけ、真の相手手札を使う
+評価専用の D vs A を追加する。B・C・D の探索設定は共通で、両側の探索割合と時間、
+勝率・Wilson 95%・ペア bootstrap 95% を `summary.json` / `summary.md` に保存する。
+`--resume` は完成した組を再利用し、引数や入力ファイルの変更は拒否する。
+`--fit` には評価局とは別に収集した belief fitting データを指定する。
+
+```sh
+scripts/tsubame_run.sh scripts/eval_p4.py \
+  --checkpoint runs/play/m-2166.pt --belief runs/play/belief-ar-m.pt \
+  --fit runs/belief-data/fit.pt --device cuda --threads 4 \
+  --pairs 500 --num-envs 32 --seed 0 --worlds 64 --depth 3 --beta 0.02 \
+  --search-response --candidates 16 --candidate-samples 64 \
+  --max-inference-batch 128 --out-dir measurements/p4-m --resume
+```
+
 `sweep_search.py` は `eval_search.py` の評価処理と共通引数を使い、同じ seed の
 paired deals で、探索あり対探索なしの同一モデルを比較する。
 `--worlds` と `--depth` は直積、`--grid 16:1 32:2 64:5` は明示の組だけを評価する。
