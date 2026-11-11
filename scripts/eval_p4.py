@@ -13,6 +13,7 @@ from gfrl.actor import Actor
 from gfrl.belief import Belief
 from gfrl.evaluation import evaluate_policies, load_policy_model
 from gfrl.runtime import configure_precision
+from gfrl.search_belief import variant_options
 from gfrl.search import SearchAgent, load_search_belief
 
 
@@ -25,11 +26,18 @@ def run_pair(args, left, right):
         if spec is None:
             agent = Actor(model, VecEnv(1, 1, eval_pairs=0), args.device)
         else:
-            belief = load_search_belief(spec, args.fit, args.device)
-            if name == 'B' and not isinstance(belief, Belief):
+            belief = load_search_belief(spec, args.fit, args.device, **(variant_options(args) if name == 'B' else {}))
+            from gfrl.search_belief import MixedBelief, TemperedBelief
+            if name == 'B' and not isinstance(belief, (Belief, MixedBelief, TemperedBelief)):
                 raise ValueError('--belief must be an autoregressive belief checkpoint')
-            agent = SearchAgent(model, belief, args.device, config=config,
+            agent_class = SearchAgent
+            if getattr(args, 'diagnostic_true_hand_nll', False):
+                from search_diagnostics import DiagnosticSearchAgent
+                agent_class = DiagnosticSearchAgent
+            agent = agent_class(model, belief, args.device, config=config,
                                 seed=args.seed, num_threads=args.threads, profile=args.profile)
+            if getattr(args, 'diagnostic_true_hand_nll', False):
+                agent.enable_diagnostic(args)
         agents[name] = evaluation.TimedPolicy(agent)
         records[name] = dict(belief=spec, search_config=asdict(config) if spec else None,
                              diagnostic_only=name == 'D')
@@ -43,10 +51,14 @@ def run_pair(args, left, right):
                                 progress=progress if args.progress_interval else None,
                                 progress_interval_s=args.progress_interval)
     for name, timed in agents.items():
+        if name != 'A' and getattr(args, 'diagnostic_true_hand_nll', False):
+            records[name]['diagnostic_true_hand_nll'] = timed.policy.diagnostic_report()
         records[name]['decision_timing'] = timed.statistics()
         records[name]['search'] = (timed.policy.statistics() if name != 'A'
                                    else dict(searched_fraction=0))
-    return dict(match=f'{left}_vs_{right}', left=left, right=right,
+    diagnostic = ({'diagnostic_true_hand_nll': {n: r['diagnostic_true_hand_nll'] for n, r in records.items() if 'diagnostic_true_hand_nll' in r}}
+                  if getattr(args, 'diagnostic_true_hand_nll', False) else {})
+    return dict(**diagnostic, match=f'{left}_vs_{right}', left=left, right=right,
                 diagnostic_only='D' in agents, **summary, agents=records,
                 elapsed_seconds=perf_counter()-start)
 
@@ -62,6 +74,9 @@ def write_summary(args, identity, reports, total):
         fractions = [r['agents'][n]['search']['searched_fraction'] for n in (r['left'], r['right'])]
         md += (f'| {r["match"]} | {r["games"]} | {r["win_rate"]:.2%} | {ci[0]} | {ci[1]} | '
                f'{fractions[0]:.2%} / {fractions[1]:.2%} | {r["elapsed_seconds"]:.3f} |\n')
+    from search_diagnostics import diagnostic_markdown
+    for report in reports:
+        md += diagnostic_markdown(report)
     md += '\nD uses true opposing hands: evaluation-only cheating upper-bound diagnostic.\n\n'
     md += TIMING_DEFINITION + '\n\nConfiguration and per-agent timing/search counters:\n\n```json\n'
     md += json.dumps(dict(config=identity, agents={r['match']: r['agents'] for r in reports}), indent=2) + '\n```\n'

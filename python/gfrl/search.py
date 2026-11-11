@@ -78,7 +78,11 @@ class OracleBelief:
     """Evaluation-only diagnostic: use privileged root hand labels, not inference."""
 
 
-def load_search_belief(spec, fit=None, device='cpu'):
+def load_search_belief(spec, fit=None, device='cpu', *, temperature=1., mix=0.):
+    from .search_belief import validate_variants, wrap_belief
+    validate_variants(temperature, mix)
+    if spec in ('oracle', 'b1', 'uniform') and (temperature != 1 or mix):
+        raise ValueError('belief variants require an autoregressive checkpoint')
     if spec == 'oracle':
         return OracleBelief()
     if spec == 'b1':
@@ -90,7 +94,9 @@ def load_search_belief(spec, fit=None, device='cpu'):
         pn = (fit_baselines(torch.load(fit, map_location='cpu', weights_only=False))['B0'].count_probs
               if fit else torch.full((19,), 1/19, dtype=torch.float64))
         return Baseline(pn, gift_probabilities())
-    return belief_from_checkpoint(torch.load(spec, map_location='cpu', weights_only=False)).to(device).eval().requires_grad_(False)
+    model = belief_from_checkpoint(torch.load(spec, map_location='cpu', weights_only=False)).to(device).eval().requires_grad_(False)
+    baseline = fit_baselines(torch.load(fit, map_location='cpu', weights_only=False))['B1'] if mix and fit else None
+    return wrap_belief(model, temperature, mix, baseline)
 
 
 _SUPPORT = {-1: 'inside_decision', 1: 'invalid_viewer', 2: 'unsupported_players',
@@ -278,24 +284,25 @@ class SearchAgent:
             self.world_load_counts[(role or 'other') + ':' + names[int(value)]] += int(count)
         return env, status.copy()
 
-    def _belief_samples(self, src, rows):
+    def _belief_samples(self, src, rows, belief=None):
         """Chunk deterministic belief work; retain the original sampling order."""
+        belief = self.belief if belief is None else belief
         cap = self.config.max_inference_batch
         if not cap:
             obs = tensor_batch({k: getattr(src, k)[rows] for k in OBS_FIELDS}, self.device)
-            return self.belief.sample(obs, 1)[:, 0].cpu().numpy().astype(np.int32)
+            return belief.sample(obs, 1)[:, 0].cpu().numpy().astype(np.int32)
         chunks, count_probs, card_probs = [], [], []
-        independent = isinstance(self.belief, IndependentBelief)
+        independent = isinstance(belief, IndependentBelief)
         for lo in range(0, len(rows), cap):
             rr = rows[lo:lo+cap]
             obs = tensor_batch({k: getattr(src, k)[rr] for k in OBS_FIELDS}, self.device)
             if independent:
-                pn, pk = self.belief._log_probs(obs)
+                pn, pk = belief._log_probs(obs)
                 count_probs.append(pn.exp())
                 card_probs.append(pk.exp())
             else:
-                cls, memory, padding = self.belief.memory(obs)
-                count_probs.append(self.belief.count_head(cls).float().softmax(-1))
+                cls, memory, padding = belief.memory(obs)
+                count_probs.append(belief.count_head(cls).float().softmax(-1))
                 chunks.append((memory.cpu(), padding.cpu()))
                 del cls, memory, padding
             del obs
@@ -315,7 +322,7 @@ class SearchAgent:
                 parts = []
                 for ci, (memory, padding) in enumerate(chunks):
                     lo = ci*cap
-                    parts.append(self.belief.decode(memory.to(self.device), padding.to(self.device),
+                    parts.append(belief.decode(memory.to(self.device), padding.to(self.device),
                                                    inputs[lo:lo+cap], counts[lo:lo+cap])[:, -1])
                 card = torch.multinomial(torch.cat(parts).exp(), 1)+1
                 result.scatter_add_(1, card, (counts > t).long()[:, None])
@@ -326,6 +333,9 @@ class SearchAgent:
         c = self.config
         oracle = isinstance(self.belief, OracleBelief)
         rr = np.repeat(roots, c.worlds).astype(np.int32)
+        from .search_belief import MixedBelief
+        mixed = isinstance(self.belief, MixedBelief)
+        use_b1 = self.belief.choose(self.rng, len(rr)) if mixed else None
         assignments = np.zeros((len(rr), 297), np.int32)
         valid = np.zeros(len(rr), bool)
         attempts = np.zeros(len(rr), int)
@@ -337,6 +347,15 @@ class SearchAgent:
                 # Includes public used cards, exactly like the training label.
                 # Keep the same validation and load conversion as sampled beliefs.
                 samples = src.label_opp_hand[rr[todo]].astype(np.int32)
+            elif mixed:
+                samples = np.zeros((len(todo), 297), np.int32)
+                mask = use_b1[todo]
+                baseline = self.belief.baseline
+                pn, pk = baseline.count_probs.numpy(), baseline.card_probs.numpy()
+                for j in np.flatnonzero(mask):
+                    samples[j] = self.rng.multinomial(self.rng.choice(19, p=pn), pk)
+                if (~mask).any():
+                    samples[~mask] = self._belief_samples(src, rr[todo[~mask]], self.belief.ar)
             elif isinstance(self.belief, Baseline):
                 pn, pk = self.belief.count_probs.numpy(), self.belief.card_probs.numpy()
                 samples = np.array([self.rng.multinomial(self.rng.choice(19, p=pn), pk) for _ in todo], np.int32)

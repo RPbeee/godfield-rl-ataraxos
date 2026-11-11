@@ -15,6 +15,7 @@ from gfrl.actor import Actor, synchronize
 from gfrl.evaluation import (evaluate_policies, load_policy_model, _policy_rng,
                              summarize, _EvaluationProgress)
 from gfrl.runtime import configure_precision
+from gfrl.search_belief import add_belief_arguments, variant_options, validate_variants
 from gfrl.search import SearchAgent, SearchConfig, load_search_belief
 
 
@@ -26,6 +27,7 @@ def build_parser(*, sweep=False):
     p.add_argument('--opponent-checkpoint')
     p.add_argument('--belief', required=True,
                    help='checkpoint path, b1, uniform, or oracle (evaluation-only diagnostic; cheats using true opponent hands)')
+    add_belief_arguments(p, sweep=sweep, offline=True)
     p.add_argument('--fit', help='B1 fitting data (optional count prior for uniform)')
     for name, default in (('worlds', 16), ('candidates', 16), ('candidate-samples', 64), ('depth', 10),
                           ('pairs', 500), ('num-envs', 32), ('threads', 1), ('seed', 0)):
@@ -33,7 +35,8 @@ def build_parser(*, sweep=False):
         p.add_argument('--'+name, type=int, default=[default] if multiple else default,
                        **({'nargs': '+'} if multiple else {}))
     p.add_argument('--search-response', action='store_true', help='search supported ordinary response roots')
-    p.add_argument('--leaf-view', choices=('actor', 'searcher'), default='actor')
+    p.add_argument('--leaf-view', choices=('actor', 'searcher'), default=['actor'] if sweep else 'actor',
+                   **({'nargs': '+'} if sweep else {}))
     p.add_argument('--max-inference-batch', type=int, default=0,
                    help='search inference row limit (0: unsplit; start with 128 on a 10 GB GPU)')
     p.add_argument('--skip-forced-inference', action=argparse.BooleanOptionalAction, default=False,
@@ -45,8 +48,9 @@ def build_parser(*, sweep=False):
                    help='maximum device token cache MiB; larger caches use host memory')
     p.add_argument('--root-batch-size', type=int, default=0,
                    help='cap roots per search workspace; 0 disables (changes RNG order)')
-    p.add_argument('--alpha', type=float, default=.002)
-    p.add_argument('--beta', type=float, default=.02)
+    for name, default in (('alpha', .002), ('beta', .02)):
+        p.add_argument('--'+name, type=float, default=[default] if sweep else default,
+                       **({'nargs': '+'} if sweep else {}))
     p.add_argument('--select', choices=('sample', 'argmax'), default='sample')
     p.add_argument('--device', choices=('cpu', 'mps', 'cuda'), default='cpu')
     p.add_argument('--profile', action='store_true', help='synchronized Actor phase timings (adds overhead)')
@@ -64,6 +68,9 @@ def validate_args(p, args):
     if not math.isfinite(args.progress_interval) or args.progress_interval < 0:
         p.error('progress-interval must be finite and nonnegative')
     try:
+        validate_variants(**variant_options(args))
+        if getattr(args, 'diagnostic_true_hand_nll', False) and (not args.fit or getattr(args, 'diagnostic_belief', args.belief) in ('uniform', 'b1', 'oracle')):
+            raise ValueError('true-hand diagnostic requires AR --belief and --fit')
         return search_config(args)
     except ValueError as exc:
         p.error(str(exc))
@@ -133,11 +140,17 @@ def run_match(args, agent, callback=None):
 def run_evaluation(args, *, measure_decisions=False):
     """Evaluate search against the requested opponent; return an unwritten report."""
     config = search_config(args)
-    belief = load_search_belief(args.belief, args.fit, args.device)
+    belief = load_search_belief(args.belief, args.fit, args.device, **variant_options(args))
     torch.set_num_threads(args.threads)
     configure_precision(args.device, args.tf32)
-    agent = SearchAgent(load_policy_model(args.checkpoint, args.device), belief, args.device,
+    agent_class = SearchAgent
+    if getattr(args, 'diagnostic_true_hand_nll', False):
+        from search_diagnostics import DiagnosticSearchAgent
+        agent_class = DiagnosticSearchAgent
+    agent = agent_class(load_policy_model(args.checkpoint, args.device), belief, args.device,
                         config=config, seed=args.seed, num_threads=args.threads, profile=args.profile)
+    if getattr(args, 'diagnostic_true_hand_nll', False):
+        agent.enable_diagnostic(args)
     start = perf_counter()
     # Keep the final report's existing configuration fields and output format.
     report_config = {k: str(v) if isinstance(v, Path) else v
@@ -170,6 +183,8 @@ def run_evaluation(args, *, measure_decisions=False):
     report = dict(belief=args.belief, diagnostic_only=args.belief == 'oracle',
                   config=report_config,
                   **summary, search=agent.statistics(), elapsed_seconds=perf_counter()-start)
+    if getattr(args, 'diagnostic_true_hand_nll', False):
+        report['diagnostic_true_hand_nll'] = agent.diagnostic_report()
     if timed is not None:
         report['decision_timing'] = timed.statistics()
     return report
@@ -199,6 +214,8 @@ def write_report(args, report):
           '| Search phase | Seconds / searched decision |\n|---|---:|\n' +
           ''.join(f'| {k} | {v:.6f} |\n' for k, v in report['search']['seconds_per_search'].items()) +
           '\n```json\n'+json.dumps(report['search'], indent=2)+'\n```\n')
+    from search_diagnostics import diagnostic_markdown
+    md += diagnostic_markdown(report)
     print(md, flush=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2)+'\n')

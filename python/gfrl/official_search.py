@@ -3,10 +3,12 @@ import numpy as np
 
 from .actor import Actor, PREFIX_FIELDS
 from .model import OBS_FIELDS
+from .search_belief import add_belief_arguments, variant_options, validate_variants
 from .search import SearchConfig, SearchAgent, load_search_belief
 
 
 def add_search_arguments(parser, *, advisor=False):
+    add_belief_arguments(parser)
     defaults = SearchConfig()
     parser.add_argument('--belief', default='uniform', help='uniform / b1 / belief checkpoint (oracle forbidden)')
     parser.add_argument('--fit')
@@ -23,6 +25,8 @@ def add_search_arguments(parser, *, advisor=False):
 
 
 def search_config(args):
+    assert not getattr(args, 'diagnostic_true_hand_nll', False), 'true-hand diagnostics are forbidden in official bot/advisor'
+    validate_variants(**variant_options(args))
     if args.belief.lower() == 'oracle':
         raise ValueError('oracle is forbidden for official advice')
     if args.threads < 1:
@@ -33,8 +37,9 @@ def search_config(args):
 
 
 def search_agent(model, args, *, seed=0):
-    agent = SearchAgent(model, load_search_belief(args.belief, args.fit, args.device), args.device,
-                        config=search_config(args), seed=seed, num_threads=args.threads)
+    config = search_config(args)  # Reject privileged options before loading anything.
+    agent = SearchAgent(model, load_search_belief(args.belief, args.fit, args.device, **variant_options(args)), args.device,
+                        config=config, seed=seed, num_threads=args.threads)
     agent.actor.sample = not args.greedy
     return agent
 
