@@ -122,21 +122,23 @@ def test_search_vs_search_each_seat_hidden_hand_invariance():
         torch.set_num_threads(previous)
 
 
-def test_danger_probe_is_read_only_and_detects_known_mask_exception():
+def test_danger_probe_is_read_only_and_pair_is_always_masked():
     env = VecEnv(1, 1, track_projection=True)
     for opponent in (False, True):
         _core._test_danger_root(env, opponent)
         fields = {k: getattr(env, k).copy() for k in (*OBS_FIELDS, 'mask', 'label_opp_hand')}
         # False fixture has an empty enemy hand: adding a card would change the
         # observation, so it must be untestable. True has one hidden 209 slot.
-        assert _core._measure_danger_probe(env, 0) == [True, opponent, opponent, opponent]
+        assert _core._measure_danger_probe(env, 0) == [True, opponent, False, opponent]
         for k, before in fields.items():
             np.testing.assert_array_equal(before, getattr(env, k))
 
-    # Count completion once, including singleton stages the engine skips. The
-    # fixture's kind=play automatically selects 94, then we add 232 and target.
+    # A play can finish with 94, but cannot append 232 (including forced stages).
     _core._test_danger_root(env, False)
-    for choice, completed in ((0, False), (1, False), (0, True)):
-        assert _core._measure_danger_selected(env, 0, choice) is completed
-        env.step(np.array([choice], np.int32))
-        assert bool(env.decision_done[0]) is completed
+    assert not _core._measure_danger_selected(env, 0, 0)
+    env.step(np.array([0], np.int32))
+    # Finish-cards is now forced because the only possible extra is forbidden.
+    assert env.stage[0] == 2
+    assert not _core._measure_danger_selected(env, 0, 0)
+    env.step(np.array([0], np.int32))
+    assert env.decision_done[0]

@@ -297,5 +297,6 @@ def test_card_specific_danger_wide_gap_prunes_wide():
     actor=PreferWide()
     a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),actor)
     assert a['status']=='advice' and a['action']['cards']==[dict(model=94,item_id=99)]
-    assert a['mask_exclusions']==[dict(reason='danger_wide_requires_unobservable_mortar_absence',item_ids=[100])]
+    # The gfrl selection mask itself now forbids 94+232; no UI pruning is needed.
+    assert 'mask_exclusions' not in a
     assert not any(actor.modes)

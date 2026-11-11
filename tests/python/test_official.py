@@ -278,7 +278,8 @@ def test_unsupported_execution_and_missing_pending_metadata():
             c=next((i for i in (0,1) if env.mask[0,i]),18)
         else:c=int(np.flatnonzero(env.mask[0])[0])
         env.step(np.array([c],np.int32))
-    assert env.action_support()==['danger_wide_requires_unobservable_mortar_absence']
+    assert env.cursor.command()['slots'] == [0]
+    assert env.action_support()==[]
     # A reversed active head without its observed launch must never invent an
     # origin or reflection count from the current source alone.
     g['attacks']=[dict(playerId=viewer,targetPlayerId=next(p['id'] for p in g['players'] if p['id']!=viewer),

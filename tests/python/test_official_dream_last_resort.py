@@ -133,7 +133,9 @@ def test_dream_last_resort_preserves_other_card_and_target_exclusions():
     advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False), PreferWide())
     assert advice['status'] == 'advice' and advice['dream_last_resort']
     assert advice['action']['cards'] == [dict(item_id=99, model=94)]
-    assert dict(reason='danger_wide_requires_unobservable_mortar_absence', item_ids=[100]) in advice['mask_exclusions']
+    # 94+232 is forbidden by the gfrl selection mask, not by a UI exclusion.
+    assert not any(e.get('reason') == 'danger_wide_requires_unobservable_mortar_absence'
+                   for e in advice.get('mask_exclusions', []))
 
     p['hand'] = [dict(id=99, face=6, used=False, disguised=True)]
     class PreferSelf(PreferFirst):

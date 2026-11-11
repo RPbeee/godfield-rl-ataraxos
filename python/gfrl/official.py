@@ -816,8 +816,8 @@ class OfficialDecision:
         """Execution gaps detectable without inspecting any hidden actual model."""
         c = self.cursor.command()
         selected = [self.public['hand'][i] for i in c['slots']]
-        faces = [h['face'] for h in selected]
         reasons = []
+        faces = [h['face'] for h in selected]
         kind = KINDS[c['kind']]
         if kind not in OBSERVED_UI_KINDS:
             reasons.append(f'ui_kind_unobserved:{kind}')
@@ -825,6 +825,7 @@ class OfficialDecision:
         if c['kind'] in (0, 5, 6) and c['target'] == self.public['viewer'] and faces and (
                 catalog[faces[0]]['targets_enemy_by_default']):
             reasons.append('self_target_of_enemy_default_unobserved')
+        # The gfrl mask forbids 94+232 in one action; keep this defensive guard.
         if 94 in faces and 232 in faces:
             reasons.append('danger_wide_requires_unobservable_mortar_absence')
         if any(h['disguised'] for h in selected):

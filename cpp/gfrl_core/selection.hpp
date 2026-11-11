@@ -1,5 +1,6 @@
 #pragma once
 #include <godfield/official_match.hpp>
+#include <algorithm>
 #include <array>
 #include <random>
 
@@ -9,6 +10,20 @@ enum class Stage : std::int8_t { kind, card, target, alloc_hp, alloc_mp };
 using Mask = std::array<bool, 21>;
 static_assert(sizeof(Mask) == 21 * sizeof(bool), "numpy mask rows must be contiguous");
 int bucket_value(int bucket);
+// Policy restriction, using displayed faces just like other selection rules.
+bool forbidden_pair(const gf::MatchSnapshot&, std::span<const gf::ItemToken>);
+template<class M> gf::SelectionNode policy_extensions(const M& match, gf::CommandKind kind,
+        std::span<const gf::ItemToken> prefix, bool canonical) {
+    if (forbidden_pair(match.snapshot(), prefix)) return {};
+    auto node = match.legal_extensions(kind, prefix, {canonical});
+    std::vector<gf::ItemToken> extended(prefix.begin(), prefix.end());
+    extended.push_back(0);
+    std::erase_if(node.next, [&](auto token) {
+        extended.back() = token;
+        return forbidden_pair(match.snapshot(), extended);
+    });
+    return node;
+}
 // A pure selection cursor over one immutable Match. Does not execute Commands.
 class Selection {
 public:

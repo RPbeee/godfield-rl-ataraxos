@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the 94+232 legal-mask exception on unchanged CPU self-play games."""
+"""Measure opponent-209 invariance of the restricted 94+232 policy masks."""
 import argparse
 import json
 from pathlib import Path

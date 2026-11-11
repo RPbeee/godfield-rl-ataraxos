@@ -32,7 +32,7 @@ gf::Command Random::act(const gf::Match& m, gf::PlayerId id, std::uint64_t& rng)
     actor_check(m,id);
     auto kinds=m.legal_kinds(); gf::Command c; c.actor=id; c.kind=kinds[uniform(rng,kinds.size())];
     for (;;) {
-        const auto node=m.legal_extensions(c.kind,c.items,{true});
+        const auto node=policy_extensions(m,c.kind,c.items,true);
         const auto choice=uniform(rng,node.next.size()+node.can_finish);
         if(choice<node.next.size()) {c.items.push_back(node.next[choice]);continue;}
         c.target=node.targets[uniform(rng,node.targets.size())];
@@ -47,7 +47,7 @@ gf::Command Random::act(const gf::Match& m, gf::PlayerId id, std::uint64_t& rng)
         return c;
     }
 }
-gf::Command Proposal::act(const gf::Match& m,gf::PlayerId id,std::uint64_t& rng) {actor_check(m,id);return m.sample_action(rng);}
+gf::Command Proposal::act(const gf::Match& m,gf::PlayerId id,std::uint64_t& rng) {actor_check(m,id);auto c=m.sample_action(rng);return forbidden_pair(m.snapshot(),c.items)?Random::act(m,id,rng):c;}
 gf::Command Greedy::act(const gf::Match& m,gf::PlayerId id,std::uint64_t& rng) {
     actor_check(m,id); const auto v=m.view(id);
     const auto own=std::find_if(v.board.players.begin(),v.board.players.end(),[&](const auto& p){return p.id==id;});
@@ -102,7 +102,7 @@ gf::Command Greedy::act(const gf::Match& m,gf::PlayerId id,std::uint64_t& rng) {
     };
     gf::Command c;c.actor=id;
     std::function<void()> walk=[&] {
-        const auto node=m.legal_extensions(c.kind,c.items,{true});
+        const auto node=policy_extensions(m,c.kind,c.items,true);
         if(node.can_finish)for(auto target:node.targets){c.target=target;consider(c);}
         if(c.items.size()==4)return;
         for(auto t:node.next){c.items.push_back(t);walk();c.items.pop_back();}

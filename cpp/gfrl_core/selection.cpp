@@ -2,6 +2,19 @@
 #include <algorithm>
 
 namespace gfrl {
+bool forbidden_pair(const gf::MatchSnapshot& s, std::span<const gf::ItemToken> tokens) {
+    const auto& own = *std::find_if(s.state.players.begin(), s.state.players.end(),
+        [&](const auto& p) { return p.id == s.actor; });
+    bool danger = false, wide = false;
+    for (auto token : tokens) {
+        const auto& item = *std::find_if(own.items.begin(), own.items.end(),
+            [&](const auto& i) { return i.token == token; });
+        const auto face = item.fake_model.value_or(item.model);
+        danger |= face == 94;
+        wide |= face == 232;
+    }
+    return danger && wide;
+}
 int bucket_value(int b) { return std::min(5 * b, 99); }
 Selection::Selection(const gf::Match& m,bool c) {init(m,c);}
 Selection::Selection(const gf::PublicSelection& m,bool c) {init(m,c);}
@@ -24,7 +37,7 @@ template<class M> void Selection::refresh(const M& match, bool canonical) {
     if (stage == Stage::kind) {
         for (auto k : match.legal_kinds()) mask.at(static_cast<int>(k)) = true;
     } else if (stage == Stage::card || stage == Stage::target) {
-        const auto node = match.legal_extensions(command.kind, command.items, {canonical});
+        const auto node = policy_extensions(match, command.kind, command.items, canonical);
         if (stage == Stage::card) {
             const auto& hand = match.snapshot().state.players[actor_seat].items;
             for (std::size_t i = 0; i < hand.size(); ++i)

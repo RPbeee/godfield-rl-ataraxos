@@ -11,6 +11,17 @@ gf::Match scene(std::vector<gf::CardId> cards) {
     m.load_scene(s,0,123);return m;
 }
 void leaks(){
+    for(bool mortar:{false,true}) {
+        auto m=scene({94,232,6});auto state=m.snapshot().state;
+        state.players[1].items={{200,static_cast<gf::CardId>(mortar?209:19),{},false}};
+        m.load_scene(state,0,123);
+        for(auto bot:{Controller::random,Controller::proposal,Controller::greedy})
+            for(std::uint64_t seed=0;seed<1000;++seed) {
+                auto rng=seed;const auto c=bot_action(bot,m,0,rng);
+                check(m.legal(c) && !forbidden_pair(m.snapshot(),c.items),"bot selected forbidden pair");
+            }
+    }
+
     for(bool dream:{false,true}) {
         auto a=scene({13,19,120,27}),b=a;auto s=a.snapshot().state;
         if(dream){s.players[0].curses={gf::Curse::dream};s.players[0].items[1].fake_model=27;a.load_scene(s,0,123);s.players[0].items[1].model=27;}
