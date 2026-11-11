@@ -3,6 +3,9 @@
 #include <cstring>
 #include <iostream>
 #include <random>
+#include <set>
+#include <map>
+#include <cmath>
 using namespace gfrl;
 void check(bool b,const char* what){if(!b)throw std::runtime_error(what);}
 namespace gfrl {
@@ -309,6 +312,60 @@ void measurement(bool evaluation=false) {
     std::cout<<"varied self-play worlds="<<loaded<<"\n";
     std::cout<<"used-card measurement: positions="<<positions<<" with_used="<<with_used<<" fraction="<<double(with_used)/positions<<" mean="<<double(used)/positions<<" conditional_mean="<<double(used)/with_used<<"\n";
 }
-int main(){try{worlds();response_worlds();response_worlds(6,true);response_worlds(202);response_worlds(202,true);
+void own_dream_worlds() {
+    for(bool response:{false,true}) {
+        auto m=scene({6,7},{6,190,118});auto state=m.snapshot().state;
+        const auto seat=response?1:0;
+        state.players[seat].curses={gf::Curse::dream};
+        state.players[seat].items[0].fake_model=7;
+        state.players[seat].items.back().fake_model=response?std::optional<gf::CardId>{123}:std::nullopt;
+        auto root=projection_root(),other=projection_root();
+        m.load_scene(state,0,19);TestAccess::inject(root,m);
+        state.players[seat].items[0].model=8;
+        if(response)state.players[seat].items.back().model=123; // identity source
+        m.load_scene(state,0,981);TestAccess::inject(other,m);
+        if(response) {
+            for(auto* env:{&root,&other}) {
+                TestAccess::accept(*env,{0,gf::CommandKind::play,{100},1});TestAccess::drive(*env);
+            }
+        }
+        obs_equal(root,other);equal(root.mask,other.mask);
+        check(root.determinize_support(row)[0]==0,"Dream root not enabled");
+        SearchEnv a(1,1,64,4,true),b(1,1,64,4,true);
+        std::array<std::int32_t,297> assignment{};assignment[card_code(8)]=2;
+        std::set<gf::CardId> sampled;
+        std::map<gf::CardId,unsigned> frequencies;
+        constexpr unsigned samples=2048;
+        for(std::uint64_t seed=0;seed<samples;++seed) {
+            const std::array seeds{seed};
+            a.load_worlds(root,row,assignment,seeds);b.load_worlds(other,row,assignment,seeds);
+            check(a.world_status[0]==0 && b.world_status[0]==0,"own world rejected");
+            check(a.match(0).snapshot()==b.match(0).snapshot(),"own actual or RNG leaked into complete world");
+            obs_equal(root,a);equal(root.mask,a.mask);
+            for(const auto& item:a.match(0).snapshot().state.players[seat].items) if(item.fake_model) {
+                check(gf::match_dream_compatible(item.model,*item.fake_model),"sample outside natural Dream prior");
+                sampled.insert(item.model);
+            }
+            ++frequencies[a.match(0).snapshot().state.players[seat].items[0].model];
+            std::mt19937_64 policy(seed);
+            for(int step=0;seed<256 && step<12 && !a.episode_done[0];++step) {
+                const auto choices=random_choices({a.mask.data(),1},{a.stage.data(),1},policy);
+                a.step(choices);b.step(choices);obs_equal(a,b);equal(a.mask,b.mask);
+                check(a.match(0).snapshot()==b.match(0).snapshot(),"own future leaked source actual");
+            }
+        }
+        check(sampled.size()>2,"own prior did not vary with world seed");
+        double weight=0;
+        for(const auto& card:gf::catalog()) if(root.match(0).gift_supported(card.id)
+                && gf::match_dream_compatible(card.id,7))weight+=card.gift_rate;
+        for(const auto& card:gf::catalog()) if(root.match(0).gift_supported(card.id)
+                && gf::match_dream_compatible(card.id,7)) {
+            const double p=card.gift_rate/weight, expected=samples*p;
+            check(std::abs(double(frequencies[card.id])-expected)<6*std::sqrt(samples*p*(1-p))+2,
+                    "own sample frequencies disagree with giftRate prior");
+        }
+    }
+}
+int main(){try{own_dream_worlds();worlds();response_worlds();response_worlds(6,true);response_worlds(202);response_worlds(202,true);
     for(const auto& card:gf::catalog()) if(gf::match_supported(card.id) && card.hit_rate && card.gift_rate && card.category==gf::Category::weapons) response_worlds(card.id);
     response_conversion();private_history();conversion();projection();tracking_disabled();measurement();measurement(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

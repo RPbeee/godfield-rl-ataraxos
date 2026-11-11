@@ -409,3 +409,174 @@ game engine comparison isolates eligibility: response support 5,204/7,339 →
 counts unchanged. The direct root comparison above separately proves that
 previously supported root outputs and disabled-response outputs stay exact.
 No strength conclusion is drawn from the 20 pairs.
+
+
+### Own Dream worlds (2026-11-11)
+
+Search now opts into `determinize_support(viewer, true)` and the new overload
+`determinized(viewer, opponent_models, own_disguises, seed, normalize_tokens)`.
+The old support call and old determinized overload retain their behavior,
+including rejecting nonidentity own disguises. No training, collection, transition,
+observation or snapshot format changes were made.
+
+`own_disguises` supplies one real model for **every** disguised slot in
+`view(viewer).board.hand` order (the public hand is sorted; the physical inventory
+is not). Slots are located by token in the main snapshot or response launch
+anchor. Faces, fake-model presence, used flags, tokens and physical order remain
+fixed. Replay regenerates both the current response and its proof anchor.
+Eligibility and sampling never distinguish identity from nonidentity disguises;
+even a restore-valid identity disguise must be resampled in the new path.
+Unmasked viewer cards and publicly played/revealed cards remain known.
+
+The parent samples each own slot independently, using only its public face and
+the configured gift catalog. For face f, the prior is
+`P(actual=a | disguised, face=f) ∝ giftRate(a) * match_dream_compatible(a,f)`.
+Goodfield's natural Dream draw chooses a different face uniformly from the
+compatible class after its mask coin. All members of a class have the same
+number of alternative faces, so that likelihood factor cancels. In particular,
+the displayed face itself has zero probability under a natural masked gift.
+The engine's broader restore-only compatibility rules (identity and the 19→27
+fixture alias) remain valid inputs to its assignment API, but are not extra
+natural-gift prior mass. An empty natural prior rejects the sample.
+
+**Design approximation:** the belief model predicts only the opponent hand.
+Own disguised reals therefore use this gift prior, without conditioning on
+private source truth or estimating history-dependent card survival. This is
+an approximation to the full posterior, not an oracle. Opponent sampling is
+unchanged. A separate seed-derived stream (`seed ^ 0x36d8a971c2ef504b`, mixed)
+with exact bounded draws selects own models; the existing world/chance seeds
+and the Python search RNG schedule stay unchanged for old roots.
+
+Each own-assigned result passes full restore validation and exact typed viewer
+view, last-decision and legal-kind equality guards. Ordered actor inventories
+are compared after replacing reals with faces. `SelectionTree` otherwise reads
+faces, disguise/used bits, resources and the public response context. Its only
+true-model tests are base call-phenomenon eligibility and mortar presence for
+exact 94+232. Those own-card predicates are checked invariant; root/one-card
+prefix nodes and every reachable 94+232 node are compared in both canonical
+modes. This proves the entire mask tree agrees without enumerating factorially
+many discard/defense permutations. Any mismatch rejects the sample, including
+a sampled enemy mortar changing the known 94+232 exception in a Dream root.
+The existing exception behavior on roots without own disguises is unchanged.
+
+Tests exhaust all 992 natural Dream compatibility pairs, compare full prefix
+trees for small hands in both modes, and reject missing/extra/incompatible
+assignments. Parent C++ tests compare complete snapshots (including anchors),
+all observation fields, masks and future transitions over 2,048 seeds per main/
+response fixture (future transitions on the first 256), with multiple disguises and changed source actuals/RNGs.
+Python tests additionally compare both seats' leaf observations and complete
+search outputs under changed true reals, including identity source disguises,
+with response search enabled and disabled. No privileged label is used for
+own sampling.
+
+Fixed pre-change fixtures in `tests/python/fixtures/search_supported_before.json`
+cover main and ordinary/percentage/Fog/202/Fog+202 response roots with both
+flag settings. All 12 output records remain exactly equal: candidates, q,
+probabilities, choices and integer counters. The earlier exact main-only
+fixture, including completed game outcomes, also remains unchanged.
+
+#### Fixed-policy coverage before and after
+
+Both runs use default goodfield config, 1,000 games, game seeds 0..999,
+policy RNG `game+101`, chance RNG `game+203`, and `sample_action` / the same
+existing automatic chance helpers. Sampling worlds never changes the played
+match or those streams. These counts include every active-player engine
+boundary, including forced choices; they are not the external-policy-only
+counts from M-policy evaluation. First-reason precedence is exclusive. Each
+percentage below uses its own main/response total as denominator (both seats).
+
+```sh
+build-goodfield/godfield_official_determinized_tests --measure 1000
+build-goodfield/godfield_official_determinized_tests --measure-own 1000
+```
+
+The first command retains the legacy API; the second uses the new own-assignment
+API on exactly the same fixed-policy games. Raw reports are
+`measurements/dream-engine-{before,after}.txt`.
+
+| First reason | Main before (22,577) | Main after (22,577) | Response before (7,339) | Response after (7,339) |
+| --- | ---: | ---: | ---: | ---: |
+| ok | 21,153 (93.6927%) | 21,858 (96.8153%) | 5,843 (79.6158%) | 6,032 (82.1910%) |
+| hidden_own_model | 705 (3.1226%) | 0 (0.0000%) | 189 (2.5753%) | 0 (0.0000%) |
+| hidden_status | 719 (3.1847%) | 719 (3.1847%) | 183 (2.4935%) | 183 (2.4935%) |
+| not_actor | 0 (0.0000%) | 0 (0.0000%) | 372 (5.0688%) | 372 (5.0688%) |
+| response_special | 0 (0.0000%) | 0 (0.0000%) | 643 (8.7614%) | 643 (8.7614%) |
+| response_random | 0 (0.0000%) | 0 (0.0000%) | 71 (0.9674%) | 71 (0.9674%) |
+| response_history | 0 (0.0000%) | 0 (0.0000%) | 38 (0.5178%) | 38 (0.5178%) |
+| Every other reason, each | 0 (0%) | 0 (0%) | 0 (0%) | 0 (0%) |
+
+Other reasons are invalid_viewer, unsupported_players, not_main, pending_work,
+reserved_gifts, replay_proof and hidden_confusion. There are also 361 purchase
+boundaries (not_main, not newly supported) and no grant boundaries under default
+local gifts. With `--search-response` absent, all 7,339 response boundaries
+remain outside frontend search (`skip_not_main`, including response_disabled).
+With it enabled, engine response eligibility above applies. Actual policy
+searches still require a nonautomatic decision and sufficient valid samples.
+
+| Rejection detail (first reason) | Main before → after | Response before → after |
+| --- | ---: | ---: |
+| Dream: own nonidentity disguised card(s) | 705 → 0 | 189 → 0 |
+| Fog on viewer: enemy status hidden | 719 → 719 | 183 → 183 |
+| Response to viewer's own launch | 0 | 372 → 372 |
+| Special: buy launch | 0 | 385 → 385 |
+| Special: sell launch | 0 | 257 → 257 |
+| Special: tick already processed | 0 | 1 → 1 |
+| Random: Danger | 0 | 24 → 24 |
+| Random: bounce | 0 | 47 → 47 |
+| History: previous resolved body | 0 | 38 → 38 |
+
+Thus eligible main roots increase by 705 and responses by 189, totaling 894.
+No old rejection category is redistributed except hidden_own_model→ok; all phase
+totals match. Main sample attempts reject 0/10,000 after the change. Response
+samples reject 312/6,032 (5.1724%), entirely launch physical capacity; there are
+zero view/decision/mask mismatch rejections. Before: main 0/10,000, response
+298/5,843 (5.1001%), also entirely capacity. Assignment RNG=778 is separate from
+play; adding newly eligible roots changes its subsequent samples, so these
+rejection totals are not a paired comparison of assignments. Timings were run
+alongside tests and are not used for performance conclusions.
+
+#### Remaining exclusions and implementation estimates
+
+These are engineering estimates including fixtures/leak tests, not measured
+runtime budgets. They remain excluded in this change:
+
+- **Viewer Fog (719 main, 183 responses):** the opponent HP/MP/CP, displayed
+  diseases and curses, guardian and confusion status are hidden. A safe world
+  needs a joint posterior over them, not copied source values or independently
+  uniform fields. Confusion counters, disease/death/revival bookkeeping and
+  response initial-state/derived pending fields must remain restore-consistent;
+  retained public history constrains the samples too. Add a status-assignment
+  contract, choose/train an estimator and rebuild response anchors/history.
+  Estimate 5–10 engineering days for an explicit prior approximation with
+  invariance/replay tests; a calibrated learned posterior is additional work.
+- **Buy (385) / sell (257):** these are before trade resolution, so the launch
+  itself need not resample a commodity already observed at these roots. Buy's
+  later random commodity must come from the sampled seller inventory and new
+  RNG; eventual escrow/price/return/overflow and purchase proofs cannot retain
+  source objects. Sell must preserve both public launch tokens (including the
+  commodity) while deriving transfer/gifts/capacity from the rebuilt inventory.
+  Existing `replay_launch` can dispatch both, but eligibility, public fields,
+  reflection contexts and current-vs-anchor used/consumed/escrow accounting need
+  a trade-specific audit and leak fixtures. Estimate 2–4 days for both (buy
+  alone 1–2, sell 1–2); not treated as a safe one-line whitelist expansion.
+- **Tick already processed (1 special), resolved-body histories (38):** replay
+  can involve disease damage, revival consumption, death/counter queues, guardian
+  opportunities, gifts/redraws and potentially private results. Replace those
+  hidden outcomes and reconstruct all dependent anchors rather than retaining
+  them. Estimate 3–5 days for a narrowly defined tick/body subset, larger for
+  the full general journal.
+- **Danger/bounce (71):** Danger depends on hidden mortar presence; bounce
+  requires fresh redirect target draws conditioned on public routing. Neither
+  was included. Response to one's own launch (372) is a separate owner/actor
+  contract expansion, also unchanged.
+
+
+Final validation: Release cmake builds succeeded for parent and standalone
+goodfield; parent CTest **17/17**, standalone goodfield CTest **166/166**,
+`pytest -q` **279 passed / 1 skipped** (including MPS equivalence). After adding
+extra sorted-slot, mask-rejection and prior-frequency fixtures, the rebuilt
+parent CTest 17/17 and goodfield official_determinized test passed again.
+The pre-change 12 root output records compare exactly equal after the final
+build. The legacy `--measure 1000` also reproduces every pre-change count and
+detail, including sample capacity rejection totals, under the changed engine.
+Logs and raw comparison outputs are under `measurements/dream-*`.
