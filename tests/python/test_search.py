@@ -231,7 +231,7 @@ def test_engine_draw_at_exact_depth_uses_result():
     assert all(c['q'] == 0 for c in agent.last_search[0]['candidates'])
 
 
-def test_known_danger_94_area_232_mask_difference_and_fallback():
+def test_danger_94_area_232_worlds_share_restricted_masks():
     env = VecEnv(1, 1, track_projection=True)
     _core._test_danger_root(env, True)
     pn = torch.zeros(19, dtype=torch.float64)
@@ -239,31 +239,20 @@ def test_known_danger_94_area_232_mask_difference_and_fallback():
     pk = torch.zeros(297, dtype=torch.float64)
     pk[209] = 1
     agent = SearchAgent(model(), Baseline(pn, pk), config=SearchConfig(
-        worlds=16, candidates=32, candidate_samples=256, depth=0), seed=6)
+        worlds=16, candidates=32, candidate_samples=256, depth=1), seed=6)
     with _policy_rng(77, (agent,)):
         choices = agent(env, np.array([0]))
-        assert agent.counts['invalid_candidate_worlds'] > 0
-        # Locate a sampled candidate whose prefix is incompatible with the
-        # real 209 world, then force its selection to exercise fallback.
-        incompatible = None
+        assert agent.counts['invalid_candidate_worlds'] == 0
         for candidate in agent.last_search[0]['candidates']:
-            assignment = np.zeros((1, 297), np.int32)
-            assignment[0, 209] = 1
-            world, _ = agent._world_env(env, [0], assignment, [1], 1)
-            path = candidate['path']
-            for t, choice in enumerate(path):
-                if world.decisions[0] or not world.mask[0, choice]:
-                    incompatible = path
-                    break
-                world.step(np.array([choice], np.int32))
-            if not world.decisions[0]:
-                incompatible = path
-            if incompatible is not None:
-                break
-        assert incompatible is not None
-        agent = SearchAgent(model(), baseline(), seed=6)
-        agent.search = lambda src, roots: {0: tuple(incompatible)}
-        choices = agent(env, np.array([0]))
+            for mortar in (False, True):
+                assignment = np.zeros((1, 297), np.int32)
+                if mortar:
+                    assignment[0, 209] = 1
+                world, _ = agent._world_env(env, [0], assignment, [1], 1)
+                for choice in candidate['path']:
+                    assert world.mask[0, choice]
+                    world.step(np.array([choice], np.int32))
+                assert world.decisions[0]
         for _ in range(20):
             assert env.mask[0, choices[0]]
             env.step(choices)
@@ -272,7 +261,7 @@ def test_known_danger_94_area_232_mask_difference_and_fallback():
             choices = agent(env, np.array([0]))
         else:
             pytest.fail('root decision did not complete')
-    assert agent.counts['real_mismatches'] > 0
+    assert agent.counts['real_mismatches'] == 0
 
 
 @pytest.mark.parametrize('case', json.loads((Path(__file__).parent/'fixtures/search_before.json').read_text()))
@@ -631,7 +620,7 @@ def test_cache_budget_falls_back_to_host():
     assert actor.token_cache.device.type == 'cpu'
 
 
-def test_singleton_preserves_partial_world_rejection():
+def test_singleton_danger_pair_has_no_partial_world_rejection():
     from dataclasses import replace
     env = VecEnv(1, 1, track_projection=True)
     _core._test_danger_root(env, True)
@@ -644,7 +633,8 @@ def test_singleton_preserves_partial_world_rejection():
     probe = SearchAgent(model(), belief, config=config, seed=6)
     with _policy_rng(77, (probe,)):
         probe.search(env, np.array([0], np.int32), report_values=True)
-    candidate = next(c for c in probe.last_search[0]['candidates'] if c['valid_worlds'] < 16)
+    assert all(c['valid_worlds'] == 16 for c in probe.last_search[0]['candidates'])
+    candidate = probe.last_search[0]['candidates'][0]
     fixed = {0: [(tuple(candidate['path']), (candidate['log_pi'], candidate['log_rho']))]}
     reports = []
     for skip in (False, True):
@@ -652,7 +642,7 @@ def test_singleton_preserves_partial_world_rejection():
         with _policy_rng(77, (agent,)):
             agent.search(env, np.array([0], np.int32), fixed_candidates=fixed)
         reports.append(agent.last_search[0])
-        assert agent.counts['invalid_candidate_worlds'] > 0
+        assert agent.counts['invalid_candidate_worlds'] == 0
     assert reports[0]['selected'] == reports[1]['selected']
     assert reports[0]['probabilities'] == reports[1]['probabilities'] == [1.]
     for key in ('path', 'valid_worlds', 'log_pi', 'log_rho'):

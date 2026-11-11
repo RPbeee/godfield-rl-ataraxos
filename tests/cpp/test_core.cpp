@@ -45,6 +45,13 @@ void selection_tree(const gf::Match& match, Selection node, bool canonical, Comm
 }
 void extension_tree(const gf::Match& match, gf::Command& c, bool canonical, Commands& out) {
     auto node = match.legal_extensions(c.kind, c.items, {canonical});
+    const auto& hand = match.snapshot().state.players.at(match.snapshot().state.players[0].id == c.actor ? 0 : 1).items;
+    bool danger=false, wide=false;
+    for (auto token:c.items) for (const auto& item:hand) if (item.token==token) {
+        danger |= item.fake_model.value_or(item.model)==94;
+        wide |= item.fake_model.value_or(item.model)==232;
+    }
+    if (danger && wide) return;
     if (node.can_finish) for (auto target : node.targets) {
         c.target = target;
         if (node.exchange) {
@@ -90,7 +97,65 @@ gf::Match fixture(std::initializer_list<int> models, int hp = 40, int mp = 10, i
     for (auto model : models) s.players[0].items.push_back({token++, static_cast<godfield::official::CardId>(model), {}, false});
     match.load_scene(s, 42, 123); return match;
 }
+void restricted_pair() {
+    for (bool canonical:{false,true}) for (bool dream:{false,true}) for (bool reverse:{false,true}) {
+        auto absent=fixture(reverse?std::initializer_list<int>{232,94,6}:std::initializer_list<int>{94,232,6});
+        auto state=absent.snapshot().state;
+        if (dream) {
+            state.players[0].curses={gf::Curse::dream};
+            // Restore permits identity disguises, even for unique Dream classes.
+            for (auto& item:state.players[0].items) item.fake_model=item.model;
+        }
+        state.players[1].items={{200,19,{},false}};
+        absent.load_scene(state,42,123);
+        state.players[1].items[0].model=209;
+        auto present=absent;present.load_scene(state,42,123);
+        gf::PublicSelection public_match(absent.view(42));
+        const auto visit=[&](auto&& self,Selection a,Selection b,Selection p)->void {
+            const auto public_choice=[&](int choice) {
+                if(a.stage!=Stage::card || choice>=3)return choice;
+                const auto token=absent.snapshot().state.players[0].items[choice].token;
+                const auto& hand=public_match.snapshot().state.players[0].items;
+                return int(std::find_if(hand.begin(),hand.end(),[&](const auto& i){return i.token==token;})-hand.begin());
+            };
+            check(a.mask==b.mask,"opponent mortar changed restricted mask");
+            for(int choice=0;choice<21;++choice)
+                check(a.mask[choice]==p.mask[public_choice(choice)],"public cursor changed restricted mask");
+            if (a.complete) {
+                bool danger=false,wide=false;
+                for (int i=0;i<a.count;++i) {
+                    const auto& item=absent.snapshot().state.players[0].items[a.cards[i]];
+                    danger |= item.fake_model.value_or(item.model)==94;
+                    wide |= item.fake_model.value_or(item.model)==232;
+                }
+                check(!(danger && wide),"forbidden pair reached leaf");
+                return;
+            }
+            for (int choice=0;choice<21;++choice) if(a.mask[choice]) {
+                auto aa=a,bb=b,pp=p;
+                aa.choose(absent,choice,canonical);bb.choose(present,choice,canonical);pp.choose(public_match,public_choice(choice),canonical);
+                self(self,aa,bb,pp);
+            }
+        };
+        visit(visit,Selection(absent,canonical),Selection(present,canonical),Selection(public_match,canonical));
+        compare_tree(absent);compare_tree(present);
+        // The engine's rules remain unchanged: it still allows the pair here.
+        const gf::ItemToken danger=reverse?101:100,wide=reverse?100:101;
+        check(absent.legal({42,gf::CommandKind::play,{danger,wide},{}}),"engine pair rule changed");
+        for (const auto& tokens:{std::array{danger,wide},std::array{wide,danger}})
+            check(forbidden_pair(absent.snapshot(),tokens),"pair check depends on order");
+        Selection cursor(absent,canonical);
+        cursor.choose(absent,int(gf::CommandKind::play),canonical);
+        check(!cursor.mask[reverse?0:1],"wide card unexpectedly became a base");
+        cursor.choose(absent,reverse?1:0,canonical);
+        check(!cursor.mask[reverse?0:1],"forbidden extra admitted");
+        bool rejected=false;
+        try {cursor.choose(absent,reverse?0:1,canonical);} catch(const std::invalid_argument&) {rejected=true;}
+        check(rejected,"forbidden choice accepted");
+    }
+}
 void tree() {
+    restricted_pair();
     std::uint64_t policy = 42, chance = 43;
     for (int i = 0; i < 120; ++i) {
         gf::Match game;
@@ -106,7 +171,7 @@ void tree() {
         compare_tree(game);
     }
     // Explicit empty hand, duplicates, exchange extrema, FREE and order-sensitive materials.
-    for (auto models : {std::initializer_list<int>{}, {6, 6, 7, 8}, {3}, {3, 3}, {57, 204, 199, 200}, {204, 199, 200, 204, 199}, {120, 26, 14, 58}})
+    for (auto models : {std::initializer_list<int>{}, {6, 6, 7, 8}, {3}, {3, 3}, {57, 204, 199, 200}, {204, 199, 200, 204, 199}, {120, 26, 14, 58}, {94, 232, 6}, {232, 94}})
         compare_tree(fixture(models));
     compare_tree(fixture({3}, 99, 99, 99));
     compare_tree(fixture({3}, 1, 0, 0));

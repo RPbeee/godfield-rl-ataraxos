@@ -453,11 +453,10 @@ are compared after replacing reals with faces. `SelectionTree` otherwise reads
 faces, disguise/used bits, resources and the public response context. Its only
 true-model tests are base call-phenomenon eligibility and mortar presence for
 exact 94+232. Those own-card predicates are checked invariant; root/one-card
-prefix nodes and every reachable 94+232 node are compared in both canonical
-modes. This proves the entire mask tree agrees without enumerating factorially
-many discard/defense permutations. Any mismatch rejects the sample, including
-a sampled enemy mortar changing the known 94+232 exception in a Dream root.
-The existing exception behavior on roots without own disguises is unchanged.
+prefix nodes are compared in both canonical modes, allowing only the known
+engine 94+232 extension difference. The gfrl policy now forbids that pair in
+all worlds, so this engine-only difference must not reject a Dream sample.
+Other mismatches still reject the sample. Goodfield execution rules are unchanged.
 
 Tests exhaust all 992 natural Dream compatibility pairs, compare full prefix
 trees for small hands in both modes, and reject missing/extra/incompatible
@@ -604,8 +603,7 @@ from their beginning. B and C settings are recorded independently and checked
 equal in the integration test. A separate B-vs-C test changes true hidden hands
 and source RNG while preserving all six acting-seat observation fields, then
 checks identical choices, search reports and counters for **both absolute
-seats of each agent**. This test excludes the separately measured known mask
-exception below.
+seats of each agent**. The formerly known mask exception is now forbidden as described below.
 
 TSUBAME example (use an independent fitting split for B1):
 
@@ -679,7 +677,7 @@ Always forbidding this combination would remove an action actually chosen on
 removal rate, not a measured win-rate effect: masking also changes policy
 normalization and potentially future trajectories. The sample is small for
 this rare combination, and zero selections does not establish a zero
-population rate. No decision to forbid the combination is made here.
+population rate. This was the measurement before the policy restriction below.
 
 Validation: Release cmake builds succeeded for parent and standalone goodfield;
 CTest **17/17** and **166/166**; full Python suite **282 passed / 1 skipped**.
@@ -688,3 +686,57 @@ configuration mismatch handling, plus both-seat hidden-hand invariance. The
 measurement fixture checks read-only observations/masks/labels, the known
 209-sensitive case, the untestable empty-hand case, and completed-play counting
 through forced stages.
+
+
+### Always forbid displayed 94 + 232 (2026-11-11)
+
+The gfrl policy now forbids selecting displayed 94 and 232 together in a single
+command, regardless of order, command kind, or either player's true models.
+`policy_extensions` removes any next card that would complete this pair;
+`Selection` uses it for both executable Match and public-only PublicSelection.
+Dream uses `fake_model.value_or(model)`, matching the existing face-based
+selection rules. A disguised face of 94/232 counts; hidden truth does not decide
+the restriction. Single-card actions and all other combinations retain their
+engine legality. This is a policy restriction; goodfield's game rules and
+automatic/confused transitions remain unchanged.
+
+VecEnv (training, collection, evaluation and play), SearchEnv candidate worlds
+and policy rollouts, and OfficialDecision/advisor share this cursor. Random and
+Greedy bots use the same filtered extensions; Proposal retains its engine sample
+unless it contains the forbidden pair, then falls back to filtered Random.
+The obsolete advisor execution-gap reason
+`danger_wide_requires_unobservable_mortar_absence` is removed because the cursor
+cannot produce the pair. Goodfield's own-Dream determinization guard now permits
+only the previously known engine pair-extension difference, so sampled mortars
+do not reject worlds for a branch that gfrl cannot reach.
+
+The same read-only counterfactual probe now compares policy-filtered extensions.
+Re-running the command above with
+`--out measurements/mask-leak-forbidden.json` produced:
+
+| Quantity | Before | After |
+| --- | ---: | ---: |
+| Games | 1,000 | 1,000 |
+| Fresh external decisions | 49,430 | 49,430 |
+| Holding unused displayed 94 and 232 | 17 | 17 |
+| Observation-preserving testable decisions | 10 | 10 |
+| Mask changed with opponent 209 | 8 | **0** |
+| Completed plays selecting the pair | 0 | 0 |
+
+Elapsed: 177.09 s, CPU, M checkpoint, seed 20261111, 32 environments / 4 threads.
+Wins/losses/draws remained 480/518/2, with no truncations. Raw report and log:
+`measurements/mask-leak-forbidden.{json,log}`. Equality of this run's outcomes
+is observational; policy normalization and future training may change.
+
+Regression coverage compares the complete engine command tree after independently
+removing only pair-containing leaves, and compares full cursor trees with/without
+an enemy mortar and with public-only selection, both canonical modes, physical
+orders and Dream identity disguises. Existing frozen search JSON fixtures remain
+unchanged. Updated synthetic 94+232 fixtures now expect no world incompatibility,
+no hidden-mortar advisor warning, and a forced finish-cards stage after 94.
+The upstream Dream fixture now accepts a world whose engine-only pair branch
+differs, while requiring the same public view.
+
+Validation after restriction: Release cmake builds succeeded for parent and
+standalone goodfield; CTest **17/17** and **166/166**; full `pytest -q`:
+**282 passed / 1 skipped** (including the MPS equivalence case).

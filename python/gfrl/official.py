@@ -436,10 +436,7 @@ class OfficialDecision:
         """Execution gaps detectable without inspecting any hidden actual model."""
         c = self.cursor.command()
         selected = [self.public['hand'][i] for i in c['slots']]
-        faces = [h['face'] for h in selected]
         reasons = []
-        if 94 in faces and 232 in faces:
-            reasons.append('danger_wide_requires_unobservable_mortar_absence')
         if any(h['disguised'] for h in selected):
             reasons.append('dream_actual_execution_not_verified_from_public_faces')
         if any(p['status'] and p['status']['guardian'] in ('earth', 'moon') for p in self.public['players']):

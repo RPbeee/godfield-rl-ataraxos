@@ -47,14 +47,14 @@ struct TestAccess {
             throw std::runtime_error("danger probe changed viewer observation");
         out[1]=true;
         const auto kind=gf::CommandKind::play;
-        const auto an=a.legal_extensions(kind,{}, {env.canonical_});
-        const auto bn=b.legal_extensions(kind,{}, {env.canonical_});
+        const auto an=policy_extensions(a,kind,{},env.canonical_);
+        const auto bn=policy_extensions(b,kind,{},env.canonical_);
         out[2]=an!=bn;
-        // The known exception is exact 94+232. Root and every shared one-card
-        // prefix locate its mask difference without factorial discard traversal.
+        // Compare the policy-filtered root and every shared one-card prefix.
+        // The forbidden pair cannot be reached, regardless of enemy mortar.
         for(auto token:an.next)if(std::find(bn.next.begin(),bn.next.end(),token)!=bn.next.end()) {
             const std::array<gf::ItemToken,1> prefix{token};
-            out[2]|=a.legal_extensions(kind,prefix,{env.canonical_})!=b.legal_extensions(kind,prefix,{env.canonical_});
+            out[2]|=policy_extensions(a,kind,prefix,env.canonical_)!=policy_extensions(b,kind,prefix,env.canonical_);
         }
         return out;
     }
