@@ -51,3 +51,30 @@ revive では公開された消費品だけを投影し、同じ player の他�
 実際の native Match で生成し、両視点の観測/History 全体を照合する。
 parser の合成 Firestore frame は既定 strict と lenient の両方で unknownEvent への置換が
 ないこと、型・キー・roster・応答 index の不正を拒否することを確認する。
+
+## 同一 updateCount の再送と conflicting_update の診断
+
+`OfficialStreams` は変更された cumulative prefix 全体を再解析するため、prefix が
+伸びるたびに以前の完全フレームも再比較する。SHA が同じ snapshot だけは省略する。
+baseline は開始時の stream ごとのバイト数で固定され、`frame_end_byte > baseline`
+のフレームを採用する。開始時に未完だったフレームが後で完成した場合も対象になる。
+private room の `parse_capture` は同じ parser に境界を渡し、境界後の本人 seat を検査する
+wrapper であり、差分フレームだけを返す機能ではない。
+同じ capture 内の複数 stream や reconnect 後の重複 document 通知でも同じ更新を比較する。
+room 再入場などで別 game が混ざる場合も候補になる。document_sequence は入力ごとの
+ローカル番号で、複数 document の拒否は各 stream 内に限られ、stream 間の同一 document
+性までは証明しない。これらはコード上の候補であり、削除済み raw から今回の原因は確定できない。
+
+`project_game` の prior 依存は売却先/売却元の `pending.target/source` のみ。
+初回の full `session.previous` と再比較用の pending-only context はこの点で等価。
+`ingest` は trial session と public を深くコピーし、`ingest_public` も source/previous を
+深くコピーするため、現在のコードに比較 snapshot を書き換える aliasing バグは見つからない。
+seen も防御的に深くコピーし、後続更新・売却 context・result/session の変更後にも
+同一再送を受理する回帰テストを追加した。
+
+conflict 時は public projection 同士だけから `update` と `differences`（最大32件の
+`{path, kind}`、kind は added/removed/changed/type）を生成する。値や raw key は出力しない。
+exception と bot 停止時の境界で型・件数・path 形式を検査し、この構造以外は転送しない。
+`moves.jsonl`、stderr、最終 summary に同じ診断を残す。既存の停止記録の action allowlist
+とは別に conflict detail の allowlist を設けた。最終 summary が停止 detail を落としていた
+問題は修正したが、これは conflict 発生原因ではない。

@@ -15,7 +15,7 @@ import threading
 import tempfile
 import time
 
-from .official import ROOT, OfficialSession, OfficialStreams, exception_detail, parser_module
+from .official import ROOT, OfficialSession, OfficialStreams, conflict_detail, exception_detail, parser_module
 from .official_ui import UIUnsupported, require, prepare, execute, ready, wait_visible, PUBLIC_PATHS
 
 
@@ -551,6 +551,8 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
     except Exception as error:
         code = str(error) if isinstance(error, UIUnsupported) else 'bot_input_or_model_failure'
         detail = error.detail if isinstance(error, UIUnsupported) else exception_detail(error, fixed_codes=False, local_only=False)
+        if isinstance(detail, dict) and detail.get('code') == 'conflicting_update':
+            detail = dict(error='ValueError', code='conflicting_update', **conflict_detail(detail))
         # Advice is an external/model boundary; a failing payload must not be
         # copied wholesale into stopped rows (even if it contains a name).
         stopped = dict(status='stopped', reason=code, detail=detail)
@@ -645,7 +647,7 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 poll_state(probe, lambda s: 'コンピュータと対戦' in s['body'])
         except Exception:
             pass
-        return dict(counts, status='stopped', reason=code)
+        return dict(counts, status='stopped', reason=code, detail=detail)
 
 
 def main(argv=None):

@@ -7,6 +7,7 @@ from __future__ import annotations
 from copy import deepcopy
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +48,67 @@ DECISION_ONLY_UNSUPPORTED = frozenset({
 })
 
 
+def projection_differences(first, new):
+    """At most 32 structural differences; callers supply public projections only.
+
+    Never stringify leaves (including IDs, card faces, or event text).
+    """
+    differences = []
+    def add(path, kind):
+        differences.append(dict(path=path, kind=kind))
+    def walk(a, b, path):
+        if len(differences) >= 32:
+            return
+        if type(a) is not type(b):
+            add(path, 'type')
+        elif isinstance(a, dict):
+            for key in sorted(a.keys() | b.keys()):
+                if len(differences) >= 32:
+                    break
+                child = f'{path}.{key}' if path else key
+                if key not in a:
+                    add(child, 'added')
+                elif key not in b:
+                    add(child, 'removed')
+                else:
+                    walk(a[key], b[key], child)
+        elif isinstance(a, list):
+            for i in range(max(len(a), len(b))):
+                if len(differences) >= 32:
+                    break
+                child = f'{path}[{i}]'
+                if i >= len(a):
+                    add(child, 'added')
+                elif i >= len(b):
+                    add(child, 'removed')
+                else:
+                    walk(a[i], b[i], child)
+        elif a != b:
+            add(path, 'changed')
+    walk(first, new, '')
+    return differences
+
+
+def conflict_detail(detail):
+    """Whitelist the conflict diagnostic shape at exception/log boundaries."""
+    safe = {}
+    if not isinstance(detail, dict):
+        return safe
+    update = detail.get('update')
+    if type(update) is int and 0 <= update <= 9007199254740991:
+        safe['update'] = update
+    differences = detail.get('differences')
+    if (isinstance(differences, list) and len(differences) <= 32
+            and all(isinstance(d, dict) and set(d) == {'path', 'kind'}
+                    and isinstance(d['path'], str) and len(d['path']) <= 256
+                    and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*(?:\[\d+\]|\.[A-Za-z_][A-Za-z_0-9]*)*', d['path'])
+                    and isinstance(d['kind'], str)
+                    and d['kind'] in ('added', 'removed', 'changed', 'type')
+                    for d in differences)):
+        safe['differences'] = deepcopy(differences)
+    return safe
+
+
 def exception_detail(error, parse_error_type=None, *, fixed_codes=True, local_only=True):
     detail = dict(error=type(error).__name__)
     if parse_error_type is not None and isinstance(error, parse_error_type):
@@ -54,6 +116,8 @@ def exception_detail(error, parse_error_type=None, *, fixed_codes=True, local_on
     elif (fixed_codes and type(error) is ValueError and error.args
           and isinstance(error.args[0], str) and error.args[0] in VALUE_ERROR_CODES):
         detail['code'] = error.args[0]
+        if detail['code'] == 'conflicting_update' and len(error.args) == 2:
+            detail.update(conflict_detail(error.args[1]))
     else:
         frame = error.__traceback__
         last = None
@@ -912,7 +976,8 @@ class OfficialStreams:
                 if u in self.seen:
                     projected = project_game(game, self.session.viewer, prior=self.context[u])
                     if projected != self.seen[u]:
-                        raise ValueError('conflicting_update')
+                        raise ValueError('conflicting_update', dict(update=u,
+                            differences=projection_differences(self.seen[u], projected)))
                     continue
                 prior = self.session.previous
                 projected = project_game(game, self.session.viewer, prior=prior)
@@ -925,7 +990,9 @@ class OfficialStreams:
                     self.replaced_events.extend(dict(update=u, **e) for e in replacements)
                 result['replaced_events'] = deepcopy(self.replaced_events)
                 self.context[u] = dict(pending=deepcopy(prior.get('pending'))) if prior else None
-                self.seen[u] = projected
+                # Keep the comparison snapshot independent of session/result
+                # ownership, including future ingest implementation changes.
+                self.seen[u] = deepcopy(projected)
                 self.latest = result
             return self.latest or dict(status='waiting', unsupported=[])
         except Exception as error:
