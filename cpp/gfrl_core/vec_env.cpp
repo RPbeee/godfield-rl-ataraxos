@@ -310,7 +310,7 @@ std::vector<int> VecEnv::determinize_support(std::span<const std::int32_t> rows)
         if(row<0 || std::size_t(row)>=num_envs)throw std::out_of_range("source row");
         const auto& e=envs_[row];
         out.push_back(e.waiting || !e.selection || substep[row]!=0 ? -1 :
-            int(e.match.determinize_support(e.match.snapshot().state.players[e.selection->actor_seat].id)));
+            int(e.match.determinize_support(e.match.snapshot().state.players[e.selection->actor_seat].id,true)));
     }
     return out;
 }
@@ -377,13 +377,29 @@ void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
         if(root.waiting || !root.selection || src.substep[rows[i]]!=0)continue;
         const auto seat=root.selection->actor_seat;
         const auto id=root.match.snapshot().state.players[seat].id;
-        if(root.match.determinize_support(id)!=gf::DeterminizeSupport::ok)continue;
+        if(root.match.determinize_support(id,true)!=gf::DeterminizeSupport::ok)continue;
         world_status[i]=int(WorldStatus::invalid_assignment);
         try {
             const auto counts=gfrl::unused_assignment(root.match,seat,assignments.subspan(i*297,297));
             std::vector<gf::CardId> models;
             for(const auto& card:gf::catalog())for(int j=0;j<counts[card_code(card.id)];++j)models.push_back(card.id);
-            e.match=root.match.determinized(id,models,seeds[i],true);
+            std::vector<gf::CardId> own;
+            // Independent stream: preserve the established chance seed and all
+            // old roots bit for bit. Read only public face/disguised metadata.
+            auto rng=mix(seeds[i]^0x36d8a971c2ef504bULL);
+            for(const auto& item:root.match.view(id).board.hand) if(item.disguised) {
+                std::vector<gf::CardId> tickets;
+                for(const auto& card:gf::catalog()) if(root.match.gift_supported(card.id)
+                        && gf::match_dream_compatible(card.id,item.face))
+                    for(int n=0;n<card.gift_rate;++n)tickets.push_back(card.id);
+                if(tickets.empty())throw std::invalid_argument("empty own Dream prior");
+                // Exact bounded draw (avoid modulo bias).
+                const auto bound=std::uint64_t(tickets.size()), threshold=-bound%bound;
+                do {rng=mix(rng);} while(rng<threshold);
+                own.push_back(tickets[rng%bound]);
+            }
+            e.match=own.empty()?root.match.determinized(id,models,seeds[i],true):
+                root.match.determinized(id,models,own,seeds[i],true);
         } catch(const std::invalid_argument&) {continue;}
           catch(const gf::MatchError& error) {if(error.code==gf::MatchErrorCode::invalid)continue;throw;}
         e.history[seat]=root.history[seat];e.history[1-seat]=root.history[seat].projected();

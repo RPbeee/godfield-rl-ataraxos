@@ -1,0 +1,836 @@
+{
+  "False:main": {
+    "support": [
+      0
+    ],
+    "choices": [
+      6
+    ],
+    "search": [
+      {
+        "row": 0,
+        "candidates": [
+          {
+            "path": [
+              6,
+              1
+            ],
+            "log_pi": -1.5175538659095764,
+            "log_rho": -1.791759469228055,
+            "q": -0.13015560309092203,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              6,
+              2
+            ],
+            "log_pi": -2.018763482570648,
+            "log_rho": -1.791759469228055,
+            "q": 0.40201515952746075,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              0,
+              7,
+              1
+            ],
+            "log_pi": -2.6417598128318787,
+            "log_rho": -3.7376696182833684,
+            "q": 0.2530251145362854,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              0,
+              7,
+              2
+            ],
+            "log_pi": -3.2549500465393066,
+            "log_rho": -3.7376696182833684,
+            "q": 0.4016571044921875,
+            "valid_worlds": 3
+          }
+        ],
+        "probabilities": [
+          3.883263673439258e-11,
+          0.7883405937308418,
+          0.00042929722268211426,
+          0.2112301090076436
+        ],
+        "selected": [
+          6,
+          2
+        ]
+      }
+    ],
+    "counts": {
+      "decisions": 1,
+      "searched": 1,
+      "searched_main": 1,
+      "searched_response": 0,
+      "skip_response_disabled": 0,
+      "selected": 1,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 1,
+      "search_batches": 1,
+      "rollout_roots": 1,
+      "rollout_worlds": 12,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 4,
+      "batch_roots": 1,
+      "max_batch_roots": 1,
+      "cache_cpu_actors": 2,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 121856,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 1,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 12,
+      "depth_leaves_searcher": 9,
+      "depth_leaves_opponent": 3,
+      "terminal_leaves": 0
+    }
+  },
+  "False:response": {
+    "support": [
+      3
+    ],
+    "choices": [
+      1
+    ],
+    "search": [],
+    "counts": {
+      "decisions": 1,
+      "searched": 0,
+      "searched_main": 0,
+      "searched_response": 0,
+      "skip_response_disabled": 1,
+      "selected": 0,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 0,
+      "search_batches": 0,
+      "rollout_roots": 0,
+      "rollout_worlds": 0,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 0,
+      "batch_roots": 0,
+      "max_batch_roots": 0,
+      "cache_cpu_actors": 0,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 0,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 0,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 0,
+      "depth_leaves_searcher": 0,
+      "depth_leaves_opponent": 0,
+      "terminal_leaves": 0,
+      "skip_not_main": 1
+    }
+  },
+  "False:percentage": {
+    "support": [
+      3
+    ],
+    "choices": [
+      1
+    ],
+    "search": [],
+    "counts": {
+      "decisions": 1,
+      "searched": 0,
+      "searched_main": 0,
+      "searched_response": 0,
+      "skip_response_disabled": 1,
+      "selected": 0,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 0,
+      "search_batches": 0,
+      "rollout_roots": 0,
+      "rollout_worlds": 0,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 0,
+      "batch_roots": 0,
+      "max_batch_roots": 0,
+      "cache_cpu_actors": 0,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 0,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 0,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 0,
+      "depth_leaves_searcher": 0,
+      "depth_leaves_opponent": 0,
+      "terminal_leaves": 0,
+      "skip_not_main": 1
+    }
+  },
+  "False:fog": {
+    "support": [
+      3
+    ],
+    "choices": [
+      1
+    ],
+    "search": [],
+    "counts": {
+      "decisions": 1,
+      "searched": 0,
+      "searched_main": 0,
+      "searched_response": 0,
+      "skip_response_disabled": 1,
+      "selected": 0,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 0,
+      "search_batches": 0,
+      "rollout_roots": 0,
+      "rollout_worlds": 0,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 0,
+      "batch_roots": 0,
+      "max_batch_roots": 0,
+      "cache_cpu_actors": 0,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 0,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 0,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 0,
+      "depth_leaves_searcher": 0,
+      "depth_leaves_opponent": 0,
+      "terminal_leaves": 0,
+      "skip_not_main": 1
+    }
+  },
+  "False:gamble": {
+    "support": [
+      3
+    ],
+    "choices": [
+      2
+    ],
+    "search": [],
+    "counts": {
+      "decisions": 1,
+      "searched": 0,
+      "searched_main": 0,
+      "searched_response": 0,
+      "skip_response_disabled": 1,
+      "selected": 0,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 0,
+      "search_batches": 0,
+      "rollout_roots": 0,
+      "rollout_worlds": 0,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 0,
+      "batch_roots": 0,
+      "max_batch_roots": 0,
+      "cache_cpu_actors": 0,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 0,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 0,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 0,
+      "depth_leaves_searcher": 0,
+      "depth_leaves_opponent": 0,
+      "terminal_leaves": 0,
+      "skip_not_main": 1
+    }
+  },
+  "False:fog_gamble": {
+    "support": [
+      3
+    ],
+    "choices": [
+      2
+    ],
+    "search": [],
+    "counts": {
+      "decisions": 1,
+      "searched": 0,
+      "searched_main": 0,
+      "searched_response": 0,
+      "skip_response_disabled": 1,
+      "selected": 0,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 0,
+      "search_batches": 0,
+      "rollout_roots": 0,
+      "rollout_worlds": 0,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 0,
+      "batch_roots": 0,
+      "max_batch_roots": 0,
+      "cache_cpu_actors": 0,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 0,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 0,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 0,
+      "depth_leaves_searcher": 0,
+      "depth_leaves_opponent": 0,
+      "terminal_leaves": 0,
+      "skip_not_main": 1
+    }
+  },
+  "True:main": {
+    "support": [
+      0
+    ],
+    "choices": [
+      6
+    ],
+    "search": [
+      {
+        "row": 0,
+        "candidates": [
+          {
+            "path": [
+              6,
+              1
+            ],
+            "log_pi": -1.5175538659095764,
+            "log_rho": -1.791759469228055,
+            "q": -0.13015560309092203,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              6,
+              2
+            ],
+            "log_pi": -2.018763482570648,
+            "log_rho": -1.791759469228055,
+            "q": 0.40201515952746075,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              0,
+              7,
+              1
+            ],
+            "log_pi": -2.6417598128318787,
+            "log_rho": -3.7376696182833684,
+            "q": 0.2530251145362854,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              0,
+              7,
+              2
+            ],
+            "log_pi": -3.2549500465393066,
+            "log_rho": -3.7376696182833684,
+            "q": 0.4016571044921875,
+            "valid_worlds": 3
+          }
+        ],
+        "probabilities": [
+          3.883263673439258e-11,
+          0.7883405937308418,
+          0.00042929722268211426,
+          0.2112301090076436
+        ],
+        "selected": [
+          6,
+          2
+        ]
+      }
+    ],
+    "counts": {
+      "decisions": 1,
+      "searched": 1,
+      "searched_main": 1,
+      "searched_response": 0,
+      "skip_response_disabled": 0,
+      "selected": 1,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 1,
+      "search_batches": 1,
+      "rollout_roots": 1,
+      "rollout_worlds": 12,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 4,
+      "batch_roots": 1,
+      "max_batch_roots": 1,
+      "cache_cpu_actors": 2,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 121856,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 1,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 12,
+      "depth_leaves_searcher": 9,
+      "depth_leaves_opponent": 3,
+      "terminal_leaves": 0
+    }
+  },
+  "True:response": {
+    "support": [
+      0
+    ],
+    "choices": [
+      18
+    ],
+    "search": [
+      {
+        "row": 0,
+        "candidates": [
+          {
+            "path": [
+              18
+            ],
+            "log_pi": -0.47573909163475037,
+            "log_rho": -1.0986122886681098,
+            "q": 0.14241461952527365,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              1
+            ],
+            "log_pi": -1.6021121740341187,
+            "log_rho": -1.0986122886681098,
+            "q": 0.1407414972782135,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              2
+            ],
+            "log_pi": -1.7310189008712769,
+            "log_rho": -1.0986122886681098,
+            "q": -0.12899998823801676,
+            "valid_worlds": 3
+          }
+        ],
+        "probabilities": [
+          0.7502642897629626,
+          0.24973465897674674,
+          1.0512602906716446e-06
+        ],
+        "selected": [
+          18
+        ]
+      }
+    ],
+    "counts": {
+      "decisions": 1,
+      "searched": 1,
+      "searched_main": 0,
+      "searched_response": 1,
+      "skip_response_disabled": 0,
+      "selected": 1,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 1,
+      "search_batches": 1,
+      "rollout_roots": 1,
+      "rollout_worlds": 9,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 3,
+      "batch_roots": 1,
+      "max_batch_roots": 1,
+      "cache_cpu_actors": 2,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 121856,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 1,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 9,
+      "depth_leaves_searcher": 5,
+      "depth_leaves_opponent": 4,
+      "terminal_leaves": 0
+    }
+  },
+  "True:percentage": {
+    "support": [
+      0
+    ],
+    "choices": [
+      2
+    ],
+    "search": [
+      {
+        "row": 0,
+        "candidates": [
+          {
+            "path": [
+              18
+            ],
+            "log_pi": -0.48853224515914917,
+            "log_rho": -1.0986122886681098,
+            "q": 0.14394324024518332,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              1
+            ],
+            "log_pi": -1.5841271877288818,
+            "log_rho": -1.0986122886681098,
+            "q": -0.12985334793726602,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              2
+            ],
+            "log_pi": -1.7073426246643066,
+            "log_rho": -1.0986122886681098,
+            "q": 0.41078556577364606,
+            "valid_worlds": 3
+          }
+        ],
+        "probabilities": [
+          1.6351293829197535e-05,
+          2.377234000815987e-11,
+          0.9999836486823983
+        ],
+        "selected": [
+          2
+        ]
+      }
+    ],
+    "counts": {
+      "decisions": 1,
+      "searched": 1,
+      "searched_main": 0,
+      "searched_response": 1,
+      "skip_response_disabled": 0,
+      "selected": 1,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 1,
+      "search_batches": 1,
+      "rollout_roots": 1,
+      "rollout_worlds": 9,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 3,
+      "batch_roots": 1,
+      "max_batch_roots": 1,
+      "cache_cpu_actors": 2,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 121856,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 0,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 9,
+      "depth_leaves_searcher": 6,
+      "depth_leaves_opponent": 3,
+      "terminal_leaves": 0
+    }
+  },
+  "True:fog": {
+    "support": [
+      0
+    ],
+    "choices": [
+      18
+    ],
+    "search": [
+      {
+        "row": 0,
+        "candidates": [
+          {
+            "path": [
+              18
+            ],
+            "log_pi": -0.4758537709712982,
+            "log_rho": -1.0986122886681098,
+            "q": 0.14188995957374573,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              1
+            ],
+            "log_pi": -1.6017898321151733,
+            "log_rho": -1.0986122886681098,
+            "q": -0.1284856696923574,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              2
+            ],
+            "log_pi": -1.7309834957122803,
+            "log_rho": -1.0986122886681098,
+            "q": -0.1284781495730082,
+            "valid_worlds": 3
+          }
+        ],
+        "probabilities": [
+          0.9999968781216855,
+          1.6522332678013882e-06,
+          1.4696450468693953e-06
+        ],
+        "selected": [
+          18
+        ]
+      }
+    ],
+    "counts": {
+      "decisions": 1,
+      "searched": 1,
+      "searched_main": 0,
+      "searched_response": 1,
+      "skip_response_disabled": 0,
+      "selected": 1,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 1,
+      "search_batches": 1,
+      "rollout_roots": 1,
+      "rollout_worlds": 9,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 3,
+      "batch_roots": 1,
+      "max_batch_roots": 1,
+      "cache_cpu_actors": 2,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 121856,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 1,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 9,
+      "depth_leaves_searcher": 4,
+      "depth_leaves_opponent": 5,
+      "terminal_leaves": 0
+    }
+  },
+  "True:gamble": {
+    "support": [
+      0
+    ],
+    "choices": [
+      18
+    ],
+    "search": [
+      {
+        "row": 0,
+        "candidates": [
+          {
+            "path": [
+              18
+            ],
+            "log_pi": -0.25676703453063965,
+            "log_rho": -0.6931471805599453,
+            "q": 0.411591370900472,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              2
+            ],
+            "log_pi": -1.4852240085601807,
+            "log_rho": -0.6931471805599453,
+            "q": 0.1390125254789988,
+            "valid_worlds": 3
+          }
+        ],
+        "probabilities": [
+          0.9999986382336964,
+          1.3617663035921958e-06
+        ],
+        "selected": [
+          18
+        ]
+      }
+    ],
+    "counts": {
+      "decisions": 1,
+      "searched": 1,
+      "searched_main": 0,
+      "searched_response": 1,
+      "skip_response_disabled": 0,
+      "selected": 1,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 1,
+      "search_batches": 1,
+      "rollout_roots": 1,
+      "rollout_worlds": 6,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 2,
+      "batch_roots": 1,
+      "max_batch_roots": 1,
+      "cache_cpu_actors": 2,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 121856,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 1,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 6,
+      "depth_leaves_searcher": 5,
+      "depth_leaves_opponent": 1,
+      "terminal_leaves": 0
+    }
+  },
+  "True:fog_gamble": {
+    "support": [
+      0
+    ],
+    "choices": [
+      18
+    ],
+    "search": [
+      {
+        "row": 0,
+        "candidates": [
+          {
+            "path": [
+              18
+            ],
+            "log_pi": -0.2568548917770386,
+            "log_rho": -0.6931471805599453,
+            "q": 0.4125480353832245,
+            "valid_worlds": 3
+          },
+          {
+            "path": [
+              2
+            ],
+            "log_pi": -1.4849239587783813,
+            "log_rho": -0.6931471805599453,
+            "q": 0.14013851682345072,
+            "valid_worlds": 3
+          }
+        ],
+        "probabilities": [
+          0.9999986272281871,
+          1.3727718129537926e-06
+        ],
+        "selected": [
+          18
+        ]
+      }
+    ],
+    "counts": {
+      "decisions": 1,
+      "searched": 1,
+      "searched_main": 0,
+      "searched_response": 1,
+      "skip_response_disabled": 0,
+      "selected": 1,
+      "invalid_samples": 0,
+      "resamples": 0,
+      "search_calls": 1,
+      "search_batches": 1,
+      "rollout_roots": 1,
+      "rollout_worlds": 6,
+      "singleton_roots": 0,
+      "singleton_validated_worlds": 0,
+      "forced_inference_rows_skipped": 0,
+      "candidate_paths": 2,
+      "batch_roots": 1,
+      "max_batch_roots": 1,
+      "cache_cpu_actors": 2,
+      "cache_cuda_actors": 0,
+      "cache_mps_actors": 0,
+      "cache_peak_bytes": 121856,
+      "exhausted_worlds": 0,
+      "invalid_loads": 0,
+      "invalid_candidate_worlds": 0,
+      "invalid_oracle_assignments": 0,
+      "real_mismatches": 0,
+      "policy_disagreements": 1,
+      "fallback_no_candidates": 0,
+      "depth_leaves": 6,
+      "depth_leaves_searcher": 5,
+      "depth_leaves_opponent": 1,
+      "terminal_leaves": 0
+    }
+  }
+}

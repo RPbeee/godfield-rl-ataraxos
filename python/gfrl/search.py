@@ -106,7 +106,10 @@ def response_roots(env, rows):
 
 
 def search_support(env, rows, search_response=False):
-    """Preserve the original main-only reason precedence when disabled."""
+    """Engine support includes public chance-conditioned response launches.
+
+    Preserve the original main-only reason precedence when disabled.
+    """
     support = env.determinize_support(rows).copy()
     if not search_response:
         support[response_roots(env, rows) & (support != -1)] = 3  # historically not_main

@@ -764,3 +764,109 @@ def test_response_paired_games_complete(belief_kind):
     assert agent.counts['real_mismatches'] == agent.counts['invalid_loads'] == 0
     assert agent.counts['invalid_oracle_assignments'] == 0
     assert agent.statistics()['seconds_per_search_by_root']['response'] > 0
+
+
+@pytest.mark.parametrize('kind', ['chance', 'fog', 'gamble', 'fog_gamble'])
+def test_public_chance_response_search_and_hidden_source_independence(kind):
+    from gfrl.search import search_support
+    if kind == 'chance':
+        card = next(cid for cid, c in _core.play_catalog().items()
+                    if c['hit_rate'] and c['category'] == 'weapons')
+    else:
+        card = 202 if 'gamble' in kind else 6
+    envs = [VecEnv(1, 1, track_projection=True) for _ in range(2)]
+    for env in envs:
+        _core._test_response_root(env, card, 'fog' in kind, 42)
+    root = np.array([0], np.int32)
+    _core._test_replace_hidden_hand(envs[1], 0, 1234)
+    assert search_support(envs[0], root, True).tolist() == [0]
+    assert search_support(envs[0], root, False).tolist() == [3]
+    for key in OBS_FIELDS:
+        np.testing.assert_array_equal(getattr(envs[0], key), getattr(envs[1], key))
+    agents = [SearchAgent(model(), baseline(), config=SearchConfig(search_response=True,
+              worlds=3, candidates=4, candidate_samples=16, depth=2), seed=421) for _ in range(2)]
+    choices = []
+    for agent, env in zip(agents, envs):
+        with _policy_rng(42, (agent,)):
+            choices.append(agent(env, root))
+        assert agent.counts['searched_response'] == 1
+        assert agent.counts['invalid_loads'] == 0
+    np.testing.assert_array_equal(*choices)
+    assert agents[0].last_search == agents[1].last_search
+    assert agents[0].counts == agents[1].counts
+    _core._test_response_root(envs[0], card, 'fog' in kind, 42)
+    disabled = SearchAgent(model(), baseline(), seed=421)
+    rng = disabled.rng.bit_generator.state
+    assert disabled.search(envs[0], root) == {}
+    assert disabled.rng.bit_generator.state == rng
+    with _policy_rng(42, (disabled,)):
+        choices = disabled(envs[0], root)
+    assert envs[0].mask[root, choices[root]].all()
+    assert disabled.rng.bit_generator.state == rng
+    assert disabled.counts['skip_not_main'] == disabled.counts['skip_response_disabled'] == 1
+
+
+@pytest.mark.parametrize('response', [False, True])
+@pytest.mark.parametrize('enabled', [False, True])
+def test_own_dream_search_hidden_actual_independence(response, enabled):
+    from gfrl import SearchEnv
+    from gfrl.search import search_support
+    envs = [VecEnv(1, 1, track_projection=True) for _ in range(3)]
+    # Include identity disguise: eligibility and sampling cannot branch on truth.
+    for env, actual in zip(envs, (6, 8, 7)):
+        _core._test_dream_root(env, response, actual)
+    root = np.array([0], np.int32)
+    for env in envs:
+        assert search_support(env, root, enabled).tolist() == ([3] if response and not enabled else [0])
+        for key in (*OBS_FIELDS, 'mask'):
+            np.testing.assert_array_equal(getattr(env, key), getattr(envs[0], key))
+    # Same seeds give the same complete root observations in either seat and
+    # same future transitions, after replacing every hidden own actual.
+    worlds = [SearchEnv(1, 1, max_decisions=4) for _ in envs]
+    assignments = np.zeros((1, 297), np.int32)
+    assignments[0, 7] = 1
+    for seed in range(32):
+        for world, env in zip(worlds, envs):
+            assert world.load_worlds(env, root, assignments, np.array([seed], np.uint64)).tolist() == [0]
+            for key in (*OBS_FIELDS, 'mask'):
+                np.testing.assert_array_equal(getattr(world, key), getattr(env, key))
+        for seat in (0, 1):
+            leaves = [{k: v.copy() for k, v in w.observe(root, seat).items()} for w in worlds]
+            for leaf in leaves[1:]:
+                for key in OBS_FIELDS:
+                    np.testing.assert_array_equal(leaf[key], leaves[0][key])
+    agents = [SearchAgent(model(), baseline(), config=SearchConfig(search_response=enabled,
+              worlds=4, candidates=4, candidate_samples=16, depth=3), seed=421) for _ in envs]
+    choices = []
+    for agent, env in zip(agents, envs):
+        with _policy_rng(42, (agent,)):
+            choices.append(agent(env, root))
+        assert agent.counts['invalid_loads'] == agent.counts['real_mismatches'] == 0
+        assert agent.counts['searched_response' if response else 'searched_main'] == (0 if response and not enabled else 1)
+    for i in (1, 2):
+        np.testing.assert_array_equal(choices[i], choices[0])
+        assert agents[i].last_search == agents[0].last_search
+        assert agents[i].counts == agents[0].counts
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+@pytest.mark.parametrize('kind', ['main', 'response', 'percentage', 'fog', 'gamble', 'fog_gamble'])
+def test_pre_dream_supported_roots_exact_fixture(enabled, kind):
+    from gfrl.search import search_support
+    env = VecEnv(1, 1, 741, track_projection=True)
+    if kind != 'main':
+        percentage = next(cid for cid, c in _core.play_catalog().items()
+                          if c['hit_rate'] and c['category'] == 'weapons')
+        card = percentage if kind == 'percentage' else 202 if 'gamble' in kind else 6
+        _core._test_response_root(env, card, 'fog' in kind, 42)
+    roots = np.array([0], np.int32)
+    support = search_support(env, roots, enabled).tolist()
+    agent = SearchAgent(model(), load_search_belief('uniform'), seed=421,
+                        config=SearchConfig(search_response=enabled, worlds=3,
+                                            candidates=4, candidate_samples=16, depth=2))
+    with _policy_rng(42, (agent,)):
+        choices = agent(env, roots)
+    actual = dict(support=support, choices=choices.tolist(),
+                  search=agent.last_search, counts=dict(agent.counts))
+    expected = json.loads((Path(__file__).parent/'fixtures/search_supported_before.json').read_text())
+    assert actual == expected[f'{enabled}:{kind}']

@@ -13,6 +13,65 @@ using namespace gfrl;
 // calls this; replacement is restricted to supported decision boundaries.
 namespace gfrl {
 struct TestAccess {
+    // Read-only measurement helpers: copies never enter live play or training.
+    static std::array<bool,4> danger_probe(const VecEnv& env, std::size_t row) {
+        const auto& e=env.envs_.at(row);
+        if(!e.selection || env.substep[row]!=0)throw std::invalid_argument("not a root");
+        const auto seat=e.selection->actor_seat;
+        const auto original=e.match.snapshot();
+        const auto& own=original.state.players[seat];
+        bool danger=false,wide=false;
+        for(const auto& item:own.items)if(!item.used) {
+            danger|=item.fake_model.value_or(item.model)==94;
+            wide|=item.fake_model.value_or(item.model)==232;
+        }
+        std::array<bool,4> out{danger&&wide,false,false,false};
+        for(const auto& item:original.state.players[1-seat].items)out[3]|=item.model==209;
+        if(!out[0] || original.phase!=gf::MatchPhase::main)return out;
+        auto absent=original;
+        auto& hidden=absent.state.players[1-seat].items;
+        for(auto& item:hidden)if(item.model==209) {
+            if(item.used)return out; // Public used cards cannot be counterfactually changed.
+            item.model=item.fake_model.value_or(19);
+            if(item.model==209)return out;
+        }
+        auto present=absent;
+        bool inserted=false;
+        for(auto& item:present.state.players[1-seat].items)
+            if(!item.used && (!item.fake_model || gf::match_dream_compatible(209,*item.fake_model))) {
+                item.model=209;inserted=true;break;
+            }
+        if(!inserted)return out; // Keep hand count and every public face fixed.
+        auto a=e.match,b=e.match;
+        a.restore(absent);b.restore(present);
+        if(a.view(own.id)!=e.match.view(own.id) || b.view(own.id)!=e.match.view(own.id))
+            throw std::runtime_error("danger probe changed viewer observation");
+        out[1]=true;
+        const auto kind=gf::CommandKind::play;
+        const auto an=a.legal_extensions(kind,{}, {env.canonical_});
+        const auto bn=b.legal_extensions(kind,{}, {env.canonical_});
+        out[2]=an!=bn;
+        // The known exception is exact 94+232. Root and every shared one-card
+        // prefix locate its mask difference without factorial discard traversal.
+        for(auto token:an.next)if(std::find(bn.next.begin(),bn.next.end(),token)!=bn.next.end()) {
+            const std::array<gf::ItemToken,1> prefix{token};
+            out[2]|=a.legal_extensions(kind,prefix,{env.canonical_})!=b.legal_extensions(kind,prefix,{env.canonical_});
+        }
+        return out;
+    }
+    static bool danger_selected(const VecEnv& env, std::size_t row, int choice) {
+        const auto& e=env.envs_.at(row);
+        auto cursor=*e.selection;
+        cursor.choose(e.match,choice,env.canonical_);
+        while(!cursor.complete && std::count(cursor.mask.begin(),cursor.mask.end(),true)==1)
+            cursor.choose(e.match,std::find(cursor.mask.begin(),cursor.mask.end(),true)-cursor.mask.begin(),env.canonical_);
+        if(!cursor.complete || cursor.command.kind!=gf::CommandKind::play || cursor.count!=2)return false;
+        std::array<gf::CardId,2> models{};
+        const auto& hand=e.match.snapshot().state.players[cursor.actor_seat].items;
+        for(int i=0;i<2;++i)models[i]=hand[cursor.cards[i]].fake_model.value_or(hand[cursor.cards[i]].model);
+        std::sort(models.begin(),models.end());
+        return models==std::array<gf::CardId,2>{94,232};
+    }
     static void danger_root(VecEnv& env, bool opponent_209) {
         auto& e=env.envs_.at(0);
         auto state=e.match.snapshot().state;
@@ -22,6 +81,39 @@ struct TestAccess {
         e.match.load_scene(state,state.players[0].id,19);
         for(auto& h:e.history)h=History(env.history_len);
         e.selection.reset();e.encoded=false;e.waiting=false;env.drive(0);
+    }
+    static void response_root(VecEnv& env, gf::CardId model, bool fog, std::uint64_t seed) {
+        auto& e=env.envs_.at(0);
+        auto state=e.match.snapshot().state;
+        for(auto& p:state.players) {p.items.clear();p.curses.clear();p.guardian=gf::Guardian::none;}
+        state.players[0].items={{100,model,{},false},{101,19,{},false}};
+        state.players[1].items={{200,8,{},false},{201,120,{},false},{202,190,{},false}};
+        if(fog)state.players[0].curses={gf::Curse::fog};
+        const gf::Command launch{state.players[0].id,gf::CommandKind::play,{100},
+            gf::find_card(model)->hit_rate?std::nullopt:std::optional<gf::PlayerId>{state.players[1].id}};
+        for(;;++seed) {
+            e.match.load_scene(state,state.players[0].id,seed);auto trial=e.match;trial.step(launch);
+            if(trial.snapshot().phase==gf::MatchPhase::response)break;
+        }
+        for(auto& h:e.history)h=History(env.history_len);
+        e.selection.reset();e.encoded=false;e.waiting=false;env.drive(0);
+        env.before_decision(0);e.match.step(launch);env.record_decision(0,false);
+        e.selection.reset();e.encoded=false;env.drive(0);
+    }
+    static void dream_root(VecEnv& env, bool response, gf::CardId actual) {
+        auto& e=env.envs_.at(0);auto state=e.match.snapshot().state;
+        for(auto& p:state.players){p.items.clear();p.curses.clear();p.guardian=gf::Guardian::none;}
+        const auto seat=response?1:0;
+        state.players[seat].curses={gf::Curse::dream};
+        state.players[seat].items={{200,actual,7,false},{201,190,{},false},{202,120,{},false}};
+        state.players[1-seat].items={{100,6,{},false},{101,7,{},false}};
+        e.match.load_scene(state,state.players[0].id,19);
+        for(auto& h:e.history)h=History(env.history_len);
+        e.selection.reset();e.encoded=false;e.waiting=false;env.drive(0);
+        if(response) {
+            env.before_decision(0);e.match.step({state.players[0].id,gf::CommandKind::play,{100},state.players[1].id});
+            env.record_decision(0,false);e.selection.reset();e.encoded=false;env.drive(0);
+        }
     }
     static void replace_hidden_hand(VecEnv& env, std::size_t row, std::uint64_t seed,
                                     std::optional<std::uint64_t> decisions) {
@@ -108,6 +200,8 @@ nb::dict schema(std::size_t k) {
 #include "official_bindings.hpp"
 
 NB_MODULE(_core, m) {
+    m.def("_measure_danger_probe", &TestAccess::danger_probe);
+    m.def("_measure_danger_selected", &TestAccess::danger_selected);
     m.def("_official_search_root",&OfficialAccess::root);
     m.def("_official_observation",&official_observation);
     m.def("_official_magic_cost",[](const std::vector<gf::CardId>& models){return gf::magic_cost(models);});
@@ -128,6 +222,8 @@ NB_MODULE(_core, m) {
         .def("choose",&OfficialCursor::choose).def("command",&OfficialCursor::command);
 
     m.def("_test_danger_root", &TestAccess::danger_root);
+    m.def("_test_dream_root", &TestAccess::dream_root);
+    m.def("_test_response_root", &TestAccess::response_root);
     m.def("_test_replace_hidden_hand", &TestAccess::replace_hidden_hand,
           "env"_a, "row"_a, "seed"_a, "decisions"_a=nb::none());
     nb::class_<gf::MatchConfig>(m, "MatchConfig")
