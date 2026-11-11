@@ -182,13 +182,101 @@ namespace gfrl {
 struct OfficialAccess {
     static std::unique_ptr<VecEnv> root(nb::dict public_view,nb::list events,std::size_t k) {
         auto v=official_view(public_view);
-        if(v.phase!=gf::MatchPhase::main || !v.board.viewer || v.actor!=v.board.viewer)
-            throw std::invalid_argument("search_requires_main_root");
+        if(!v.board.viewer || v.actor!=v.board.viewer)
+            throw std::invalid_argument("search_requires_viewer_root");
         gf::PublicSelection selection(v);auto state=selection.snapshot().state;
         auto out=std::make_unique<VecEnv>(1,1,0,true,gf::MatchConfig{},k,
             std::array<Controller,2>{Controller::external,Controller::external},std::nullopt,Controller::external,0,true);
-        auto& e=out->envs_[0];e.match.load_scene(std::move(state),v.owner,0);
-        auto snap=e.match.snapshot();snap.decisions=v.decisions;e.match.restore(snap);
+        auto& e=out->envs_[0];
+        if(v.phase==gf::MatchPhase::main) {
+            e.match.load_scene(std::move(state),v.owner,0);
+        } else {
+            if(v.phase!=gf::MatchPhase::response || !public_view.contains("_search_launch"))
+                throw std::invalid_argument("search_requires_public_launch_journal");
+            const auto proof=nb::cast<nb::dict>(public_view["_search_launch"]);
+            const auto before=official_view(nb::cast<nb::dict>(proof["before"]));
+            const auto models=nb::cast<std::vector<gf::CardId>>(proof["models"]);
+            if(before.phase!=gf::MatchPhase::main || before.owner!=v.owner || before.owner==*v.board.viewer
+                    || before.actor!=before.owner || models.empty() || !v.pending
+                    || v.pending->models!=models || v.pending->counter || v.pending->death
+                    || v.pending->bounces || v.pending->guardian!=gf::Guardian::none)
+                throw std::invalid_argument("unsupported_public_launch");
+            state.gf=before.board.gf;
+            const auto responses=field<nb::list>(proof,"responses",nb::list());
+            gf::ItemToken next=100;
+            gf::Command attack;attack.actor=v.owner;attack.kind=gf::CommandKind::play;
+            attack.target=nb::cast<gf::PlayerId>(proof["target"]);
+            // Percentage commands select their sole enemy internally. The wire
+            // publishes that resolved recipient, not a manual command target.
+            if(gf::find_card(models.front())->hit_rate)attack.target.reset();
+            for(auto& player:state.players) {
+                const auto old=std::find_if(before.board.players.begin(),before.board.players.end(),[&](const auto& p){return p.id==player.id;});
+                if(old==before.board.players.end() || !old->status || old->fogged || old->status->confused)
+                    throw std::invalid_argument("hidden_launch_status");
+                const auto& pane=*old->status;
+                player.hp=pane.hp;player.mp=pane.mp;player.cp=pane.cp;player.curses=pane.curses;
+                player.guardian=pane.guardian;player.dead=old->dead;
+                if(player.id==*v.board.viewer) {
+                    player.items.clear();
+                    for(const auto& h:before.board.hand)
+                        player.items.push_back({h.token,h.face,h.disguised?std::optional<gf::CardId>{h.face}:std::nullopt,h.used});
+                } else if(player.id==v.owner) {
+                    player.items.clear();
+                    for(auto model:old->used_models)player.items.push_back({next++,model,{},true});
+                    for(auto model:models) {
+                        // Reusable public miracles may already be used at launch.
+                        auto used=std::find_if(player.items.begin(),player.items.end(),[&](const auto& h){
+                            return h.model==model && std::find(attack.items.begin(),attack.items.end(),h.token)==attack.items.end();});
+                        if(used!=player.items.end())attack.items.push_back(used->token);
+                        else {attack.items.push_back(next);player.items.push_back({next++,model,{},false});}
+                    }
+                }
+            }
+            // Opponent response cards are now public too. Add only those
+            // selected copies to the launch inventory, never unused wire truth.
+            auto& opponent=*std::find_if(state.players.begin(),state.players.end(),[&](const auto& p){return p.id==v.owner;});
+            for(auto obj:responses) {
+                const auto response=nb::cast<nb::dict>(obj);
+                if(nb::cast<gf::PlayerId>(response["actor"])==v.owner)
+                    for(auto model:nb::cast<std::vector<gf::CardId>>(response["models"]))
+                        opponent.items.push_back({next++,model,{},false});
+            }
+            bool found=false;
+            // Pending existence proves a percentage hit. HP gamble also exposes
+            // its sign. Select a fresh synthetic stream on these public facts;
+            // never transplant an unvalidated batch or the server's private RNG.
+            for(std::uint64_t seed=0;seed<256 && !found;++seed) {
+                e.match.load_scene(state,v.owner,seed);
+                auto initial=e.match.snapshot();initial.decisions=before.decisions;e.match.restore(initial);
+                e.match.step(attack);
+                if(e.match.snapshot().phase!=gf::MatchPhase::response)continue;
+                for(auto obj:responses) {
+                    const auto response=nb::cast<nb::dict>(obj);
+                    gf::Command command;command.actor=nb::cast<gf::PlayerId>(response["actor"]);
+                    command.kind=gf::CommandKind::defend;
+                    const auto& current=e.match.snapshot().state.players;
+                    const auto player=std::find_if(current.begin(),current.end(),[&](const auto& p){return p.id==command.actor;});
+                    if(player==current.end())throw std::invalid_argument("unknown_public_responder");
+                    for(auto model:nb::cast<std::vector<gf::CardId>>(response["models"])) {
+                        const auto item=std::find_if(player->items.begin(),player->items.end(),[&](const auto& h){
+                            return h.fake_model.value_or(h.model)==model
+                                && std::find(command.items.begin(),command.items.end(),h.token)==command.items.end();});
+                        if(item==player->items.end())throw std::invalid_argument("missing_public_response_card");
+                        command.items.push_back(item->token);
+                    }
+                    e.match.step(command);
+                }
+                auto replay=e.match.view(*v.board.viewer);
+                found=replay.phase==gf::MatchPhase::response && replay.actor==v.actor && replay.pending
+                    && replay.pending->models==v.pending->models && replay.pending->target==v.pending->target
+                    && replay.pending->power==v.pending->power && replay.pending->amount==v.pending->amount;
+            }
+            if(!found)throw std::invalid_argument("public_launch_replay_mismatch");
+        }
+        auto snap=e.match.snapshot();snap.decisions=v.decisions;
+        // The response journal's counter must agree with its launch anchor.
+        if(v.phase==gf::MatchPhase::main)e.match.restore(snap);
+        else if(e.match.snapshot().decisions!=v.decisions)throw std::invalid_argument("public_launch_decision_mismatch");
         for(int seat=0;seat<2;++seat) {
             e.history[seat]=History(k);
             if(snap.state.players[seat].id==*v.board.viewer)e.history[seat]=official_history(events,k);

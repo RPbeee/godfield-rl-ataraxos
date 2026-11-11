@@ -1838,3 +1838,41 @@ def test_selected_response_never_uses_allow_button(tmp_path, settle_clock):
     assert point(690,423) not in probe.commands
     row = json.loads((directory/'moves.jsonl').read_text().splitlines()[-1])
     assert row['state']['update'] == 4 and row['confirmation_retries'] == 1
+
+
+def test_search_duration_does_not_consume_click_or_acceptance_timeout(tmp_path, settle_clock):
+    probe = FakeProbe(tmp_path)
+    directory = private_directory(tmp_path/'log'); journal = Journal(directory)
+    def slow_advisor(result):
+        settle_clock.now += 6  # Longer than both waits below, without wall-clock sleep.
+        advice = advisor(result)
+        advice.update(search_status='main_public_worlds', search_worlds=8,
+            search_candidates=2, search_seconds=6., pi_search_top=[dict(path=[0], probability=1.)],
+            pi_theta_top=[dict(path=[0], probability=.8)])
+        return advice
+    report = run(probe, slow_advisor, journal, name='SyntheticName', timeout=1, settle_timeout=1)
+    journal.close()
+    assert report['status'] == 'complete'
+    rows = [json.loads(line) for line in (directory/'moves.jsonl').read_text().splitlines()]
+    moves = [r for r in rows if 'advice' in r]
+    assert moves and all(r['accepted'] for r in moves)
+    for row in rows:
+        assert all(k in row for k in ('search_status', 'search_worlds', 'search_candidates',
+            'search_seconds', 'pi_search_top', 'pi_theta_top'))
+    assert all(r['search_worlds'] == 8 and r['search_seconds'] == 6 for r in moves)
+
+
+def test_receive_advancing_during_search_supersedes_without_click(tmp_path, settle_clock):
+    probe = LagProbe(tmp_path, advance=True)
+    directory = private_directory(tmp_path/'log'); journal = Journal(directory)
+    def slow_advisor(result):
+        settle_clock.now += 6
+        return advisor(result)
+    report = run(probe, slow_advisor, journal, name='SyntheticName', timeout=1,
+                 settle_timeout=1, dry_run=True)
+    journal.close()
+    rows = [json.loads(line) for line in (directory/'moves.jsonl').read_text().splitlines()]
+    assert report['status'] == 'dry_run'
+    assert rows[0]['status'] == 'superseded' and rows[0]['clicks'] == []
+    assert rows[1]['state']['update'] == 2
+    assert not any(c['kind'] == 'clickPoint' for c in probe.commands)

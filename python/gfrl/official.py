@@ -369,6 +369,11 @@ class OfficialSession:
 
     def ingest_public(self, public):
         p = deepcopy(public)
+        # Proofs are session-owned and must be established again from this
+        # update, even if a caller builds a synthetic update from prior output.
+        p.pop('_search_launch', None)
+        p.pop('_search_fallback', None)
+        public_source = deepcopy(p)
         if self.previous and p['update'] <= self.previous['update']:
             if p == self.previous.get('_source'):
                 return dict(status='duplicate', unsupported=[])
@@ -655,8 +660,92 @@ class OfficialSession:
         # Keep only bounded public records. Ring trimming is done in C++ History.
         self.events = self.events[-max(1, self.history_len):]
         self.pending_meta = launch
+        # Executable proof is deliberately narrower than observation/history.
+        # Require a witnessed, contiguous pre-launch main boundary. End-state
+        # resources are never inverted to invent pre-spend panes.
+        prior = self.previous
+        if p['phase'] != 0:
+            p['_search_fallback'] = ('purchase_public_escrow_unavailable' if p['phase'] == 2
+                                     else 'response_public_journal_unavailable')
+            uses = [e for e in p['events'] if e['action'] == 'useAttackItems']
+            allowed = {'useAttackItems', 'setTargetPlayer', 'hit', 'miss'}
+            if p.get('pending') and (p['pending']['counter'] or p['pending']['death']
+                    or p['pending']['guardian'] != 'none'):
+                p['_search_fallback'] = 'response_special_launch'
+            elif p.get('pending') and (p['pending']['reflections'] or p['pending']['bounces']):
+                p['_search_fallback'] = 'response_redirect_journal_unavailable'
+            elif (prior and p['update'] == prior['update'] + 1 and prior['phase'] == 0
+                    and prior['actor'] == prior['owner'] and prior['owner'] != self.viewer
+                    and prior['gf'] == p['gf'] and prior['hand'] == p['hand']
+                    and len(uses) == 1 and uses[0]['faces'] and not uses[0]['reveals']
+                    and all(e['action'] in allowed for e in p['events'])
+                    and p.get('pending') and uses[0]['faces'] == p['pending']['models']):
+                anchor = deepcopy(prior)
+                anchor.pop('_source', None)
+                anchor.pop('_search_launch', None)
+                p['_search_fallback'] = 'response_public_launch_replay_mismatch'
+                p['_search_launch'] = dict(before=anchor, models=uses[0]['faces'],
+                    target=p['pending']['target'])
+        # Retain a witnessed ordinary launch across reflection-only updates.
+        # Any body, bounce, redraw, reveal, counter or missing update breaks the
+        # proof. Actors come from the previous public recipient and each reflect.
+        if (p['phase'] == 1 and prior and '_search_launch' in prior
+                and p['update'] == prior['update'] + 1 and p.get('pending')
+                and not p['pending']['counter'] and not p['pending']['death']
+                and not p['pending']['bounces'] and p['pending']['guardian'] == 'none'
+                and all(e['action'] in {'useDefenseItems', 'reflect'} for e in p['events'])):
+            journal = deepcopy(prior['_search_launch'])
+            responder = prior['pending']['target']
+            responses = journal.setdefault('responses', [])
+            valid = True
+            waiting_reflect = False
+            for event in p['events']:
+                if event['action'] == 'useDefenseItems':
+                    if waiting_reflect or event['reveals'] or not event['faces']:
+                        valid = False
+                    responses.append(dict(actor=responder, models=event['faces']))
+                    waiting_reflect = True
+                elif not waiting_reflect:
+                    valid = False
+                else:
+                    responder = next(x['id'] for x in p['players'] if x['id'] != responder)
+                    waiting_reflect = False
+            if valid and not waiting_reflect and responses:
+                p['_search_launch'] = journal
+                p['_search_fallback'] = 'response_public_launch_replay_mismatch'
+        # A single received update may finish our command, advance GF, then
+        # launch the enemy's command. The public ledger already applied those
+        # effects forward. Use its last pre-launch boundary only when every
+        # preceding effect was understood and no earlier enemy command occurred.
+        if (p['phase'] == 1 and '_search_launch' not in p and prior
+                and p['update'] == prior['update'] + 1 and self.history_complete
+                and self.events and p.get('pending') and not p['pending']['counter']
+                and not p['pending']['death'] and not p['pending']['reflections']
+                and not p['pending']['bounces'] and p['pending']['guardian'] == 'none'):
+            final = self.events[-1]
+            decision = final['decision']
+            markers = [i for i, e in enumerate(p['events']) if e['action'] == 'useAttackItems']
+            if (markers and decision['phase'] == 0 and decision['kind'] == 0
+                    and decision['actor'] == p['owner'] != self.viewer
+                    and decision['faces'] == p['pending']['models']
+                    and not p['events'][markers[-1]]['reveals']
+                    and all(e['action'] in {'setTargetPlayer', 'hit', 'miss'}
+                            for e in p['events'][markers[-1]+1:])
+                    and any(e['decision']['actor'] == self.viewer for e in self.events[:-1]
+                            if e['decision']['decision'] > prior['decisions'])
+                    and all(e['decision']['actor'] != p['owner'] for e in self.events[:-1]
+                            if e['decision']['decision'] > prior['decisions'])):
+                anchor = deepcopy(final['before'])
+                for key in ('_source', '_search_launch', '_search_fallback'):
+                    anchor.pop(key, None)
+                anchor.update(phase=0, owner=p['owner'], actor=p['owner'], gf=decision['gf'],
+                              pending=None, purchase=None, hand=deepcopy(p['hand']),
+                              decisions=decision['decision']-1)
+                p['_search_launch'] = dict(before=anchor, models=decision['faces'],
+                                          target=p['pending']['target'])
+                p['_search_fallback'] = 'response_public_launch_replay_mismatch'
         self.previous = deepcopy(p)
-        self.previous['_source'] = deepcopy(public)
+        self.previous['_source'] = public_source
         fatal = [code for code in p['unsupported']
                  if p['actor'] == self.viewer or code not in DECISION_ONLY_UNSUPPORTED]
         if fatal:

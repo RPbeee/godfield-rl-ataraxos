@@ -22,8 +22,8 @@
 通信しない検証には下記の `--replay` を使う。
 `--name`（既定 GFRLBot）、`--search`、`--timeout`（ログイン・送信の受理待ち、既定20秒）、
 `--settle-timeout`（画面・各クリックの反映待ち、既定30秒）、
-`--on-stop save|abandon` も指定可能。探索は既存 advisor と同じく主手番だけで、
-応答は方策へフォールバックする。複数局は `--games N`。
+`--on-stop save|abandon` も指定可能。`--search-response` で公開 launch/journal を
+再構成できる通常応答も探索する。対応範囲は下記。複数局は `--games N`。
 出力先の `moves.jsonl` は上書きしないので、毎回新しいディレクトリを使う。
 
 受信は全 stream の不変 prefix を解析する。bot は events だけ寛容に取り込み、
@@ -263,3 +263,94 @@ Nodeもブラウザも起動せず、元資料は変更しない。5つの自分
   `OfficialSession.ingest()` は受信 game の公開状態を盤面に投影するため、使用結果の実体が
   偽装の面と異なっても、選択した面から盤面を推測して上書きしない。合成受信と probe で
   実体の違う使用結果・正常受理・受理タイムアウトを検証する。
+
+
+## 学習済み belief と探索
+
+bot/advisor とも `--belief uniform|b1|<checkpoint>`、`--fit`、`--worlds`、`--depth`、
+`--candidates`、`--candidate-samples`、`--alpha`、`--beta`、`--leaf-view actor|searcher`、
+`--search-response`、`--device cpu|mps`、`--threads` を受け付ける。
+`--belief` の既定は uniform。`--search` がなければ belief をロードしない。
+AR は `--belief runs/play/belief-ar-m.pt` と明示する。oracle は拒否する。
+bot のコード既定は従来どおり worlds=16 / depth=10 / candidates=16 / candidate-samples=64、
+alpha=0.002 / beta=0.02 / leaf-view=actor / response無効 / cpu / threads=1。
+advisor の従来予算 depth=3 / candidates=8 も維持した。
+
+対人戦で5秒以内を目安にする推奨予算は **worlds=16 / depth=3 / candidates=16 /
+candidate-samples=64 / threads=1 / CPU**。上の対局コマンドに次を追加する。
+コードの既定予算は変更していない。全局面への5秒の実行期限を設けるものではない。
+
+```sh
+--search --belief runs/play/belief-ar-m.pt --search-response \
+  --worlds 16 --depth 3 --candidates 16 --candidate-samples 64 \
+  --device cpu --threads 1
+```
+
+探索は方策と同じ公開 OBS_FIELDS だけを belief に渡す。
+通常応答は、連続して観測した攻撃前 main と launch、または同一受信内の完全な
+公開イベント ledger から anchor を作り、公開カード・対象・反射 journal を通常 step で再生する。
+確率攻撃は pending の存在による命中条件、202 は公開符号の条件を使う。
+相手の未使用品の真値やサーバーの乱数は使わない。観測・mask・prefix が
+`OfficialDecision` と完全一致する根だけを探索する。
+途中参加・欠番・不完全なイベント・追跡不能な反射/跳ね返し・counter/death/guardian・
+購入などは理由付きで方策へ戻す。詳しい fixture と理由は
+[official_advisor.md](official_advisor.md#探索と未対応) を参照。
+
+`moves.jsonl` の各行は `search_status`、`search_worlds`（候補で有効だった世界数の最大）、
+`search_candidates`、`search_seconds`、`pi_search_top`、`pi_theta_top` を持つ。
+上位3手は公開 cursor の path と、自分の可視カード・対象・配分で表す。
+πθ は探索に残った候補集合内で正規化した方策 prior であり、全合法手の厳密な上位ではない。
+π_search は同じ候補集合の探索分布。相手の手札サンプル・世界の状態・乱数・葉の詳細は保存しない。
+探索なし/探索不能/強制手/停止行では世界数・候補数・秒数は0、分布は空。
+UI の mask 除外や再試行で方策へ切り替えた場合も、既に行った探索の費用・分布を残す。
+`search_seconds` は同期した agent 呼び出しの合計（方策推論を含む）。下表の時間は根の構築・
+上位手の変換・全 substep も含む助言全体なので、ログの値より少し大きい。
+
+## オフラインの1手時間（2026-11-11）
+
+macOS 27.0.1 / arm64、PyTorch 2.15.0、CPU、torch/探索とも threads=1。
+M 方策 `runs/play/m-2166.pt` と AR belief `runs/play/belief-ar-m.pt` を使った。
+候補上限16、候補サンプル64、seed=421、argmax、history_len=64。
+各予算で1回ウォームアップ後、fresh agent/root で3回測定した中央値（秒）。
+モデル読込・受信解析・UI・クリック待ちは除き、根構築から1コマンドの助言完了までを計測する。
+
+- fixture: v73/update1 の記録済み main。
+- wide: 自分の可視手札18枚・HP/MP/CP=70/60/30 の合成 main（候補の多いケース）。
+- response: 同じ手札への55の通常攻撃。連続した公開 main→launch から作る合成応答。
+
+| worlds | depth | fixture CPU (秒) | wide CPU (秒) | response CPU (秒) |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 1 | 0.076 | 0.284 | 0.319 |
+| 8 | 3 | 0.115 | 0.543 | 0.648 |
+| 8 | 5 | 0.157 | 0.830 | 0.948 |
+| 16 | 1 | 0.142 | 0.540 | 0.595 |
+| 16 | 3 | 0.232 | 1.091 | 1.352 |
+| 16 | 5 | 0.338 | 1.657 | 1.998 |
+| 32 | 1 | 0.188 | 0.791 | 1.175 |
+| 32 | 3 | 0.310 | 1.654 | 2.601 |
+| 32 | 5 | 0.449 | 2.527 | 3.897 |
+| 64 | 1 | 0.364 | 1.605 | 2.320 |
+| 64 | 3 | 0.601 | 3.384 | 4.866 |
+| 64 | 5 | 0.880 | 5.277 | 7.244 |
+
+実候補数は fixture=2–3、wide=10–13、response=15–16。worlds=16 / depth=3 の
+全3局面・各3回での最大は1.353秒だった。64 / depth=5 は main/応答とも5秒を超えた。
+
+MPS はこの実行環境で `torch.backends.mps.is_available() == False` のため未計測。
+MPS が利用できる Mac では次で同じ sweep を再現できる。
+ベンチマークはローカルファイルだけを読み、ブラウザ・ネットワークを起動しない。
+結果は訓練・収集・評価の保存先に書かず、指定した別ファイルへ出す。
+
+```sh
+.venv/bin/python scripts/bench_official_search.py --position fixture --out /tmp/official-fixture.json
+.venv/bin/python scripts/bench_official_search.py --position wide --out /tmp/official-wide.json
+.venv/bin/python scripts/bench_official_search.py --position response --out /tmp/official-response.json
+.venv/bin/python scripts/bench_official_search.py --position wide --device mps --out /tmp/official-mps.json
+```
+
+`--timeout`（受理待ち）、`--settle-timeout`（画面/クリック反映待ち）、probe の
+コマンド応答 timeout は、同期した助言が返った後の各操作で開始する。
+探索6秒・各待ち1秒の合成テストでもクリック・送信受理が完了し、探索時間はこれらの
+待ち時間を消費しなかった。探索中に受信が進めば、クリック前の refresh で
+`superseded` を記録して助言し直す。送信待ちを延ばしても探索そのものは速くならない。
+今回ネットワーク接続は行っておらず、本家サーバー側の待機制限の実測は含まない。

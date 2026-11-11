@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -12,7 +13,10 @@ from .actor import Actor
 from .evaluation import load_policy_model, _policy_rng
 from .official import OfficialSession, read_games
 from .play import Presenter, KINDS
-from .search import SearchAgent, SearchConfig, load_search_belief
+from .search import _SUPPORT
+from .official_search import (add_search_arguments, search_config, search_agent, root_matches,
+                              empty_diagnostics, public_report, policy_at_prefix)
+from .actor import synchronize
 
 
 def advise(result, agent, *, search=False):
@@ -29,23 +33,52 @@ def advise(result, agent, *, search=False):
     labels = []
     search_status = 'forced_no_inference' if search and env.complete else 'disabled'
     root = None
+    diagnostics = empty_diagnostics()
     if search and not env.complete:
-        if p['phase'] == 0:
+        response_enabled = getattr(getattr(agent, 'config', None), 'search_response', False)
+        if p['phase'] != 0 and not response_enabled:
+            search_status = 'response_search_disabled_policy_fallback'
+        else:
             try:
                 root = _core._official_search_root(p, env.events, env.history_len)
-                if int(root.determinize_support(np.array([0],np.int32))[0]) != 0:
+                support = int(root.determinize_support(np.array([0], np.int32))[0])
+                if support != 0:
+                    search_status = _SUPPORT.get(support, 'unsupported_root') + '_policy_fallback'
                     root = None
-                    search_status = 'unsupported_root_policy_fallback'
+                elif not root_matches(root, env):
+                    root = None
+                    search_status = 'public_root_mismatch_policy_fallback'
                 else:
-                    search_status = 'main_public_worlds'
-            except (ValueError, RuntimeError):
-                search_status = 'unsupported_root_policy_fallback'
-        else:
-            search_status = 'response_public_journal_unavailable_policy_fallback'
+                    search_status = 'main_public_worlds' if p['phase'] == 0 else 'response_public_worlds'
+            except (ValueError, RuntimeError) as error:
+                root = None
+                # Only fixed local codes may cross the diagnostic boundary.
+                reason = {'hidden_launch_status': 'response_hidden_launch_status',
+                          'unsupported_public_launch': 'response_special_launch',
+                          'public_launch_decision_mismatch': 'response_public_decision_mismatch'}.get(str(error))
+                search_status = (reason or (p.get('_search_fallback', 'response_public_journal_unavailable')
+                                 if p['phase'] != 0 else 'unsupported_root')) + '_policy_fallback'
     while not env.complete:
         choices = presenter.options(env, env.play_hand(0, seat))
         if root is not None:
-            choice = int(agent(root, np.array([0], np.int32))[0])
+            if not root_matches(root, env):
+                root = None
+                search_status = 'public_prefix_mismatch_policy_fallback'
+                choice = int(policy_at_prefix(agent.actor, env, np.array([0], np.int32))[0])
+            else:
+                first = int(root.substep[0]) == 0
+                device = getattr(agent, 'device', None)
+                if device is not None:
+                    synchronize(device)
+                started = perf_counter()
+                choice = int(agent(root, np.array([0], np.int32))[0])
+                if device is not None:
+                    synchronize(device)
+                diagnostics['search_seconds'] += perf_counter()-started
+                if first:
+                    diagnostics.update(public_report(agent, env))
+                    if not diagnostics['search_candidates']:
+                        search_status = 'no_candidates_policy_fallback'
         else:
             actor = agent.actor if search else agent
             choice = int(actor(env, np.array([0], np.int32))[0])
@@ -62,7 +95,7 @@ def advise(result, agent, *, search=False):
     unsupported = env.action_support()
     return dict(status='unsupported' if unsupported else 'advice', unsupported=unsupported, update=p['update'], gf=p['gf'], board=board,
                 explanation=text, selections=labels, action=semantic,
-                history_complete=result['history_complete'], search_status=search_status,
+                history_complete=result['history_complete'], search_status=search_status, **diagnostics,
                 **({'detail': result['detail']} if result.get('detail') else {}),
                 warnings=([] if result['history_complete'] else ['partial_history_and_decision_count'])
                          + p.get('warnings', [])
@@ -80,36 +113,30 @@ def main(argv=None):
     parser.add_argument('--checkpoint', required=True, help='checkpoint EMA (same loader as play.py)')
     parser.add_argument('--greedy', action='store_true')
     parser.add_argument('--search', action='store_true')
-    parser.add_argument('--belief', default='uniform', help='uniform / b1 / belief checkpoint; oracle forbidden')
-    parser.add_argument('--fit')
-    parser.add_argument('--worlds', type=int, default=16)
-    parser.add_argument('--candidates', type=int, default=8)
-    parser.add_argument('--depth', type=int, default=3)
+    add_search_arguments(parser, advisor=True)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--history-len', type=int, default=64)
     parser.add_argument('--json', action='store_true', help='JSONL including semantic actions')
     args = parser.parse_args(argv)
-    if args.belief == 'oracle':
-        parser.error('oracle is forbidden for official advice')
-    if args.history_len < 0 or min(args.worlds, args.candidates, args.depth) < 1:
-        parser.error('invalid history/search sizes')
-    torch.set_num_threads(1)
-    model = load_policy_model(args.checkpoint, 'cpu')
+    try:
+        search_config(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.history_len < 0:
+        parser.error('history-len must be nonnegative')
+    torch.set_num_threads(args.threads)
+    model = load_policy_model(args.checkpoint, args.device)
     session = OfficialSession(args.viewer_id, args.history_len)
     agent = None
     if args.search:
-        agent = SearchAgent(model, load_search_belief(args.belief, args.fit, 'cpu'), 'cpu',
-                            config=SearchConfig(worlds=args.worlds, candidates=args.candidates,
-                                                depth=args.depth, select='argmax' if args.greedy else 'sample'),
-                            seed=args.seed, num_threads=1)
-        agent.actor.sample = not args.greedy
+        agent = search_agent(model, args, seed=args.seed)
     try:
         with _policy_rng(args.seed, (agent,) if agent else ()):
             for game in read_games(args.input, args.viewer_id, args.document_sequence):
                 result = session.ingest(game)
                 if result['status'] == 'decision':
                     if agent is None:
-                        agent = Actor(model, result['env'], 'cpu', sample=not args.greedy)
+                        agent = Actor(model, result['env'], args.device, sample=not args.greedy)
                     result = advise(result, agent, search=args.search)
                 else:
                     result = {key: value for key, value in result.items() if key != 'public'}
@@ -152,9 +179,14 @@ def advise_supported(result, agent, *, search=False, max_samples=16):
     except (ValueError, RuntimeError):
         return advice
     actor = agent.actor if search else agent
-    return _advise_supported(fresh, actor, max_samples=max_samples, allow_dream=True,
+    recovered = _advise_supported(fresh, actor, max_samples=max_samples, allow_dream=True,
         excluded_ids=hard_ids, excluded_kinds=kinds, exclude_self=prune_self,
         initial_exclusions=exclusions)
+    if search:
+        recovered.update({k: advice[k] for k in empty_diagnostics()},
+                         search_status='dream_last_resort_policy_fallback',
+                         initial_search_status=advice['search_status'])
+    return recovered
 
 
 def _advise_supported(result, agent, *, search=False, max_samples=16, allow_dream=False,
@@ -177,6 +209,8 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
     advice = choose(result, agent, search=search)
     if advice['status'] != 'unsupported':
         return advice
+    search_diagnostics = {k: advice[k] for k in empty_diagnostics()}
+    searched_status = advice['search_status']
     actor = agent.actor if search else agent
     excluded = set(excluded_ids)
     excluded_kinds = set(excluded_kinds)
@@ -222,7 +256,10 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
         exclusions.extend(dict(reason=e['reason'], item_ids=sorted(set(e['item_ids']) & new))
                           for e in blocked_by_reason if set(e['item_ids']) & new)
         exclusions.extend(kind_exclusions)
-        advice = choose(fresh, actor)  # Retain greedy/sample; search cannot use a different mask.
+        advice = choose(fresh, actor)  # Search cannot use a different mask.
+        if search:
+            advice.update(search_diagnostics, search_status='ui_mask_policy_fallback',
+                          initial_search_status=searched_status)
         advice['mask_exclusions'] = exclusions
     if advice['status'] == 'advice':
         return advice
@@ -234,6 +271,9 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
                 excluded_ids=excluded, excluded_kinds=excluded_kinds,
                 exclude_enemy_default_self=exclude_enemy_default_self))
             advice = choose(fresh, actor)
+            if search:
+                advice.update(search_diagnostics, search_status='ui_retry_policy_fallback',
+                              initial_search_status=searched_status)
             advice['fallback_samples'] = n
             if exclusions:
                 advice['mask_exclusions'] = exclusions

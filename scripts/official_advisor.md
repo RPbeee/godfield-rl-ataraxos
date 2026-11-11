@@ -11,8 +11,13 @@
 
 `--checkpoint` は `play.py` と同じ EMA loader。`--greedy` を省けば方策を
 サンプルする。`--search --belief uniform`、`--belief b1`、学習済み belief の
-path と `--fit` も使える。oracle は拒否する。CPU のみで実行する。
-`--worlds`、`--candidates`、`--depth` で探索量を制御する。
+path と `--fit` も使える。oracle は拒否する。belief は `--search` のときだけロードする。
+`--device cpu|mps`（既定 cpu）、`--threads`（既定1）を指定できる。
+`--worlds`（16）、`--candidates`（8）、`--candidate-samples`（64）、`--depth`（3）、
+`--alpha`（0.002）、`--beta`（0.02）、`--leaf-view actor|searcher`（actor）、
+`--search-response`（既定無効）は eval_search と同じ意味。既存の予算は変更していない。
+bot の旧予算は candidates=16 / depth=10 なので、advisor と異なる。
+対人戦向け予算とオフライン計測は [official_bot.md](official_bot.md) を参照。
 
 入力は probe の capture prefix の本文ファイル、厳密 parser の出力 JSON、
 `wire-game-updates` fixture、game の JSON 配列、game または `{game: ...}` の
@@ -65,9 +70,37 @@ useDefenseItems を公開決定にまとめる。通常補充は学習時の既�
 主手番は公開情報だけの Match を作り、既存の SearchAgent と belief を使う。
 相手の未使用品が空の構築元から belief の世界を作るので、受信した真在庫は使わない。
 霧・偽装など既存 determinize が拒否する root は方策へフォールバックする。
-応答/購入は合法選択と方策推論に対応するが、公開受信終点だけでは実行用 journal を
-作れないので、**探索は方策へフォールバック**する。`search_status` に理由を返す。
-これは `load_scene` の pending 制限を無効化する変更ではない。
+`--search-response` を指定すると、次の公開の証拠が残る通常応答も探索する。
+
+- 連続する受信で攻撃前の main 境界と、公開の launch カード・対象がある。
+- 同じ受信内で自分の行動解決→GF進行→相手の launch が続く場合は、完全に解釈できた
+  公開イベントの ledger の最後の攻撃前状態を使う。終点の MP から逆算しない。
+- 証拠を保持したまま、公開の防御カード＋反射だけが続く場合は response journal を再生する。
+
+C++ は公開 used 品と既に出されたカードだけを相手の anchor に置き、通常の
+`Match::step` で launch/journal を再生する。確率攻撃では pending の存在が命中を、
+202 では公開 amount が符号を示すので、その条件に合う新しい合成乱数列を使う。
+サーバーの乱数や未使用の真在庫は受け取らない。goodfield 本体は変更していない。
+
+根の全 `OBS_FIELDS`・mask・prefix・substep が `OfficialDecision` と完全一致する場合だけ
+探索し、各 substep の選択前にも再照合する。根の構築で強制コマンドは実行しない。
+探索状態は `main_public_worlds` / `response_public_worlds`。UI 用の mask 除外後は
+`ui_mask_policy_fallback` などで方策を使い、最初の探索の費用と `initial_search_status` を残す。
+
+途中参加・欠番・不完全な前段イベントには anchor の証拠がなく、
+`response_public_journal_unavailable_policy_fallback`。
+追跡できない反射/跳ね返しは `response_redirect_journal_unavailable_policy_fallback`、
+counter/death/guardian は `response_special_launch_policy_fallback`。
+購入、Danger、霧/混乱、再生不一致、観測/prefix 不一致も方策へ戻す。
+202 の符号が仮定値で警告される場合も、その警告を保持し、一致しない根は使わない。
+強制手には `forced_no_inference`、応答探索の未指定には
+`response_search_disabled_policy_fallback` を返す。
+
+実 fixture は v73/update2、v68/update2・4、v78/update2 で根が一致した。
+v59/update2・v89/update2 は選択が全て強制なので探索不要。
+v73/update3 の counter/反射は通常 launch の証拠とは別の特殊 frame なので探索しない。
+v64 の初回応答は攻撃前の受信がなく、方策を使う。
+通常武器・確率攻撃・202・反射2回の合成局面も検査する。
 
 `status=unsupported` は接続側が人へ知らせて停止すべき結果。
 未知 schema/event、2 人以外/チーム、18 枠超過、不明な pending の行為者、
@@ -103,8 +136,9 @@ raw、モデルエラー、認証、未知イベントの本文をエラー表�
 ## 検証範囲
 
 - 30 wire ファイル・79 game を fixture として使用。主手番43、応答待ち32
-  （40.5%）、終局4。`load_scene` が受け付けない32応答待ちは読み取り専用の
-  `PublicSelection` で扱い、実行用 journal を捏造しない。購入待ちは合成データでも検証。
+  （40.5%）、終局4。応答待ちの選択は読み取り専用の `PublicSelection` を使う。
+  上記の公開証拠がある場合だけ、別途実行用の根を通常 step から構築する。
+  購入待ちは合成データでも検証。
 - 76 game に既存 goodfield native 再生の対応あり。current board の 55 token は、
   **手札を対応付けると76/76一致**。native の外部補充決定数は受信 updateCount と
   異なるため、この比較では native の counter を明示して比較する。
@@ -119,7 +153,10 @@ raw、モデルエラー、認証、未知イベントの本文をエラー表�
   学習時既定の counter に正規化した native 公開記録からの History と6/6一致。
 - 全79入力で相手の未使用モデル/数/ID/fake と名前/userId を改変し、公開出力不変。
   75の viewer 決定で観測・mask・説明・意味行動も不変。霧の敵 status も別検査。
-- goodfield に main/response/purchase の合法 prefix 一致テストを追加。
+- goodfield に main/response/purchase の合法 prefix 一致テストがある。
+- uniform/AR について wire の相手の未使用モデル・数・fake・ID・名前を変えても、
+  belief 入力（方策と同じ OBS_FIELDS のみ）、AR サンプル、候補値・確率・選択が不変。
+  記録済み main/応答と合成応答を検査し、観測/prefix 不一致時の探索禁止も検査する。
 
 `gfrl_official_native_dump` は既存 `official_wire_trace_test.cpp` の実再生を
 観測用 hook から取得するテスト専用実行物。native 真在庫を Python の変換側へ

@@ -94,6 +94,10 @@ class Journal:
         self.file = open(os.open(directory / 'moves.jsonl', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'w')
 
     def write(self, value):
+        from .official_search import empty_diagnostics
+        advice = value.get('advice', {})
+        value = dict(value, **{key: advice.get(key, default)
+            for key, default in dict(search_status='not_a_decision', **empty_diagnostics()).items()})
         self.file.write(json.dumps(value, ensure_ascii=False, allow_nan=False)+'\n'); self.file.flush()
 
     def close(self):
@@ -653,6 +657,8 @@ def main(argv=None):
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--greedy', action='store_true')
     parser.add_argument('--search', action='store_true')
+    from .official_search import add_search_arguments, search_config, search_agent
+    add_search_arguments(parser)
     parser.add_argument('--games', type=int, default=1)
     parser.add_argument('--out-dir', type=Path, required=True)
     parser.add_argument('--dry-run', action='store_true')
@@ -666,6 +672,10 @@ def main(argv=None):
     parser.add_argument('--on-stop', choices=['save', 'abandon'], default='save')
     parser.add_argument('--replay', type=Path, help='Offline live1 directory; never starts Node/network')
     args = parser.parse_args(argv)
+    try:
+        search_config(args)
+    except ValueError as error:
+        parser.error(str(error))
     if (args.games < 1 or not 0 < args.timeout < float('inf')
             or not 0 < args.settle_timeout < float('inf')
             or not 0 <= args.chance_delay < float('inf')
@@ -691,18 +701,15 @@ def main(argv=None):
         from .actor import Actor
         from .evaluation import load_policy_model, _policy_rng
         from .official_advisor import advise_supported
-        torch.set_num_threads(1)
-        model = load_policy_model(args.checkpoint, 'cpu')
+        torch.set_num_threads(args.threads)
+        model = load_policy_model(args.checkpoint, args.device)
         agent = None
         if args.search:
-            from .search import SearchAgent, SearchConfig, load_search_belief
-            agent = SearchAgent(model, load_search_belief('uniform', None, 'cpu'), 'cpu',
-                                config=SearchConfig(select='argmax' if args.greedy else 'sample'), seed=0, num_threads=1)
-            agent.actor.sample = not args.greedy
+            agent = search_agent(model, args)
         def advisor(result):
             nonlocal agent
             if agent is None:
-                agent = Actor(model, result['env'], 'cpu', sample=not args.greedy)
+                agent = Actor(model, result['env'], args.device, sample=not args.greedy)
             return advise_supported(result, agent, search=args.search)
         directory = private_directory(args.out_dir)
         journal = Journal(directory)
