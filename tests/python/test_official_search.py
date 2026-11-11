@@ -407,3 +407,82 @@ def test_dream_last_resort_uses_remaining_search_budget(models):
     assert advice['search_status'] == 'dream_last_resort_search'
     assert advice['dream_last_resort'] and advice['status'] == 'advice'
     assert agent.counts['searched'] == 2
+
+
+@pytest.mark.parametrize('response', [False, True])
+@pytest.mark.parametrize('count', range(2, 7))
+@pytest.mark.parametrize('kind', ['uniform', 'ar'])
+@pytest.mark.parametrize('singleton', [False, True])
+def test_dream_singleton_faces_produce_candidates_without_truth(models, response, count, kind, singleton):
+    """Official disguises include faces with no natural Dream partners."""
+    outcomes = []; snapshots = []
+    for changed in (False, True):
+        sequence = games(response)
+        for game in sequence:
+            game['players'][0].update(hp=22, mp=15, cp=40, curses=['dream'])
+            game['players'][0]['items'] = [
+                dict(id=990+i, modelId=6 if changed else face, fakeModelId=face)
+                for i, face in enumerate([189, 58, 20, 91, 195, 63][:count])]
+            game['players'][0]['items'] += [dict(id=980, modelId=190)]
+            if changed:
+                game['players'][1]['items'] = [dict(id=880+i, modelId=m)
+                                               for i, m in enumerate((94, 232, 209))]
+        result = result_for(sequence)
+        root = _core._official_search_root(result['public'], result['env'].events, 64,
+                                           result['env'].restrictions)
+        assert root_matches(root, result['env'])
+        assert root.determinize_support(np.array([0], np.int32))[0] == 0
+        agent = SearchAgent(models[0], load_search_belief(str(models[1]) if kind == 'ar' else 'uniform'),
+            config=SearchConfig(worlds=4, candidates=1 if singleton else 4, candidate_samples=8,
+                                depth=2, search_response=True, skip_single_candidate=singleton), seed=17)
+        seen = []
+        original = agent._world_env
+        def spy(*args, **kwargs):
+            env, status = original(*args, **kwargs)
+            seen.append(dict(status=status.copy(), **{k: getattr(env, k).copy()
+                             for k in (*OBS_FIELDS, *PREFIX_FIELDS)}))
+            return env, status
+        agent._world_env = spy
+        with _policy_rng(31, (agent,)):
+            selected = agent.search(root, [0])
+        assert selected and agent.last_search[0]['candidates']
+        diagnostic = agent.last_candidate_diagnostics[0]
+        assert diagnostic['sampled'] == 8
+        assert diagnostic['singleton'] == singleton
+        assert all(n == 4 for n in diagnostic['valid_worlds'])
+        assert agent.counts['invalid_loads'] == agent.counts['invalid_candidate_worlds'] == 0
+        assert agent.counts['singleton_validated_worlds'] == (4 if singleton else 0)
+        outcomes.append((selected, agent.last_search, diagnostic)); snapshots.append(seen)
+    assert outcomes[0] == outcomes[1]
+    for left, right in zip(*snapshots, strict=True):
+        for key in left:
+            np.testing.assert_array_equal(left[key], right[key])
+
+
+def test_world_rejection_does_not_repeat_search_on_ui_exclusion(models, monkeypatch):
+    from gfrl.official_advisor import advise_supported
+    agent = small_search(models[0])
+    class FirstCardPolicy:
+        sample = False
+        def __call__(self, env, rows):
+            choices = np.zeros(env.num_envs, np.int32)
+            for r in rows:
+                legal = np.flatnonzero(env.mask[r])
+                choices[r] = 2 if env.stage[r] == 2 and 2 in legal else legal[0]
+            return choices
+    agent.actor = FirstCardPolicy()
+    original = agent._world_env
+    calls = []
+    def rejected(src, rows, assignments, seeds, depth, role=None):
+        calls.append(role)
+        invalid = np.zeros_like(assignments)
+        invalid[:, 6] = 19  # impossible hand: reject through the real loader
+        return original(src, rows, invalid, seeds, depth, role)
+    monkeypatch.setattr(agent, '_world_env', rejected)
+    with _policy_rng(7, (agent,)):
+        advice = advise_supported(result_for([research_game()]), agent, search=True)
+    assert advice['status'] == 'advice'
+    assert calls == ['candidate']
+    assert advice['initial_search_status'] == 'no_candidates_policy_fallback'
+    assert advice['search_fallback_reason'] == 'world_rejection'
+    assert agent.counts['searched'] == 1

@@ -234,6 +234,8 @@ class SearchAgent:
         self.profile = profile
         self._workspaces = {}
         self.last_candidates = {}
+        self.last_candidate_diagnostics = {}
+        self.world_load_counts = Counter()
         self.last_policy_paths = {}
 
     def statistics(self):
@@ -270,6 +272,10 @@ class SearchAgent:
         status = env.load_worlds(src, np.asarray(rows, np.int32), np.asarray(assignments, np.int32), np.asarray(seeds, np.uint64))
         self.seconds['world_load'] += perf_counter()-start
         self.counts['invalid_loads'] += int((status != 0).sum())
+        names = {0: 'ok', 1: 'invalid_assignment', 2: 'unsupported_root', 3: 'empty_own_prior',
+                 4: 'observation_mismatch', 5: 'decision_mismatch', 6: 'legality_mismatch'}
+        for value, count in zip(*np.unique(status, return_counts=True)):
+            self.world_load_counts[(role or 'other') + ':' + names[int(value)]] += int(count)
         return env, status.copy()
 
     def _belief_samples(self, src, rows):
@@ -377,7 +383,7 @@ class SearchAgent:
         roots = np.asarray(roots, np.int32)
         roots = roots[search_support(src, roots, self.config.search_response) == 0]
         response = response_roots(src, roots)
-        selected, reports, candidates, policies = {}, [], {}, {}
+        selected, reports, candidates, policies, diagnostics = {}, [], {}, {}, {}
         for kind, take in (('main', ~response), ('response', response)):
             rows = roots[take]
             if not len(rows):
@@ -389,7 +395,9 @@ class SearchAgent:
             reports.extend(self.last_search)
             candidates.update(self.last_candidates)
             policies.update(self.last_policy_paths)
+            diagnostics.update(self.last_candidate_diagnostics)
         self.last_search, self.last_candidates, self.last_policy_paths = reports, candidates, policies
+        self.last_candidate_diagnostics = diagnostics
         return selected
 
     @torch.inference_mode()
@@ -405,7 +413,7 @@ class SearchAgent:
         c = self.config
         roots = np.asarray(roots, np.int32)
         if c.root_batch_size and len(roots) > c.root_batch_size:
-            selected, reports, candidates, policies = {}, [], {}, {}
+            selected, reports, candidates, policies, diagnostics = {}, [], {}, {}, {}
             for lo in range(0, len(roots), c.root_batch_size):
                 selected.update(self._search(src, roots[lo:lo+c.root_batch_size],
                                             fixed_candidates=fixed_candidates, policy_paths=policy_paths,
@@ -413,6 +421,8 @@ class SearchAgent:
                 reports.extend(self.last_search)
                 candidates.update(self.last_candidates)
                 policies.update(self.last_policy_paths)
+                diagnostics.update(self.last_candidate_diagnostics)
+            self.last_candidate_diagnostics = diagnostics
             self.last_search, self.last_candidates, self.last_policy_paths = reports, candidates, policies
             return selected
         self.counts['search_batches'] += 1
@@ -420,6 +430,7 @@ class SearchAgent:
         self.counts['max_batch_roots'] = max(self.counts['max_batch_roots'], len(roots))
         self.last_search = []
         self.last_candidates = {}
+        self.last_candidate_diagnostics = {int(r): dict(sampled=0, unique=0, retained=0, valid_worlds=[], loads={}, singleton=False) for r in roots}
         self.last_policy_paths = {}
         start = self._time()
         rr, assignments, seeds = self._sample_worlds(src, roots)
@@ -432,6 +443,9 @@ class SearchAgent:
         if fixed_candidates is None:
             indices = np.concatenate([np.resize(ids, c.candidate_samples) for ids in groups.values() if len(ids)])
             env, status = self._world_env(src, rr[indices], assignments[indices], seeds[indices], 1, role="candidate")
+            for r in roots:
+                ids = np.flatnonzero(rr[indices] == r)
+                self.last_candidate_diagnostics[int(r)]['loads'] = dict(Counter(int(v) for v in status[ids]))
             actor = _SearchActor(self.model, env, self.device, profile=self.profile, max_batch=c.max_inference_batch,
                                  cache_device=c.search_cache_device, cache_mb=c.search_cache_mb)
             actor._search_root_groups = rr[indices]
@@ -451,10 +465,18 @@ class SearchAgent:
                 if status[i] == 0:
                     policy_paths.setdefault(int(rr[idx]), tuple(paths[i]))
                     candidates[int(rr[idx])][tuple(paths[i])] = (float(lp[i]), float(lr[i]))
+            for r, items in candidates.items():
+                self.last_candidate_diagnostics[r]['unique'] = len(items)
+                if not items and len(groups[r]):
+                    self.last_candidate_diagnostics[r]['failure'] = 'world_rejection'
             candidates = {r: sorted(items.items(), key=lambda x: (-x[1][0], x[0]))[:c.candidates] for r, items in candidates.items()}
         else:
             candidates = {int(r): fixed_candidates.get(int(r), []) for r in roots}
             policy_paths = policy_paths or {}
+        for r, items in candidates.items():
+            self.last_candidate_diagnostics[r].update(
+                sampled=(int(sum(status[i] == 0 for i, idx in enumerate(indices) if rr[idx] == r))
+                         if fixed_candidates is None else None), retained=len(items))
         self.last_candidates = candidates
         self.counts['candidate_paths'] += sum(map(len, candidates.values()))
         self.last_policy_paths = policy_paths
@@ -466,6 +488,8 @@ class SearchAgent:
         self.seconds['candidate'] += self._time()-start
         if not jobs:
             return {}
+        for r in singleton:
+            self.last_candidate_diagnostics[r]['singleton'] = True
         self.counts['singleton_roots'] += len(singleton)
         self.counts['rollout_roots'] += sum(bool(items) and r not in singleton for r, items in candidates.items())
         aggregated = {}
@@ -480,6 +504,7 @@ class SearchAgent:
             kept = []
             for path, priors in items:
                 samples = aggregated.get((r, path), [])
+                self.last_candidate_diagnostics[r]["valid_worlds"].append(len(samples))
                 if samples:
                     kept.append((path, priors, float(np.mean(samples)), len(samples)))
             if not kept:

@@ -392,7 +392,12 @@ void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
                 for(const auto& card:gf::catalog()) if(root.match.gift_supported(card.id)
                         && gf::match_dream_compatible(card.id,item.face))
                     for(int n=0;n<card.gift_rate;++n)tickets.push_back(card.id);
-                if(tickets.empty())throw std::invalid_argument("empty own Dream prior");
+                // Official public hands may mark even singleton faces disguised.
+                // Natural local draws never do that. Use the supported identity
+                // assignment only for this otherwise empty public-face prior;
+                // never consult the original hidden model or change old draws.
+                if(tickets.empty() && root.match.gift_supported(item.face))tickets.push_back(item.face);
+                if(tickets.empty()) {world_status[i]=int(WorldStatus::empty_own_prior);throw std::invalid_argument("empty own Dream prior");}
                 // Exact bounded draw (avoid modulo bias).
                 const auto bound=std::uint64_t(tickets.size()), threshold=-bound%bound;
                 do {rng=mix(rng);} while(rng<threshold);
@@ -401,7 +406,13 @@ void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
             e.match=own.empty()?root.match.determinized(id,models,seeds[i],true):
                 root.match.determinized(id,models,own,seeds[i],true);
         } catch(const std::invalid_argument&) {continue;}
-          catch(const gf::MatchError& error) {if(error.code==gf::MatchErrorCode::invalid)continue;throw;}
+          catch(const gf::MatchError& error) {if(error.code==gf::MatchErrorCode::invalid) {
+              const std::string_view message=error.what();
+              if(message.find("observation differs")!=message.npos)world_status[i]=int(WorldStatus::observation_mismatch);
+              else if(message.find("decision differs")!=message.npos)world_status[i]=int(WorldStatus::decision_mismatch);
+              else if(message.find("differs")!=message.npos)world_status[i]=int(WorldStatus::legality_mismatch);
+              continue;
+          }throw;}
         e.history[seat]=root.history[seat];e.history[1-seat]=root.history[seat].projected();
         e.chance_rng=mix(seeds[i]^0xa4093822299f31d0ULL);e.encoded=false;e.waiting=false;
         e.selection.reset();

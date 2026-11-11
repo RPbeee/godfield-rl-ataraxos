@@ -175,7 +175,7 @@ DREAM_RELAXABLE_REASONS = (DREAM_REASON, AMBIGUOUS_REASON)
 def advise_supported(result, agent, *, search=False, max_samples=16):
     """Prefer verified actions; relax Dream gaps only after the safe mask is exhausted."""
     from .official import OfficialDecision, OBSERVED_UI_KINDS, KINDS as ACTION_KINDS
-    budget = [2]
+    budget = dict(remaining=2, blocked_reason=None)
     advice = _advise_supported(result, agent, search=search, max_samples=max_samples, search_budget=budget)
     exclusions = advice.get('mask_exclusions', [])
     if not advice.get('selection_exhausted') or not any(e['reason'] in DREAM_RELAXABLE_REASONS for e in exclusions):
@@ -210,14 +210,18 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
     """Prune UI gaps; search at most twice across all recovery paths."""
     from .official import OfficialDecision
     env = result['env']
-    budget = search_budget if search_budget is not None else [2]
+    budget = search_budget if search_budget is not None else dict(remaining=2, blocked_reason=None)
     totals = dict(prior_diagnostics or empty_diagnostics())
     actor = agent.actor if search else agent
     def choose(position, *, recovery=None):
-        use_search = search and budget[0] > 0
+        use_search = search and budget['remaining'] > 0
         if use_search:
-            budget[0] -= 1
+            budget['remaining'] -= 1
         advice = advise(position, agent if use_search else actor, search=use_search)
+        if use_search and advice.get('search_failure_reason') == 'world_rejection':
+            # Removing public card choices cannot repair failed world loads.
+            # Share this stop reason with the Dream last-resort recovery too.
+            budget.update(remaining=0, blocked_reason='world_rejection')
         if search:
             seconds = totals['search_seconds'] + advice['search_seconds']
             if use_search:
@@ -225,7 +229,7 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
             totals['search_seconds'] = seconds
             advice.update(totals)
             if not use_search:
-                advice['search_fallback_reason'] = 'search_limit'
+                advice['search_fallback_reason'] = budget['blocked_reason'] or 'search_limit'
             elif advice['search_status'].endswith('_policy_fallback'):
                 advice['search_fallback_reason'] = advice['search_status']
             if recovery:
@@ -233,7 +237,7 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
                 success = use_search and status in ('main_public_worlds', 'response_public_worlds')
                 advice['search_status'] = recovery + ('_search' if success else '_policy_fallback')
                 if not success:
-                    advice['search_fallback_reason'] = (status if use_search else 'search_limit')
+                    advice['search_fallback_reason'] = (status if use_search else budget['blocked_reason'] or 'search_limit')
         relaxed = [r for r in advice['unsupported'] if r in DREAM_RELAXABLE_REASONS]
         if allow_dream and relaxed:
             advice['unsupported'] = [r for r in advice['unsupported'] if r not in DREAM_RELAXABLE_REASONS]

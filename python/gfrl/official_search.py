@@ -53,7 +53,9 @@ def public_report(agent, env):
     """Candidate paths refer only to own public cursor choices; no world data."""
     reports = getattr(agent, 'last_search', [])
     if not reports:
-        return dict(search_worlds=0, search_candidates=0, pi_search_top=[], pi_theta_top=[])
+        failure = getattr(agent, 'last_candidate_diagnostics', {}).get(0, {}).get('failure')
+        return dict(search_worlds=0, search_candidates=0, pi_search_top=[], pi_theta_top=[],
+                    **({'search_failure_reason': failure} if failure else {}))
     report = reports[0]; candidates = report['candidates']
     lp = np.array([c['log_pi'] for c in candidates]); pi = np.exp(lp-lp.max()); pi /= pi.sum()
     def top(probs):

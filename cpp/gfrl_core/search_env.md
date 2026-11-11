@@ -740,3 +740,115 @@ differs, while requiring the same public view.
 Validation after restriction: Release cmake builds succeeded for parent and
 standalone goodfield; CTest **17/17** and **166/166**; full `pytest -q`:
 **282 passed / 1 skipped** (including the MPS equivalence case).
+
+### Official Dream empty-prior candidate loss (2026-11-11)
+
+The official public hand can contain `disguised=True` on a face with no natural
+local Dream-compatible gift models. Examples from the reported GF16 hand are
+189 (虹のカーテン), 58 (マジカルステッキ), and 63 (輝きのカケラ).
+`match_dream_compatible` excludes identity and compares category, element,
+ability, cost and other attributes. A singleton face therefore had zero tickets
+in the loader. The support check returned `ok` because identity disguises are
+supported by the existing engine, but `load_worlds` threw `empty own Dream prior`
+and mapped it to `invalid_assignment`. Every candidate world was stopped before
+sampling a path. Excluding the disguised slots did not remove those cards from
+the physical hand, so the second search encountered the same empty prior.
+The live log does not identify the disguised slots; this reproduces the reported
+failure mechanism but cannot attribute every one of its 11 decisions individually.
+
+The parent loader now uses the public face as an identity assignment **only when
+the natural compatible gift prior is empty** and that face is a configured gift.
+The engine already accepts this assignment. Existing nonempty priors, their
+weights, chance RNG streams, and real execution rules are unchanged. No goodfield
+file was modified. Neither own hidden reals nor opponent unused cards are read.
+Identity is a public-only approximation for these otherwise unmodellable faces;
+it does not establish their actual official hidden effect. Existing advisor
+execution-gap checks still exclude such actions, with the existing Dream last
+resort behavior preserved. Calibrating a broader official disguise posterior
+remains separate work (estimated 1–2 engineering days with supplied public reveal
+traces, plus further calibration data); there is no claim of improved strength.
+
+Diagnostics are separate from the legacy exact-fixture counters:
+
+- `SearchAgent.world_load_counts`: cumulative `role:reason` counts (candidate,
+  rollout, singleton). `WorldStatus` retains 0=ok, 1=invalid_assignment,
+  2=unsupported_root and adds 3=empty_own_prior, 4=observation_mismatch,
+  5=decision_mismatch, 6=legality_mismatch. Remaining restore/capacity errors stay 1.
+- `last_candidate_diagnostics[row]`: successful pre-dedup samples, raw unique
+  paths, retained paths, candidate load status counts, per-retained-path
+  `valid_worlds`, singleton fast-path use, and `failure=world_rejection` when
+  all candidate loads fail. Mixed root kinds and root batches retain all rows.
+- The advisor exposes only the fixed `search_failure_reason=world_rejection`
+  code when this happens. It suppresses further searches across UI exclusions
+  and Dream last-resort recovery; policy recovery can still continue.
+
+#### Paired measurements
+
+No network or additional dependencies were used. The script includes 20 official
+public-view cases: main/response × 2–6 disguised cards × natural-partner control
+faces / singleton faces. It uses the existing wire-fixture/session construction,
+including the public launch journal for response. Resources are HP22/MP15/CP40
+for the viewer and HP37/MP30/CP0 for the opponent. Synthetic singleton hand faces
+are `[189,58,20,91,195,63][:n]`, plus undisguised trade/reflection cards.
+
+`SearchConfig`: worlds=4, candidate_samples=8, candidates=4, depth=1,
+search_response=True, skip_single_candidate=True, select=argmax. Policy is a
+fixed seeded tiny model (d16, heads2, depth1, ff32, Torch seed11); search RNG17 /
+Torch31 on synthetic cases. Self-play uses 300 games, both seats, VecEnv
+`eval_seed=20261111`, policy RNG101, search RNG778 and isolated search Torch203.
+Only the fixed policy chooses real moves; search results never alter play.
+Before was measured with the new instrumentation but the single identity-fallback
+line disabled; after enables that line. The paired real-action SHA256 is identical:
+`a91899a2190c8739e00e2e2f585c8e4ee646a60742ba7b9352a33fe5cb248f85`.
+
+| Supported roots with zero candidates | Before | After |
+| --- | ---: | ---: |
+| Official synthetic, all (all Dream-cursed) | 10/20 | 0/20 |
+| Official synthetic, main | 5/10 | 0/10 |
+| Official synthetic, response | 5/10 | 0/10 |
+| Fixed-policy self-play, overall | 0/6,838 | 0/6,838 |
+| Fixed-policy self-play, Dream-cursed viewer | 0/169 | 0/169 |
+| Fixed-policy self-play, other viewer | 0/6,669 | 0/6,669 |
+
+The ten failing singleton cases had 80/80 candidate loads rejected for empty
+own prior (formerly all status1), zero observation/decision/legality mismatch,
+zero accepted candidate samples, zero unique paths and no rollout or singleton
+jobs. Deduplication never dropped a valid path. After: 80/80 candidate loads
+succeed, 80 accepted samples → 51 unique paths → 38 retained candidates,
+152/152 rollout loads succeed, and every retained candidate has valid_worlds=4.
+No candidate path was rejected. The natural-partner controls pass before and
+after. Thus neither future Dream draws/RNG, history consistency, mask changes,
+nor singleton optimization explains this reproduction's loss.
+
+The local engine only creates natural nonidentity disguises with nonempty
+compatibility classes. Its fixed-policy games therefore **do not reproduce the
+official singleton-face issue**, and the zero-to-zero self-play comparison is a
+regression check, not evidence of live incidence or strength. In both runs the
+self-play load totals are candidate:ok=54,704, rollout:ok=93,192,
+singleton:ok=116, all rejection categories zero.
+
+The real `runs/play/belief-ar-m.pt` checkpoint was also run on the 20 synthetic
+cases after the fix: 20/20 produce candidates. On the ten singleton cases,
+80 candidate loads and 144 rollout loads succeed, 80 accepted draws → 49 unique
+paths → 36 retained candidates, all with valid_worlds=4. New parametrized tests
+cover 2–6 disguises, both root kinds, uniform/AR belief and ordinary/singleton
+validation; changing all own hidden reals and the opponent hand preserves world
+observations and complete search outputs. A loader-rejection regression test
+proves the advisor invokes search once across UI card exclusions.
+
+```sh
+.venv/bin/python scripts/measure_dream_search.py --out measurements/dream-search-after.json
+.venv/bin/python scripts/measure_dream_search.py --games 0 \
+  --belief runs/play/belief-ar-m.pt --out measurements/dream-search-ar-after.json
+```
+
+Raw paired data: `measurements/dream-search-{before,after}.json` and
+`measurements/dream-search-ar-after.json`. To repeat the baseline, temporarily
+omit only `if(tickets.empty() && root.match.gift_supported(item.face))tickets.push_back(item.face);`
+in the loader, rebuild `build`, and use the same script/budgets/seeds.
+
+Validation on this Mac: `cmake --build build && ctest --test-dir build`: 17/17;
+`cmake --build build-goodfield && ctest --test-dir build-goodfield`: 166/166;
+`.venv/bin/python -m pytest -q tests/python`: 1,180 passed, 1 skipped (125.90s).
+The existing Mac exact search fixtures and leak tests pass unchanged. No MPS
+failure occurred in this run. No new dependencies, network access or commit.

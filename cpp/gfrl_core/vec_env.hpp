@@ -40,7 +40,7 @@ private:
     std::size_t generation_ = 0, remaining_ = 0;
     bool stop_ = false;
 };
-enum class WorldStatus : std::int8_t { ok=0, invalid_assignment=1, unsupported_root=2 };
+enum class WorldStatus : std::int8_t { ok=0, invalid_assignment=1, unsupported_root=2, empty_own_prior=3, observation_mismatch=4, decision_mismatch=5, legality_mismatch=6 };
 // Public assignment includes used cards; output contains only unused counts.
 std::array<std::int32_t,297> unused_assignment(const gf::Match& match, int searcher, std::span<const std::int32_t> assignment);
 class VecEnv {
