@@ -125,6 +125,29 @@ raw受信・本文・認証は JSONL に含めない。probe が必要とする�
 
 停止時の `moves.jsonl` は `reason` と安全な `detail` を持つ1行を記録し、
 標準エラーにも同じ2項目を1行の JSON で出す。停止行には助言本文をコピーしない。
+`probe_failure` は最終サマリーにも同じ `detail` を残す。読み方は次の通り。
+
+- `cause`: 応答待ちの `timeout`、標準出力終了の `eof`、error フィールドのある
+  応答の `probe_error`、JSON 解析失敗の `invalid_json`、object 以外の `not_object`。
+- `command`: 待っていたコマンドの種類だけ。`state` / `capture` / `fillName` /
+  `clickText` / `clickPoint` / `screenshot` / `close` を許可し、引数は残さない。
+  起動時の ready 待ちはコマンド送信前なので、この項目はない。
+- `probe_error`: probe の固定コード。`^[a-z_]{1,64}$` に一致する場合だけ記録する。
+  例は `action_failed` / `startup_failed`。元の例外メッセージは記録しない。
+- `exit_code`: 最大0.1秒の終了待ち後、まだ動作中なら停止し、さらに最大0.1秒待って
+  poll した整数の終了コード。終了が未確認なら省略する。負数は bot の停止処理による
+  シグナル終了（例: `-15`）も含むので、自然終了とは限らない。
+- `elapsed_seconds`: コマンド送信開始から異常検出までの秒数。終了確認の待ち時間は
+  含めない。起動時だけは ready 待ち開始から測る。
+
+main 決定の助言直後、最初のクリック前はまず `state` を取得する。
+その後の画面照合（`wait_visible`）と各クリック直前には `capture` で受信の前進を
+確認し、必要なら再び `state` を取得する。hit/miss 後の演出待ちでも `capture` を送る。
+したがって update40/GF24 の「クリックなし」だけでは `state` / `capture` のどちらを
+待っていたか確定できない。通常の最初の候補は `state` で、新しい `command` で判別する。
+probe 異常後は再送・再試行しない。既存の応答 timeout と stderr の破棄は変更しない。
+画面本文・表示名・生JSON・stderr はこれらの診断項目には入れない。
+
 「生誕する」の後、`--timeout` を過ぎても名前入力画面なら `login_not_accepted` で停止し、
 標準エラーに「名前が使用中の可能性。別の名前で」を追加する。名前そのものは出さない。
 

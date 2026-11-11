@@ -338,6 +338,152 @@ for line in sys.stdin:
         Probe([sys.executable,str(script)],timeout=.01)
 
 
+@pytest.mark.parametrize('cause,reply', [
+    ('timeout', None), ('eof', ''),
+    ('probe_error', '{"error":"action_failed","raw":"PRIVATE_AUTH"}'),
+    ('invalid_json', 'PRIVATE_AUTH {'), ('not_object', '["PRIVATE_AUTH"]'),
+])
+def test_probe_failure_at_decision_reaches_journal_and_summary(tmp_path, capsys, cause, reply):
+    script = tmp_path/'transport.py'
+    script.write_text(
+        'import sys,time\nprint(\'{"ready":true}\',flush=True)\n'
+        'sys.stdin.readline()\n' +
+        ('time.sleep(10)\n' if reply is None else
+         f'print({reply!r},flush=True)\nsys.exit(7)\n' if reply else 'sys.exit(7)\n'))
+    transport = Probe([sys.executable, str(script)])
+    transport.timeout = .02
+    probe = FakeProbe(tmp_path)
+    original_send = probe.send
+    armed = False
+    def send(command):
+        if armed:
+            return transport.send(command)
+        return original_send(command)
+    probe.send = send
+    def advising(result):
+        nonlocal armed
+        armed = True
+        return advisor(result)
+    directory = private_directory(tmp_path/'log')
+    journal = Journal(directory)
+    try:
+        report = run(probe, advising, journal, name='SyntheticName')
+        assert transport.broken
+        with pytest.raises(UIUnsupported, match='probe_stopped'):
+            transport.send(dict(kind='capture'))
+    finally:
+        journal.close()
+        transport.close()
+    row, = [json.loads(line) for line in (directory/'moves.jsonl').read_text().splitlines()]
+    detail = report['detail']
+    assert report['reason'] == row['reason'] == 'probe_failure'
+    assert detail == row['detail'] == json.loads(capsys.readouterr().err)['detail']
+    assert detail['cause'] == cause and detail['command'] == 'state'
+    assert type(detail['elapsed_seconds']) is float and detail['elapsed_seconds'] >= 0
+    assert detail['exit_code'] == (-15 if cause == 'timeout' else 7)
+    assert set(detail) == {'cause', 'command', 'elapsed_seconds', 'exit_code'} | (
+        {'probe_error'} if cause == 'probe_error' else set())
+    if cause == 'probe_error':
+        assert detail['probe_error'] == 'action_failed'
+    assert row['clicks'] == [] and not row['accepted']
+    assert 'PRIVATE_AUTH' not in json.dumps(report) + json.dumps(row)
+
+
+@pytest.mark.parametrize('kind', ['state', 'capture', 'fillName', 'clickText', 'clickPoint', 'screenshot', 'close',
+                                 'PRIVATE_AUTH', [], {}, 1, True, None])
+def test_probe_failure_queue_tracks_command_and_elapsed(monkeypatch, kind):
+    import io
+    import queue
+    from types import SimpleNamespace
+    from gfrl import official_bot as bot
+    probe = Probe.__new__(Probe)
+    probe.broken = False
+    probe.timeout = 40
+    probe.lines = queue.Queue()
+    probe.lines.put('{"error":"action_failed"}')
+    probe.process = SimpleNamespace(stdin=io.StringIO(), wait=lambda **kw: 9, poll=lambda: 9)
+    ticks = iter([100., 102.5])
+    monkeypatch.setattr(bot.time, 'monotonic', lambda: next(ticks))
+    with pytest.raises(UIUnsupported, match='probe_failure') as raised:
+        probe.send(dict(kind=kind, text='PRIVATE_AUTH'))
+    expected = dict(cause='probe_error', probe_error='action_failed', exit_code=9, elapsed_seconds=2.5)
+    if isinstance(kind, str) and kind in bot.PROBE_COMMANDS:
+        expected['command'] = kind
+    assert raised.value.detail == expected
+
+
+@pytest.mark.parametrize('code', ['startup_failed', 'a'*64, 'a'*65, 'PRIVATE_AUTH', 'bad-code',
+                                 'bad\n', '', None, False, [], {}])
+def test_probe_failure_detail_whitelists_at_log_boundary(tmp_path, capsys, code):
+    from gfrl.official_bot import probe_failure_detail
+    unsafe = dict(cause='probe_error', command='capture', probe_error=code, exit_code=3,
+                  elapsed_seconds=1.25, raw='PRIVATE_AUTH', stderr='PRIVATE_AUTH')
+    safe = dict(cause='probe_error', command='capture', exit_code=3, elapsed_seconds=1.25)
+    if code in ('startup_failed', 'a'*64):
+        safe['probe_error'] = code
+    assert probe_failure_detail(unsafe) == safe
+    probe = FakeProbe(tmp_path)
+    def advising(result):
+        raise UIUnsupported('probe_failure', unsafe)
+    journal = Journal(private_directory(tmp_path/'log'))
+    report = run(probe, advising, journal, name='SyntheticName')
+    journal.close()
+    row = json.loads((journal.directory/'moves.jsonl').read_text())
+    assert row['detail'] == report['detail'] == safe
+    assert json.loads(capsys.readouterr().err)['detail'] == safe
+    assert probe_failure_detail(dict(cause=[], command={}, probe_error=[], exit_code=True,
+                                    elapsed_seconds=float('nan'), raw='secret')) == {}
+    assert probe_failure_detail(dict(elapsed_seconds=float('inf'))) == {}
+    assert probe_failure_detail(dict(elapsed_seconds=-1)) == {}
+    assert probe_failure_detail(dict(elapsed_seconds=10**1000)) == {}
+
+
+def test_probe_failure_exit_wait_is_bounded_without_exit_code():
+    import queue
+    import subprocess
+    from types import SimpleNamespace
+    probe = Probe.__new__(Probe)
+    probe.timeout = 40
+    probe.command = 'capture'
+    probe.sent_at = 0
+    probe.lines = queue.Queue()
+    probe.lines.put(None)
+    waits = []
+    terminations = []
+    def wait(timeout):
+        waits.append(timeout)
+        raise subprocess.TimeoutExpired('private command', timeout)
+    probe.process = SimpleNamespace(wait=wait, poll=lambda: None,
+                                    terminate=lambda: terminations.append(True))
+    with pytest.raises(UIUnsupported, match='probe_failure') as raised:
+        probe.receive()
+    assert waits == [.1, .1] and terminations == [True]
+    assert probe.broken
+    assert set(raised.value.detail) == {'cause', 'command', 'elapsed_seconds'}
+    assert raised.value.detail['cause'] == 'eof'
+
+
+def test_probe_startup_failure_reaches_main_journal_and_summary(tmp_path, monkeypatch, capsys):
+    from gfrl import official_bot as bot, evaluation
+    script = tmp_path/'startup.py'
+    script.write_text('print(\'{"error":"startup_failed","raw":"PRIVATE_AUTH"}\',flush=True)\nraise SystemExit(4)\n')
+    real_probe = Probe
+    monkeypatch.setattr(bot, 'Probe', lambda *a, **kw: real_probe([sys.executable, str(script)]))
+    monkeypatch.setattr(evaluation, 'load_policy_model', lambda *a: None)
+    out = tmp_path/'log'
+    assert bot.main(['--checkpoint', 'unused', '--playwright', 'unused', '--out-dir', str(out)]) == 1
+    streams = capsys.readouterr()
+    report = json.loads(streams.out)
+    row = json.loads((out/'moves.jsonl').read_text())
+    detail = row['detail']
+    assert detail == report['detail'] == json.loads(streams.err)['detail']
+    assert report['reason'] == row['reason'] == 'probe_failure'
+    assert set(detail) == {'cause', 'probe_error', 'exit_code', 'elapsed_seconds'}
+    assert detail['cause'] == 'probe_error' and detail['probe_error'] == 'startup_failed'
+    assert detail['exit_code'] == 4
+    assert 'PRIVATE_AUTH' not in streams.out + streams.err + json.dumps(row)
+
+
 def test_parser_sell_exact_shape_and_unknown_remains_rejected():
     parser=parser_module();g=deepcopy(GAMES[0]);g['events']=[dict(action='sell',item=dict(id=7,modelId=189))]
     assert parser.parse_prefix(frame(g),1)['games'][0]['game']['events']==g['events']

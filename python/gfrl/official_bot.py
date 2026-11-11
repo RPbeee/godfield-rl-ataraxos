@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -24,6 +25,30 @@ class ReceiveAdvanced(Exception):
         self.result = result
 
 
+PROBE_COMMANDS = frozenset(('state', 'capture', 'fillName', 'clickText', 'clickPoint', 'screenshot', 'close'))
+PROBE_CAUSES = frozenset(('timeout', 'eof', 'probe_error', 'invalid_json', 'not_object'))
+
+
+def probe_failure_detail(detail):
+    """Whitelist transport diagnostics at both the exception and log boundaries."""
+    safe = {}
+    if not isinstance(detail, dict):
+        return safe
+    for key, allowed in (('cause', PROBE_CAUSES), ('command', PROBE_COMMANDS)):
+        value = detail.get(key)
+        if isinstance(value, str) and value in allowed:
+            safe[key] = value
+    value = detail.get('probe_error')
+    if isinstance(value, str) and re.fullmatch(r'[a-z_]{1,64}', value):
+        safe['probe_error'] = value
+    if type(detail.get('exit_code')) is int:
+        safe['exit_code'] = detail['exit_code']
+    value = detail.get('elapsed_seconds')
+    if type(value) in (int, float) and 0 <= value <= sys.float_info.max and math.isfinite(value):
+        safe['elapsed_seconds'] = value
+    return safe
+
+
 class Probe:
     def __init__(self, command, timeout=30):
         self.timeout = timeout
@@ -31,12 +56,18 @@ class Probe:
                                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.lines = queue.Queue()
         self.broken = False
+        self.command = None  # Startup has no in-flight bot command.
+        self.sent_at = time.monotonic()
         def reader():
             for line in self.process.stdout:
                 self.lines.put(line)
             self.lines.put(None)
         threading.Thread(target=reader, daemon=True).start()
-        ready = self.receive()
+        try:
+            ready = self.receive()
+        except UIUnsupported:
+            self.close()
+            raise
         if ready.get('ready') is not True:
             self.broken = True
             self.process.terminate(); self.process.wait(timeout=5)
@@ -45,16 +76,41 @@ class Probe:
     def receive(self):
         try:
             line = self.lines.get(timeout=self.timeout)
-            value = json.loads(line) if line is not None else None
-            require(isinstance(value, dict) and not value.get('error'), 'probe_error')
-            return value
-        except Exception:
-            self.broken = True
+        except queue.Empty:
+            self.fail('timeout')
+        if line is None:
+            self.fail('eof')
+        try:
+            value = json.loads(line)
+        except (ValueError, TypeError):
+            self.fail('invalid_json')
+        if not isinstance(value, dict):
+            self.fail('not_object')
+        if 'error' in value:
+            self.fail('probe_error', value['error'])
+        return value
+
+    def fail(self, cause, probe_error=None):
+        self.broken = True
+        detail = dict(cause=cause, command=self.command, probe_error=probe_error,
+                      elapsed_seconds=max(0, time.monotonic()-self.sent_at))
+        # EOF can precede the process status becoming visible. Bound the wait,
+        # and capture a natural exit code before terminating a still-live probe.
+        try:
+            self.process.wait(timeout=.1)
+        except subprocess.TimeoutExpired:
             self.process.terminate()
-            raise UIUnsupported('probe_failure') from None
+            try:
+                self.process.wait(timeout=.1)
+            except subprocess.TimeoutExpired:
+                pass
+        detail['exit_code'] = self.process.poll()
+        raise UIUnsupported('probe_failure', probe_failure_detail(detail)) from None
 
     def send(self, command):
         require(not self.broken, 'probe_stopped')
+        self.command = command.get('kind')
+        self.sent_at = time.monotonic()
         try:
             self.process.stdin.write(json.dumps(command, ensure_ascii=False)+'\n')
             self.process.stdin.flush()
@@ -553,6 +609,8 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
         detail = error.detail if isinstance(error, UIUnsupported) else exception_detail(error, fixed_codes=False, local_only=False)
         if isinstance(detail, dict) and detail.get('code') == 'conflicting_update':
             detail = dict(error='ValueError', code='conflicting_update', **conflict_detail(detail))
+        if code == 'probe_failure':
+            detail = probe_failure_detail(detail)
         # Advice is an external/model boundary; a failing payload must not be
         # copied wholesale into stopped rows (even if it contains a name).
         stopped = dict(status='stopped', reason=code, detail=detail)
@@ -736,6 +794,17 @@ def main(argv=None):
                              strict_events=args.strict_events, chance_delay=args.chance_delay)
         print(json.dumps(report, ensure_ascii=False))
         return 1 if report['status'] == 'stopped' else 0
+    except UIUnsupported as error:
+        if str(error) != 'probe_failure' or journal is None:
+            print('error:official_bot_initialization_failure')
+            return 1
+        detail = probe_failure_detail(error.detail)
+        report = dict(games=0, wins=0, losses=0, draws=0, status='stopped',
+                      reason='probe_failure', detail=detail)
+        journal.write(dict(status='stopped', reason='probe_failure', detail=detail))
+        print(json.dumps(dict(reason='probe_failure', detail=detail), allow_nan=False), file=sys.stderr)
+        print(json.dumps(report, allow_nan=False))
+        return 1
     except Exception:
         print('error:official_bot_initialization_failure')
         return 1
