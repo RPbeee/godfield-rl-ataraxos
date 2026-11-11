@@ -22,6 +22,24 @@ struct TestAccess {
         for(auto& h:e.history)h=History(env.history_len);
         e.selection.reset();e.encoded=false;e.waiting=false;env.drive(0);
     }
+    static void response_root(VecEnv& env, gf::CardId model, bool fog, std::uint64_t seed) {
+        auto& e=env.envs_.at(0);
+        auto state=e.match.snapshot().state;
+        for(auto& p:state.players) {p.items.clear();p.curses.clear();p.guardian=gf::Guardian::none;}
+        state.players[0].items={{100,model,{},false},{101,19,{},false}};
+        state.players[1].items={{200,8,{},false},{201,120,{},false},{202,190,{},false}};
+        if(fog)state.players[0].curses={gf::Curse::fog};
+        const gf::Command launch{state.players[0].id,gf::CommandKind::play,{100},
+            gf::find_card(model)->hit_rate?std::nullopt:std::optional<gf::PlayerId>{state.players[1].id}};
+        for(;;++seed) {
+            e.match.load_scene(state,state.players[0].id,seed);auto trial=e.match;trial.step(launch);
+            if(trial.snapshot().phase==gf::MatchPhase::response)break;
+        }
+        for(auto& h:e.history)h=History(env.history_len);
+        e.selection.reset();e.encoded=false;e.waiting=false;env.drive(0);
+        env.before_decision(0);e.match.step(launch);env.record_decision(0,false);
+        e.selection.reset();e.encoded=false;env.drive(0);
+    }
     static void replace_hidden_hand(VecEnv& env, std::size_t row, std::uint64_t seed,
                                     std::optional<std::uint64_t> decisions) {
         auto& e=env.envs_.at(row);
@@ -115,6 +133,7 @@ NB_MODULE(_core, m) {
         .def("choose",&OfficialCursor::choose).def("command",&OfficialCursor::command);
 
     m.def("_test_danger_root", &TestAccess::danger_root);
+    m.def("_test_response_root", &TestAccess::response_root);
     m.def("_test_replace_hidden_hand", &TestAccess::replace_hidden_hand,
           "env"_a, "row"_a, "seed"_a, "decisions"_a=nb::none());
     nb::class_<gf::MatchConfig>(m, "MatchConfig")

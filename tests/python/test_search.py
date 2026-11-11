@@ -764,3 +764,43 @@ def test_response_paired_games_complete(belief_kind):
     assert agent.counts['real_mismatches'] == agent.counts['invalid_loads'] == 0
     assert agent.counts['invalid_oracle_assignments'] == 0
     assert agent.statistics()['seconds_per_search_by_root']['response'] > 0
+
+
+@pytest.mark.parametrize('kind', ['chance', 'fog', 'gamble', 'fog_gamble'])
+def test_public_chance_response_search_and_hidden_source_independence(kind):
+    from gfrl.search import search_support
+    if kind == 'chance':
+        card = next(cid for cid, c in _core.play_catalog().items()
+                    if c['hit_rate'] and c['category'] == 'weapons')
+    else:
+        card = 202 if 'gamble' in kind else 6
+    envs = [VecEnv(1, 1, track_projection=True) for _ in range(2)]
+    for env in envs:
+        _core._test_response_root(env, card, 'fog' in kind, 42)
+    root = np.array([0], np.int32)
+    _core._test_replace_hidden_hand(envs[1], 0, 1234)
+    assert search_support(envs[0], root, True).tolist() == [0]
+    assert search_support(envs[0], root, False).tolist() == [3]
+    for key in OBS_FIELDS:
+        np.testing.assert_array_equal(getattr(envs[0], key), getattr(envs[1], key))
+    agents = [SearchAgent(model(), baseline(), config=SearchConfig(search_response=True,
+              worlds=3, candidates=4, candidate_samples=16, depth=2), seed=421) for _ in range(2)]
+    choices = []
+    for agent, env in zip(agents, envs):
+        with _policy_rng(42, (agent,)):
+            choices.append(agent(env, root))
+        assert agent.counts['searched_response'] == 1
+        assert agent.counts['invalid_loads'] == 0
+    np.testing.assert_array_equal(*choices)
+    assert agents[0].last_search == agents[1].last_search
+    assert agents[0].counts == agents[1].counts
+    _core._test_response_root(envs[0], card, 'fog' in kind, 42)
+    disabled = SearchAgent(model(), baseline(), seed=421)
+    rng = disabled.rng.bit_generator.state
+    assert disabled.search(envs[0], root) == {}
+    assert disabled.rng.bit_generator.state == rng
+    with _policy_rng(42, (disabled,)):
+        choices = disabled(envs[0], root)
+    assert envs[0].mask[root, choices[root]].all()
+    assert disabled.rng.bit_generator.state == rng
+    assert disabled.counts['skip_not_main'] == disabled.counts['skip_response_disabled'] == 1

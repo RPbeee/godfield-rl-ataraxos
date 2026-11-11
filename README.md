@@ -93,6 +93,39 @@ scripts/tsubame_run.sh scripts/bench_training.py --help
 `module` があれば libstdc++ 用に `gcc/14.2.0` をロードする。
 `OMP_NUM_THREADS` は未設定なら4（指定済みならその値）を使う。
 
+## 探索予算と勝率・推論時間
+
+`sweep_search.py` は `eval_search.py` の評価処理と共通引数を使い、同じ seed の
+paired deals で、探索あり対探索なしの同一モデルを比較する。
+`--worlds` と `--depth` は直積、`--grid 16:1 32:2 64:5` は明示の組だけを評価する。
+モデル規模は checkpoint の設定から読み込む。TSUBAME で M の checkpoint を使う例:
+
+```sh
+scripts/tsubame_run.sh scripts/sweep_search.py \
+  --checkpoint runs/play/m-2166.pt --belief runs/play/belief-ar-m.pt \
+  --device cuda --threads 4 --num-envs 32 --pairs 500 --seed 0 \
+  --worlds 16 32 64 128 --depth 1 2 3 5 \
+  --search-response --leaf-view actor --beta 0.02 \
+  --candidates 16 --candidate-samples 64 --max-inference-batch 128 \
+  --out-dir measurements/search-budget-m --resume
+```
+
+設定ごとの `worlds-N_depth-D.json` は既存の評価 JSON に `decision_timing` と
+再開検証用の `sweep_inputs` を追加した形。`baseline.json` は探索なしの基準を一度測る。
+`summary.json` と `summary.md` に勝率、Wilson / ペア bootstrap 95% 区間、局数、
+探索割合、main / 応答の秒数、全決定あたりの秒数をまとめ、設定が終わるたび保存する。
+`--resume` は完成済み JSON を再利用し、未完の設定を最初から実行する。
+引数や入力ファイルのサイズ・更新時刻が変わっていれば混在を防ぐためエラーになる。
+別の出力先を使うか、`--resume` を外して再測定する。
+
+全決定の時間は評価対象側の全 Actor 呼び出しの実時間を CUDA / MPS 同期付きで合計し、
+`substep == 0` の決定数で割る。探索しない決定と全 action substep を含み、
+相手の推論・環境の step・モデル読込・レポート出力を除く。warm-up は行わず、
+初回のキャッシュ構築も含める。バッチで償却した秒数なので単一局の応答遅延とは異なる。
+探索内の main / 応答の時間は既存と同じ定義を使い、全決定の時間には追加の呼び出し境界の
+同期コストが入る。探索なしの基準も同じ測り方を使う。`--profile` は測定負荷を増やす。
+`oracle` は真の相手手札を使う診断専用。
+
 ## ターミナルで対局
 
 ```sh

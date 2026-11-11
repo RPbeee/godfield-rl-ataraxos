@@ -103,10 +103,17 @@ void worlds() {
     check(root.substep[0]>0 && root.determinize_support(row)[0]==-1,"partial decision accepted");
     a.load_worlds(root,row,assignment,seed);check(a.world_status[0]==2 && a.episode_done[0],"unsupported root moved");
 }
-void response_worlds() {
-    auto m=scene({6,7,235},{8,8,120});
+void response_worlds(gf::CardId model=6, bool fog=false) {
+    auto m=scene({model,7,235},{8,190,120});
+    auto state=m.snapshot().state;
+    if(fog) state.players[0].curses={gf::Curse::fog};
+    const gf::Command launch{0,gf::CommandKind::play,{100},gf::find_card(model)->hit_rate?std::nullopt:std::optional<gf::PlayerId>{1}};
+    for(std::uint64_t seed=0;;++seed) {
+        m.load_scene(state,0,seed);auto trial=m;trial.step(launch);
+        if(trial.snapshot().phase==gf::MatchPhase::response) break;
+    }
     auto root=projection_root(),other=projection_root();TestAccess::inject(root,m);
-    TestAccess::accept(root,{0,gf::CommandKind::play,{100},1});TestAccess::drive(root);
+    TestAccess::accept(root,launch);TestAccess::drive(root);
     check(root.match(0).snapshot().phase==gf::MatchPhase::response,"response fixture");
     check(root.determinize_support(row)[0]==0,"response unsupported");
     // Inflate the hidden allocator, hand, and RNG while keeping the public root.
@@ -128,7 +135,7 @@ void response_worlds() {
     };
     check(strip(a.match(0).snapshot())==strip(c.match(0).snapshot()),"response assignment leaked beyond unused models");
     const auto& snap=a.match(0).snapshot();
-    check(snap.rng==42 && snap.batch->rng==42 && snap.queue.front().redirect_rng==42,"response RNG not reset");
+    check(snap.queue.front().redirect_rng==snap.rng,"response RNG not reconstructed");
     check(TestAccess::chance(a)!=TestAccess::chance(root),"response chance copied");
     auto bad=sample;bad[card_code(6)]=18;bool rejected=false;
     try{(void)root.unused_assignment(0,bad);}catch(const std::invalid_argument&){rejected=true;}
@@ -302,4 +309,6 @@ void measurement(bool evaluation=false) {
     std::cout<<"varied self-play worlds="<<loaded<<"\n";
     std::cout<<"used-card measurement: positions="<<positions<<" with_used="<<with_used<<" fraction="<<double(with_used)/positions<<" mean="<<double(used)/positions<<" conditional_mean="<<double(used)/with_used<<"\n";
 }
-int main(){try{worlds();response_worlds();response_conversion();private_history();conversion();projection();tracking_disabled();measurement();measurement(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{worlds();response_worlds();response_worlds(6,true);response_worlds(202);response_worlds(202,true);
+    for(const auto& card:gf::catalog()) if(gf::match_supported(card.id) && card.hit_rate && card.gift_rate && card.category==gf::Category::weapons) response_worlds(card.id);
+    response_conversion();private_history();conversion();projection();tracking_disabled();measurement();measurement(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -103,7 +103,10 @@ API behavior. Doing this inside `determinized` avoids post-hoc editing of a
 replay proof and also avoids allocation from a discarded source `next_token`.
 Own slots and used objects are unchanged. Chance RNG is SplitMix64 of
 `seed ^ 0xa4093822299f31d0`; Match RNG and the response anchor/redirect RNG use
-`seed` directly. No source RNG or row index enters either stream.
+`seed` directly for deterministic launches. For public chance response launches,
+goodfield conditions a fresh launch stream on the visible hit/sign and consumes
+its launch draws; anchor/current/redirect RNG can therefore differ from `seed`.
+No source RNG or row index enters either stream.
 
 ### Opt-in response roots
 
@@ -347,3 +350,62 @@ a speed comparison. AR invalid samples were rejected/resampled (16,195 / 13,930)
 no invalid world reached rollout. Reports are in
 `runs/response-search-smoke/{disabled,enabled}.json` with exact CLI arguments,
 phase timings and counters. The small game sample is a completion check only.
+
+### Public chance response roots (2026-11-11)
+
+`--search-response` now also admits ordinary percentage hits, two-player Fog
+single-target launches, and 202 HP-gamble launches. No new option or reason code
+is needed: `_SUPPORT` already maps the engine's reasons 11–13. The support and
+world-loading paths delegate to the extended engine. Pending percentage attacks
+publicly imply a hit; the Fog target is public and unique; 202's signed amount
+is public in the pending observation. The engine conditions a fresh RNG on
+these facts and replays the journal with full observation/decision/inventory/
+legal-kind equality checks. Danger (including Wide), bounce and resolved-body
+histories remain outside this subset. See goodfield's `docs/determinization.md`
+for the information audit and fixed-policy coverage counts.
+
+The unchanged main-only exact fixtures pass. For an additional direct engine
+comparison, the pre-change `official_match.cpp` was compiled into
+`build/baseline/libgodfield.dylib` using this worktree's other engine objects.
+Running `measurements/compare_roots.py` with that library selected through
+`DYLD_LIBRARY_PATH`, and again with the current engine, gives exact JSON equality
+(choices, candidate values, probabilities and integer counters) for all six
+main-only fixtures, and for enabled main/ordinary-response fixtures. Only the
+four new enabled fixtures (percentage, Fog, 202, Fog+202) change support 12→0
+and begin searching. Artifacts: `measurements/roots-{before,after}.json` and
+`measurements/comparison.json`.
+
+Release validation: parent CTest 17/17, goodfield CTest 166/166, Python 262
+passed / 1 skipped. This worktree uses a local `.venv` symlink to the supplied
+read/execute-only venv so the existing TSUBAME-wrapper test resolves its expected
+interpreter path. No dependencies were installed.
+
+CPU paired evaluation used the supplied M policy `m-2166.pt` and AR belief
+`belief-ar-m.pt`, both read only, against the same policy: 20 pairs (40 games),
+seed 0, 8 environments, 4 threads, 8 worlds, depth 3, 8 candidates / 32 samples,
+alpha .002, beta .1, actor leaves, response search enabled. Exact arguments and
+raw reports are in `measurements/chance-{before,after}.json`.
+
+| Counter | Before | After |
+| --- | ---: | ---: |
+| Searcher decisions | 1,025 | 1,084 |
+| Searched | 709 (69.1707%) | 917 (84.5941%) |
+| Searched main | 535 | 648 |
+| Searched response | 174 | 269 |
+| skip_not_main (purchase etc.) | 41 | 36 |
+| skip_not_actor | 29 | 20 |
+| skip_hidden_status | 31 | 21 |
+| skip_hidden_own_model | 185 | 76 |
+| skip_response_random | 28 | 9 |
+| skip_response_special | 0 | 4 |
+| skip_response_history | 2 | 1 |
+| Invalid loads / real mismatches | 0 / 0 | 0 / 0 |
+
+The enabled new searches change subsequent game trajectories, so other main
+and skip counts also change. This aggregate increase is a smoke measurement,
+not a causal estimate of coverage or strength. The identical-trajectory 1,000
+game engine comparison isolates eligibility: response support 5,204/7,339 →
+5,843/7,339 (70.9088% → 79.6158%), response_random 784 → 71, with all main
+counts unchanged. The direct root comparison above separately proves that
+previously supported root outputs and disabled-response outputs stay exact.
+No strength conclusion is drawn from the 20 pairs.
