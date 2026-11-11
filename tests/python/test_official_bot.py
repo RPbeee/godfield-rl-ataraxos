@@ -1518,8 +1518,8 @@ def test_chance_wait_refreshes_and_redecides_on_new_receive(tmp_path, settle_clo
     assert not any(c['kind'] == 'clickPoint' for c in probe.commands)
 
 
-UNKNOWN_EVENTS = [dict(action='removeItems', items=[]),
-                  dict(action='dealDarkDamage', damage=7),
+UNKNOWN_EVENTS = [dict(action='removeItems', items=None),
+                  dict(action='dealDarkDamage', damage=True),
                   dict(action='hit', index=0)]
 
 

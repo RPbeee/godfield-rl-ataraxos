@@ -54,6 +54,9 @@ def test_guardian_native_observations_and_masks():
         pending=n['view']['pending']
         if pending:
             g['attacks'][0]['guardian']=pending['guardian']
+            # An explicit received rate must preserve the native observation
+            # and every response prefix, including chance guardian payloads.
+            g['attacks'][0]['hitRate']=pending['hit_rate']
             if pending['models'][0] in (187,188,202):
                 g['attacks'][0]['atk']=pending['amount']
             elif pending['models'][0]==58:

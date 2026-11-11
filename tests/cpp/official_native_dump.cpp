@@ -68,6 +68,25 @@ void official_observe(const gf::Match& match) {
     }
 }
 int main(int argc, char** argv) {
+    if(argc==3 && std::string_view(argv[1])=="--received-effects") {
+        const auto scenario=std::string_view(argv[2]);
+        gf::SnapshotState state;state.gf=1;
+        gf::PlayerState a;a.id=0;a.items={{0,64,{},false}};
+        gf::PlayerState b;b.id=7;b.items={{0,208,{},false},{1,130,{},false}};
+        if(scenario=="heaven") {a.curses={gf::Curse::heaven};a.items={{0,130,{},false}};}
+        state.players={a,b};unsigned seed=0;
+        if(scenario=="heaven")for(;;++seed) {
+            gf::Match trial;trial.load_scene(state,0,seed);trial.step({0,gf::CommandKind::pray,{},{}});
+            if(trial.snapshot().last_tick && trial.snapshot().last_tick->fallen)break;
+        }
+        gf::Match match;match.load_scene(state,0,seed);official_observe(match);
+        if(scenario=="heaven")match.step({0,gf::CommandKind::pray,{},{}});
+        else {
+            match.step({0,gf::CommandKind::play,{0},7});official_observe(match);
+            match.step({7,gf::CommandKind::defend,{},{}});
+        }
+        official_observe(match);return 0;
+    }
     if(argc==2 && std::string_view(argv[1])=="--guardian-decisions") {
         const auto compare=[](const gf::Match& match) {
             auto v=match.view(*match.snapshot().actor);

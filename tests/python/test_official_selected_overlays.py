@@ -1,0 +1,166 @@
+"""Offline synthetic scenes using only auto52's public image paths/rectangles.
+
+No receipt, name, screenshot, or redacted state is a fixture. The observed
+orange icon/card is Dream, not Flash; Flash is tested independently below.
+"""
+from collections import Counter
+from copy import deepcopy
+
+import numpy as np
+import pytest
+
+from gfrl.official import OfficialDecision
+from gfrl.official_ui import (PATHS, UIUnsupported, card_detail, execute,
+                              hand_images, point, prepare, ready, selected,
+                              verify, verify_attack)
+from test_official_bot import action, results
+
+FAKE = '/images/items/fake.webp'
+
+
+def image(path, x, y, w=80, h=80):
+    return dict(path=path, x=x, y=y, w=w, h=h)
+
+
+def dream_scene(flash=False):
+    p = deepcopy(results()[2]['public'])
+    p['gf'] = 36
+    own = next(r for r in p['players'] if r['id'] == p['viewer'])
+    own['status']['curses'] = ['fog', 'dream'] + (['flash'] if flash else [])
+    other = next(r for r in p['players'] if r['id'] != p['viewer'])
+    other.update(status=None, fogged=True)
+    # All twelve observed hand faces and positions, with synthetic item IDs.
+    faces = [('weapons/saver-rod',190,493,True),
+             ('weapons/bouncing-sword',272,493,True),
+             ('weapons/unknown-feather',354,493,True),
+             ('weapons/reflection-sword',436,493,True),
+             ('armor/ogre-s-helm',518,493,True),
+             ('armor/steel-armor',600,493,False),
+             ('armor/angel-shield',682,493,False),
+             ('sundries/smile-shell',764,493,True),
+             ('sundries/sun-amulet',846,493,False),
+             ('miracles/waterfall',190,595,False),
+             ('miracles/dream',272,595,False),
+             ('miracles/fog',846,595,False)]
+    models = {path: model for model, path in PATHS.items()}
+    p['hand'] = []; images = []
+    for i, (face, x, y, disguised) in enumerate(faces):
+        path = f'/images/items/{face}.webp'
+        p['hand'].append(dict(id=100+i, face=models[path], used=i == 11,
+                              disguised=disguised))
+        images.append(image(path, x, y))
+        if disguised:
+            images.append(image(FAKE, x, y))
+    images += [image('/images/screens/room.webp',180,38,1080,660),
+               image('/images/screens/fog.webp',180,38,1080,660),
+               image('/images/curses/small/fog.webp',1083,288,30,16),
+               image('/images/curses/small/dream.webp',1141,288,30,16),
+               image('/images/items/trade/discard.webp',846,405),
+               image(PATHS[199],955,463)]
+    if flash:
+        images.append(image('/images/curses/small/flash.webp',1112,288,30,16))
+    s = dict(body=f"G.F.36\nHP {own['status']['hp']} MP {own['status']['mp']} ¥ {own['status']['cp']}",
+             images=images, inputs=[], targetArrow=None,
+             texts=[dict(text='SyntheticName',x=320,y=60,w=60,h=20),
+                    dict(text='SyntheticName',x=870,y=270,w=90,h=20)],
+             fogBands=[dict(x=860,y=131,w=340,h=40)])
+    return p, s, action(p,'play',[199],target=p['viewer'])
+
+
+@pytest.mark.parametrize('flash', [False, True])
+def test_dream_selection_overlay_executes_once(flash):
+    p, s, a = dream_scene(flash)
+    ready(s,p,'SyntheticName')
+    assert len(hand_images(s)) == len(p['hand']) == 12
+    with pytest.raises(UIUnsupported, match='ambiguous_disguised_face'):
+        prepare(s,p,a,'SyntheticName')
+    commands = []
+    class Probe:
+        def send(self, command):
+            if command == point(804,533):
+                s['images'] += [image(PATHS[199],205,103),image(FAKE,205,103)]
+            return dict(state=deepcopy(s))
+    plan = execute(Probe(),s,p,a,'SyntheticName',commands=commands,
+                   dream_last_resort=True,settle_timeout=0)
+    assert commands == [point(804,533),point(350,193)]
+    assert selected(s,350) == Counter({PATHS[199]:1})
+    assert plan['attempted'] == [dict(path=PATHS[199],x=804,y=533)]
+
+
+@pytest.mark.parametrize('bad', ['wrong','extra','duplicate','missing','unknown','overlay_only'])
+def test_real_selection_mismatch_still_stops(bad):
+    p, s, a = dream_scene()
+    plan = prepare(s,p,a,'SyntheticName',dream_last_resort=True)
+    paths = {'wrong':[PATHS[200]], 'extra':[PATHS[199],PATHS[200]],
+             'duplicate':[PATHS[199],PATHS[199]], 'missing':[],
+             'unknown':[PATHS[199],'/images/items/unknown.webp'], 'overlay_only':[]}[bad]
+    s['images'] += [image(path,205+82*i,103) for i,path in enumerate(paths)]
+    s['images'].append(image(FAKE,205,103))
+    with pytest.raises(UIUnsupported,match='selected_cards_mismatch'):
+        verify(s,p,'SyntheticName',plan,{PATHS[199]:1})
+    if bad == 'unknown':
+        assert card_detail({},selected(s,350))['actual']['?'] == 1
+
+
+@pytest.mark.parametrize('pane', [350,690])
+def test_selected_faces_use_item_paths_size_and_pane_geometry(pane):
+    x = pane-145
+    s = dict(images=[image(PATHS[199],x,103),image(FAKE,x,103),
+                     image('/images/curses/flash.webp',x,103),
+                     image('/images/screens/fog.webp',x,103),
+                     image(PATHS[200],x-1,103),image(PATHS[200],pane+66,103),
+                     image(PATHS[200],x,493),image(PATHS[200],x,103,30,16),
+                     image(PATHS[200],1040-pane-145,103)])
+    assert selected(s,pane) == Counter({PATHS[199]:1})
+
+
+def test_fog_attack_overlay_keeps_exact_face_check():
+    p, s, _ = dream_scene()
+    p['pending'] = dict(models=[199])
+    s['images'] += [image(PATHS[199],545,103),image(FAKE,545,103)]
+    verify_attack(s,p,350)
+    s['images'].append(image(PATHS[200],627,103))
+    with pytest.raises(UIUnsupported,match='visible_attack_mismatch'):
+        verify_attack(s,p,350)
+
+
+@pytest.mark.parametrize('bad', ['missing','extra','unknown'])
+def test_hand_overlay_does_not_hide_real_mismatches(bad):
+    p, s, _ = dream_scene()
+    if bad == 'missing':
+        s['images'].remove(next(r for r in s['images'] if r['path']==PATHS[199] and r['x']==764))
+    else:
+        s['images'].append(image(PATHS[199] if bad=='extra' else '/images/items/unknown.webp',354,595))
+    with pytest.raises(UIUnsupported,match='visible_hand_mismatch'):
+        ready(s,p,'SyntheticName')
+
+
+@pytest.mark.parametrize('flash', [False,True])
+def test_flash_response_limits_second_card_including_free(flash):
+    # goodfield/docs/official-execution-subset.md: Flash is checked before FREE.
+    p = deepcopy(results()[1]['public'])
+    own = next(r for r in p['players'] if r['id']==p['viewer'])
+    own['status']['curses'] = ['flash'] if flash else []
+    p['pending'].update(models=[6],power=1,element=None,category='weapons')
+    p['hand'] = [dict(id=100+i,face=m,used=False,disguised=False)
+                 for i,m in enumerate((233,204))]  # Wall followed by FREE doll
+    env = OfficialDecision(p)
+    assert env.mask[0,0]
+    env.step(np.array([0],np.int32))
+    if flash:
+        assert env.complete
+        assert env.semantic_action()['cards'] == [dict(item_id=100,model=233)]
+    else:
+        assert not env.complete and env.mask[0,1]
+
+
+@pytest.mark.parametrize('flash', [False,True])
+def test_flash_does_not_limit_main_turn_to_one_card(flash):
+    p = deepcopy(results()[2]['public'])
+    own = next(r for r in p['players'] if r['id']==p['viewer'])
+    own['status']['curses'] = ['flash'] if flash else []
+    p['hand'] = [dict(id=100+i,face=m,used=False,disguised=False)
+                 for i,m in enumerate((6,7))]
+    env = OfficialDecision(p)
+    env.step(np.array([0],np.int32))
+    assert not env.complete and env.mask[0,1]

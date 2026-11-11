@@ -43,6 +43,7 @@ DECISION_ONLY_UNSUPPORTED = frozenset({
     'dynamic_attack_value_unavailable', 'earth_moon_payload',
     'redirect_chance_activation_unavailable',
     'dying_players_decision_unavailable',
+    'dynamic_hit_rate_unavailable', 'death_attack_decision_unavailable',
 })
 
 
@@ -204,7 +205,7 @@ def project_game(game, viewer, *, prior=None):
                 # Commodity contents are released only to the receiving viewer.
                 if sale_target == viewer:
                     e['face'] = _face(event['item'])
-                if 'overflowItem' in event:
+                if event.get('overflowItem') is not None:
                     item = event['overflowItem']
                     # Fanout of foreign unused eviction truth is unverified.
                     e['overflow_used'] = item['used']
@@ -213,6 +214,14 @@ def project_game(game, viewer, *, prior=None):
                         e['overflow_model'] = _face(item)
                     if item.get('fakeModelId'):
                         e['overflow_unobserved'] = True
+        elif action == 'revive':
+            # ks.k displays the consumed item (including a fake flip) to all.
+            # No instance ID or other inventory entry crosses this boundary.
+            item = event['item']
+            e.update(model=_integer(item['modelId'], 1, 296), face=_face(item))
+        elif action in ('counterAttack', 'selfCurse'):
+            if 'index' in event:
+                e['index'] = _integer(event['index'], 0, 17)
         elif action in ('gift', 'replaceItems'):
             if event.get('playerId') == viewer:
                 e['faces'] = [_face(i) for i in ([event['item']] if action == 'gift' else event.get('items', [])) if i.get('modelId')]
@@ -228,7 +237,7 @@ def project_game(game, viewer, *, prior=None):
         elif action in ('nextAttack', 'attackByGuardian'):
             a = event['attack']
             e['attack'] = {k: deepcopy(a[k]) for k in ('playerId', 'targetPlayerId', 'itemModelIds', 'atk', 'guardian', 'reversed') if k in a}
-        elif action in ('dealDamage', 'boostHP', 'boostMP', 'exchange', 'takeCP', 'boostCP', 'boostCPOfEverybody'):
+        elif action in ('dealDamage', 'dealDarkDamage', 'boostHP', 'boostMP', 'exchange', 'takeCP', 'boostCP', 'boostCPOfEverybody'):
             for key in ('damage', 'hp', 'mp', 'cp'):
                 if key in event:
                     e[key] = _integer(event[key], -9007199254740991)
@@ -247,7 +256,7 @@ def project_game(game, viewer, *, prior=None):
         elif action == 'phenomenon':
             e['model'] = event['itemModelId']
         elif action not in ('startGame', 'advanceGF', 'setTargetPlayer', 'disease', 'die', 'endGame',
-                             'safe', 'block', 'selfCurse', 'redraw', 'counterAttack', 'reflect', 'bounce', 'danger', 'miss', 'hit', 'removeGuardian', 'pray'):
+                             'safe', 'block', 'upgradeHeaven', 'collectCPOfEverybody', 'redraw', 'reflect', 'bounce', 'danger', 'miss', 'hit', 'removeGuardian', 'pray'):
             out['unsupported'].append('unknown_event')
             if isinstance(action, str) and action in parser_module().GAME_STRINGS:
                 out['detail'].append(dict(code='unknown_event', action=action))
@@ -292,6 +301,22 @@ def project_game(game, viewer, *, prior=None):
                     out['pending']['amount'] = _integer(a['atk'], -9007199254740991)
             if models[0] in (4, 5):
                 out['pending']['power'] = 0
+            # p6/fu/gf2 display a positive DTO rate, otherwise the catalog rate.
+            # The Match-view adapter reconstructs catalog rates only. A display
+            # override is not proof of a native activation/death/redirect state.
+            catalog_rate = _core.play_catalog()[models[0]]['hit_rate']
+            rate = _integer(a['hitRate'], 0, 100) if 'hitRate' in a else 0
+            if rate > 0 and rate != catalog_rate:
+                out['unsupported'].append('dynamic_hit_rate_unavailable')
+                out['detail'].append(dict(code='dynamic_hit_rate_unavailable',
+                    models=models, hit_rate=rate, catalog_hit_rate=catalog_rate,
+                    reason='native_pending_uses_catalog_hit_rate'))
+            # Native death bows carry both rate=75 and death=true. Neither a
+            # 30-power DTO nor a 75% label establishes that execution provenance.
+            if models[0] == 112 and (a.get('atk', 0) == 30 or rate == 75):
+                out['unsupported'].append('death_attack_decision_unavailable')
+                out['detail'].append(dict(code='death_attack_decision_unavailable',
+                    models=models, reason='native_death_state_not_reconstructible'))
             if a.get('buyingItemModelId'):
                 out['phase'] = 3; out['actor'] = source; out['pending'] = None
                 out['purchase'] = dict(origin=source, buyer=source, seller=target,
@@ -454,6 +479,29 @@ class OfficialSession:
             elif kind == 'bounce' and launch:
                 launch['bounces'] += 1
                 self.history_complete = False  # target must be explicitly witnessed
+            elif kind == 'dealDarkDamage':
+                # Receiver ignores damage and zeroes the current pane. Death,
+                # guardian departure and revival are separate public events.
+                s = pane(target)
+                if action is None or s is None:
+                    self.history_complete = False
+                if s is not None:
+                    s['hp'] = 0
+            elif kind == 'revive':
+                # There is no native revival token. A plain 208 consumption
+                # contributes through the separate boostHP/decision delta.
+                # Disguised consumption needs a native Reveal journal too.
+                if action is None or e['model'] != 208 or e['face'] != e['model']:
+                    self.history_complete = False
+            elif kind == 'upgradeHeaven':
+                # cl is an animation only, not a disease/HP/dead mutation.
+                if action is None:
+                    self.history_complete = False
+            elif kind == 'collectCPOfEverybody':
+                # Native 294 is an external phenomenon decision, with its own
+                # source and journal. This marker alone cannot recover that
+                # anchor (or event-time fogged CP). Keep the public recipient.
+                self.history_complete = False
             elif kind in ('dealDamage', 'boostHP', 'boostMP'):
                 s = pane(e.get('player', target))
                 if s is not None:
@@ -516,16 +564,17 @@ class OfficialSession:
                     self.history_complete = False
             elif kind in ('removeItems', 'removeUsedMiracles'):
                 model = 205 if kind == 'removeItems' else 206
+                recipient = e.get('player', target)
                 if action is None or e['models'] != e['faces']:
                     self.history_complete = False
                 if launch and removal_model == model:
                     working['removal'] = dict(origin=launch['origin'], source=launch['source'],
-                                              target=e['player'], model=model, models=e['models'])
+                                              target=recipient, model=model, models=e['models'])
                 else:
                     # A midgame receipt cannot identify the origin/source from
                     # the recipient alone. Keep the public result, omit history.
                     self.history_complete = False
-                player = next(x for x in working['players'] if x['id'] == e['player'])
+                player = next(x for x in working['players'] if x['id'] == recipient)
                 if kind == 'removeUsedMiracles':
                     for face in e['faces']:
                         if face in player['used']:
@@ -547,7 +596,7 @@ class OfficialSession:
                 for x in working['players']:
                     if x['id'] == e['player']:
                         x['dead'] = True
-            elif kind in ('gift', 'replaceItems', 'startGame', 'safe', 'block', 'danger', 'miss', 'hit', 'counterAttack', 'disease'):
+            elif kind in ('gift', 'replaceItems', 'startGame', 'safe', 'block', 'danger', 'miss', 'hit', 'counterAttack', 'selfCurse', 'disease'):
                 pass
             elif kind in ('addCurse', 'removeCurses', 'setGuardian', 'setCurseOfEverybody'):
                 # Event-time fog changes need a full visibility journal. Do not

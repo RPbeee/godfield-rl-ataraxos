@@ -57,9 +57,15 @@ def point(x, y):
     return dict(kind='clickPoint', x=x, y=y)
 
 
+def is_card_face(image):
+    # Dream's fake.webp is an overlay on a face, including in selected panes.
+    # Keep unknown item paths: they must still fail the exact card comparison.
+    return (image['path'].startswith('/images/items/')
+            and image['path'] != '/images/items/fake.webp')
+
+
 def hand_images(state):
-    return sorted([r for r in state['images'] if r['path'].startswith('/images/items/')
-                   and r['path'] != '/images/items/fake.webp'
+    return sorted([r for r in state['images'] if is_card_face(r)
                    and r['w'] == r['h'] == 80
                    and 180 <= r['x'] and r['x']+r['w'] <= 930
                    and 480 <= r['y'] and r['y']+r['h'] <= 700], key=lambda r: (r['y'], r['x']))
@@ -130,7 +136,7 @@ def verify_switched_target(state, public, action, name, x):
 
 
 def selected_images(state, x):
-    return [r for r in state['images'] if r['path'].startswith('/images/items/')
+    return [r for r in state['images'] if is_card_face(r)
             and r['w'] == r['h'] == 80 and x-145 <= r['x']
             and r['x']+r['w'] <= x+145 and 0 <= r['y'] < 480]
 

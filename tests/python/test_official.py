@@ -336,7 +336,8 @@ def received_scene(n, update, events):
                 attackTurnPlayerId=view['owner'], events=events, attacks=attacks)
 
 
-def test_received_removals_native_observation_masks_and_history():
+@pytest.mark.parametrize("implicit_recipient", [False, True])
+def test_received_removals_native_observation_masks_and_history(implicit_recipient):
     from gfrl.official import parser_module
     output = subprocess.run([str(ROOT/'build/gfrl_official_native_dump'), '--removals'],
                             capture_output=True, text=True, check=True).stdout
@@ -354,6 +355,8 @@ def test_received_removals_native_observation_masks_and_history():
             event = dict(action='removeItems' if model == 205 else 'removeUsedMiracles', playerId=7,
                          items=[dict(id=200+i, modelId=m, fakeModelId=0, used=model==206)
                                 for i, m in enumerate(removed)])
+            if implicit_recipient and model == 205:
+                event.pop('playerId')
             game = received_scene(final, 3, [dict(action='useDefenseItems', items=[]), event,
                                             dict(action='advanceGF', playerId=7)])
             clean = parser_module().sanitize_game(game, viewer)

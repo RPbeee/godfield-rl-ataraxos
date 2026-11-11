@@ -40,8 +40,12 @@ def test_nonempty_dying_stops_only_at_own_decision(response, own_decision):
     assert 'env' not in result
     assert result['public']['dying_players'] == [2]
     assert result['public']['players'][1]['dead'] is False
-    assert result['detail'] == [dict(code='dying_players_decision_unavailable',
+    expected = [dict(code='dying_players_decision_unavailable',
         phase=int(response), dying_players=[2], reason='native_death_state_not_reconstructible')]
+    if response:
+        expected.insert(0, dict(code='death_attack_decision_unavailable', models=[112],
+                               reason='native_death_state_not_reconstructible'))
+    assert result['detail'] == expected
     assert session.ingest(game)['status'] == 'duplicate'
     # A later authoritative update clears the transitional metadata; do not
     # carry a sticky unsupported reason into the next usable decision.
