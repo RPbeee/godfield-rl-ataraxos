@@ -571,13 +571,16 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 target=a.get('target') if type(a.get('target')) is int else None)
             if recorded_advice.get('dream_last_resort') is True:
                 stopped['dream_last_resort'] = True
-                stopped['warnings'] = ['dream_actual_execution_not_verified_from_public_faces']
+                stopped['warnings'] = [r for r in recorded_advice.get('warnings', [])
+                    if isinstance(r, str) and r in (
+                        'dream_actual_execution_not_verified_from_public_faces', 'ambiguous_disguised_face')]
             for key in ('confirm_method', 'fallback_samples', 'selection_exhausted'):
                 if key in current_record:
                     stopped[key] = current_record[key]
             if isinstance(recorded_advice.get('mask_exclusions'), list):
                 stopped['mask_exclusions'] = [dict(reason=e.get('reason') if e.get('reason') in (
                     'dream_actual_execution_not_verified_from_public_faces',
+                    'ambiguous_disguised_face',
                     'danger_wide_requires_unobservable_mortar_absence') else 'unsupported_card',
                     item_ids=[i for i in e.get('item_ids', []) if type(i) is int])
                     for e in recorded_advice['mask_exclusions'] if isinstance(e, dict) and isinstance(e.get('item_ids'), list)]

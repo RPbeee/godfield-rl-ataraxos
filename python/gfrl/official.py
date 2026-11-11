@@ -830,6 +830,9 @@ class OfficialDecision:
             reasons.append('danger_wide_requires_unobservable_mortar_absence')
         if any(h['disguised'] for h in selected):
             reasons.append('dream_actual_execution_not_verified_from_public_faces')
+        disguised_faces = {h['face'] for h in self.public['hand'] if h['disguised']}
+        if any(not h['disguised'] and h['face'] in disguised_faces for h in selected):
+            reasons.append('ambiguous_disguised_face')
         return reasons
 
     def semantic_action(self):

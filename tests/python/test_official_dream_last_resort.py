@@ -7,12 +7,70 @@ import pytest
 
 from gfrl.model import OBS_FIELDS
 from gfrl.official import OfficialDecision, OfficialSession
-from gfrl.official_advisor import DREAM_REASON, advise_supported
+from gfrl.official_advisor import AMBIGUOUS_REASON, DREAM_REASON, advise, advise_supported
 from gfrl.official_bot import Journal, private_directory, run
 from gfrl.official_ui import UIUnsupported, prepare
 from test_official_bot import FakeProbe, GAMES, advisor, results, visible
 from test_official_live_fixes import PreferFirst
 from test_official_unobserved_kinds import PreferUnobserved
+
+
+def test_real_card_sharing_disguised_public_face_is_excluded():
+    p = deepcopy(results()[2]['public'])
+    p['hand'] = [dict(id=18, face=200, used=False, disguised=False),
+                 dict(id=99, face=200, used=False, disguised=True),
+                 dict(id=100, face=6, used=False, disguised=False)]
+    position = lambda: dict(env=OfficialDecision(p), history_complete=False)
+    initial = advise(position(), PreferFirst())
+    assert initial['action']['cards'] == [dict(item_id=18, model=200)]
+    assert initial['unsupported'] == [AMBIGUOUS_REASON]
+    advice = advise_supported(position(), PreferFirst())
+    assert advice['status'] == 'advice' and advice['unsupported'] == []
+    assert advice['action']['cards'] == [dict(item_id=100, model=6)]
+    assert dict(reason=AMBIGUOUS_REASON, item_ids=[18]) in advice['mask_exclusions']
+    assert dict(reason=DREAM_REASON, item_ids=[99]) in advice['mask_exclusions']
+    assert not advice.get('dream_last_resort')
+
+
+@pytest.mark.parametrize('search', [False, True])
+def test_ambiguous_real_card_reaches_last_resort(search):
+    p = deepcopy(results()[2]['public'])
+    p['hand'] = [dict(id=18, face=6, used=False, disguised=False),
+                 dict(id=99, face=6, used=False, disguised=True)]
+    actor = PreferFirst()
+    class Search:
+        def __init__(self): self.actor = actor
+        def __call__(self, env, rows): return actor(env, rows)
+    advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False),
+                              Search() if search else actor, search=search)
+    assert advice['status'] == 'advice' and advice['unsupported'] == []
+    assert advice['dream_last_resort'] and AMBIGUOUS_REASON in advice['warnings']
+    assert DREAM_REASON not in advice['warnings']
+    assert advice['action']['cards'] == [dict(item_id=18, model=6)]
+    assert dict(reason=AMBIGUOUS_REASON, item_ids=[18]) in advice['mask_exclusions']
+    with pytest.raises(UIUnsupported, match=AMBIGUOUS_REASON):
+        prepare(visible(p), p, advice['action'], 'SyntheticName')
+    assert prepare(visible(p), p, advice['action'], 'SyntheticName', dream_last_resort=True)['cards']
+
+
+def test_ambiguity_only_exhaustion_restores_real_card(monkeypatch):
+    from gfrl import official_advisor
+    p = deepcopy(results()[2]['public'])
+    p['hand'] = [dict(id=18, face=6, used=False, disguised=False),
+                 dict(id=99, face=6, used=False, disguised=True)]
+    position = dict(env=OfficialDecision(p), history_complete=False)
+    exhausted = advise(position, PreferFirst())
+    exhausted.update(selection_exhausted=True,
+                     mask_exclusions=[dict(reason=AMBIGUOUS_REASON, item_ids=[18])])
+    original = official_advisor._advise_supported
+    def recover(result, agent, **kwargs):
+        # Exercise the recovery boundary with no DREAM_REASON exclusion.
+        return original(result, agent, **kwargs) if kwargs.get('allow_dream') else exhausted
+    monkeypatch.setattr(official_advisor, '_advise_supported', recover)
+    advice = advise_supported(position, PreferFirst())
+    assert advice['status'] == 'advice' and advice['unsupported'] == []
+    assert advice['dream_last_resort'] and AMBIGUOUS_REASON in advice['warnings']
+    assert advice['action']['cards'] == [dict(item_id=18, model=6)]
 
 
 @pytest.mark.parametrize('response', [False, True])
@@ -77,11 +135,15 @@ def test_dream_never_restores_discard_even_when_policy_prefers_it():
 
 
 @pytest.mark.parametrize('reject', [False, True])
-def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject):
+@pytest.mark.parametrize('ambiguous', [False, True])
+def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject, ambiguous):
     games = deepcopy(GAMES)
     # One apparent weapon with a different actual miracle. No non-card main
     # command is legal, so the bot must select the visible weapon as a last resort.
     games[2]['players'][0]['items'] = [dict(id=99, modelId=218, fakeModelId=6, used=False)]
+    if ambiguous:
+        games[2]['players'][0]['items'].insert(0, dict(id=18, modelId=6, used=False))
+    reason = AMBIGUOUS_REASON if ambiguous else DREAM_REASON
     games[2]['players'][0].setdefault('curses', []).append('dream')
     class Probe(FakeProbe):
         def send(self, command):
@@ -106,13 +168,15 @@ def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject):
     assert row['dream_last_resort']
     if reject:
         assert report['reason'] == 'acceptance_timeout' and not row['accepted']
-        assert DREAM_REASON in row['warnings']
+        assert reason in row['warnings']
+        assert dict(reason=reason, item_ids=[18 if ambiguous else 99]) in row['mask_exclusions']
         assert not any(p['update'] > 3 for p in observed)
     else:
         assert report['status'] == 'complete' and row['accepted']
         assert row['received_update'] == 4
-        assert row['advice']['dream_last_resort'] and DREAM_REASON in row['advice']['warnings']
-        assert row['advice']['action']['cards'] == [dict(item_id=99, model=6)]
+        assert row['advice']['dream_last_resort'] and reason in row['advice']['warnings']
+        assert row['advice']['unsupported'] == []
+        assert row['advice']['action']['cards'] == [dict(item_id=18 if ambiguous else 99, model=6)]
         received = next(p for p in observed if p['update'] == 4)
         session = OfficialSession(1)
         expected = [session.ingest(g) for g in games[:4]][-1]['public']

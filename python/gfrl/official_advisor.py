@@ -158,18 +158,20 @@ def main(argv=None):
 
 
 DREAM_REASON = 'dream_actual_execution_not_verified_from_public_faces'
+AMBIGUOUS_REASON = 'ambiguous_disguised_face'
+DREAM_RELAXABLE_REASONS = (DREAM_REASON, AMBIGUOUS_REASON)
 
 
 def advise_supported(result, agent, *, search=False, max_samples=16):
-    """Prefer verified actions; relax only Dream after the safe mask is exhausted."""
+    """Prefer verified actions; relax Dream gaps only after the safe mask is exhausted."""
     from .official import OfficialDecision, OBSERVED_UI_KINDS, KINDS as ACTION_KINDS
     advice = _advise_supported(result, agent, search=search, max_samples=max_samples)
     exclusions = advice.get('mask_exclusions', [])
-    if not advice.get('selection_exhausted') or not any(e['reason'] == DREAM_REASON for e in exclusions):
+    if not advice.get('selection_exhausted') or not any(e['reason'] in DREAM_RELAXABLE_REASONS for e in exclusions):
         return advice
     # Preserve every other execution gap. In particular, never restore discard
-    # (or another unobserved kind) while restoring disguised card selections.
-    hard_ids = {i for e in exclusions if e['reason'] != DREAM_REASON for i in e.get('item_ids', [])}
+    # (or another unobserved kind) while restoring disguised or ambiguous cards.
+    hard_ids = {i for e in exclusions if e['reason'] not in DREAM_RELAXABLE_REASONS for i in e.get('item_ids', [])}
     kinds = set(ACTION_KINDS) - OBSERVED_UI_KINDS
     prune_self = any(e['reason'] == 'self_target_of_enemy_default_unobserved' for e in exclusions)
     env = result['env']
@@ -196,12 +198,11 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
     env = result['env']
     def choose(position, policy, *, search=False):
         advice = advise(position, policy, search=search)
-        if allow_dream and DREAM_REASON in advice['unsupported'] and any(
-                h['disguised'] and h['id'] in {c['item_id'] for c in advice['action']['cards']}
-                for h in env.public['hand']):
-            advice['unsupported'] = [r for r in advice['unsupported'] if r != DREAM_REASON]
+        relaxed = [r for r in advice['unsupported'] if r in DREAM_RELAXABLE_REASONS]
+        if allow_dream and relaxed:
+            advice['unsupported'] = [r for r in advice['unsupported'] if r not in DREAM_RELAXABLE_REASONS]
             advice['status'] = 'unsupported' if advice['unsupported'] else 'advice'
-            advice['warnings'].append(DREAM_REASON)
+            advice['warnings'].extend(relaxed)
             advice['dream_last_resort'] = True
         if initial_exclusions:
             advice['mask_exclusions'] = list(initial_exclusions)
@@ -220,9 +221,14 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
         reasons = advice.get('unsupported', [])
         selected = {c['item_id'] for c in advice['action']['cards']}
         blocked_by_reason = []
-        if 'dream_actual_execution_not_verified_from_public_faces' in reasons:
-            blocked_by_reason.append(dict(reason='dream_actual_execution_not_verified_from_public_faces',
+        if DREAM_REASON in reasons:
+            blocked_by_reason.append(dict(reason=DREAM_REASON,
                 item_ids=[h['id'] for h in env.public['hand'] if h['disguised'] and h['id'] in selected]))
+        if AMBIGUOUS_REASON in reasons:
+            disguised_faces = {h['face'] for h in env.public['hand'] if h['disguised']}
+            blocked_by_reason.append(dict(reason=AMBIGUOUS_REASON,
+                item_ids=[h['id'] for h in env.public['hand'] if not h['disguised']
+                          and h['face'] in disguised_faces and h['id'] in selected]))
         if 'danger_wide_requires_unobservable_mortar_absence' in reasons:
             blocked_by_reason.append(dict(reason='danger_wide_requires_unobservable_mortar_absence',
                 item_ids=[c['item_id'] for c in advice['action']['cards'] if c['model'] == 232]))
