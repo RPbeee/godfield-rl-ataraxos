@@ -215,7 +215,12 @@ class _SearchActor(Actor):
 
 
 class SearchAgent:
-    def __init__(self, model, belief, device='cpu', *, config=SearchConfig(), seed=0, num_threads=1, profile=False):
+    def __init__(self, model, belief, device='cpu', *, config=SearchConfig(), seed=0, num_threads=1, profile=False, record=False):
+        if record and isinstance(belief, OracleBelief):
+            raise ValueError("oracle belief is forbidden for distillation recording")
+        self.record = record
+        self.records = []
+        self._record_decisions = {}
         self.device = torch.device(device)
         self.model = model.to(device).eval()
         self.belief = belief
@@ -448,6 +453,8 @@ class SearchAgent:
         The caller isolates Torch RNG (as __call__ does with _policy_rng).
         """
         c = self.config
+        if self.record and fixed_candidates is not None:
+            raise ValueError("recording requires candidate generation")
         roots = np.asarray(roots, np.int32)
         if c.root_batch_size and len(roots) > c.root_batch_size:
             selected, reports, candidates, policies, diagnostics = {}, [], {}, {}, {}
@@ -487,9 +494,19 @@ class SearchAgent:
                                  cache_device=c.search_cache_device, cache_mb=c.search_cache_mb)
             actor._search_root_groups = rr[indices]
             paths = [[] for _ in indices]
+            if self.record:
+                root_obs = {int(r): {k: getattr(src, k)[r].copy() for k in OBS_FIELDS} for r in roots}
+                for k in OBS_FIELDS:
+                    np.testing.assert_array_equal(getattr(env, k)[status == 0],
+                                                  getattr(src, k)[rr[indices][status == 0]])
+                prefixes = [[] for _ in indices]
+                path_prefixes = {int(r): {} for r in roots}
             lp, lr = np.zeros(len(indices)), np.zeros(len(indices))
             while not env.episode_done.all():
                 active = np.flatnonzero(env.stage >= 0)
+                if self.record:
+                    for i in active:
+                        prefixes[i].append({k: getattr(env, k)[i].copy() for k in PREFIX_FIELDS})
                 act = self._act(actor, active, "candidate")
                 for i in active:
                     paths[i].append(int(act.choices[i]))
@@ -502,6 +519,8 @@ class SearchAgent:
                 if status[i] == 0:
                     policy_paths.setdefault(int(rr[idx]), tuple(paths[i]))
                     candidates[int(rr[idx])][tuple(paths[i])] = (float(lp[i]), float(lr[i]))
+                    if self.record:
+                        path_prefixes[int(rr[idx])][tuple(paths[i])] = prefixes[i]
             for r, items in candidates.items():
                 self.last_candidate_diagnostics[r]['unique'] = len(items)
                 if not items and len(groups[r]):
@@ -552,6 +571,16 @@ class SearchAgent:
             self.counts['policy_disagreements'] += kept[pick][0] != policy_paths.get(r)
             selected_paths[r] = kept[pick][0]
             reports.append(dict(row=r, candidates=[dict(path=list(x[0]), log_pi=x[1][0], log_rho=x[1][1], q=None if r in singleton else x[2], valid_worlds=x[3]) for x in kept], probabilities=probs.tolist(), selected=list(kept[pick][0])))
+        if self.record:
+            for report in reports:
+                r = report['row']
+                game = int(src.episode_id[r])
+                index = self._record_decisions.get(r, (game, 0))[1]
+                self.records.append(dict(obs=root_obs[r], game=game, seat=int(src.actor_seat[r]),
+                                         phase='response' if response_roots(src, [r])[0] else 'main',
+                                         decision=index, probabilities=report['probabilities'],
+                                         candidates=[dict(candidate, prefixes=path_prefixes[r][tuple(candidate['path'])])
+                                                     for candidate in report['candidates']]))
         if report_values:
             for report in reports:
                 report['policy_path'] = list(policy_paths.get(report['row'], ()))
@@ -654,10 +683,16 @@ class SearchAgent:
         if env is not self.env:
             self.pending.clear()
             self.env = env
+            if self.record:
+                self._record_decisions.clear()
         choices = self.actor(env, rows)
         fresh = np.asarray(rows, np.int32)[env.substep[rows] == 0]
         self.counts['decisions'] += len(fresh)
         for r in fresh:
+            if self.record:
+                game = int(env.episode_id[r])
+                old_game, index = self._record_decisions.get(int(r), (game, -1))
+                self._record_decisions[int(r)] = (game, index+1 if old_game == game else 0)
             if self.pending.get(int(r)):
                 self.counts['real_mismatches'] += 1
             self.pending.pop(int(r), None)
