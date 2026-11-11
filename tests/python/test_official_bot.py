@@ -565,7 +565,7 @@ def test_bot_waits_for_opening_and_each_click_without_reclicking(tmp_path, settl
                                  recorded_action(r['public']), 'SyntheticName')['commands']]
     assert [c for c in probe.commands if c['kind']=='clickPoint'] == expected
     # The initial navigation poll consumes the first of three opening states.
-    assert len(settle_clock.sleeps) == 2 + 3*14
+    assert len(settle_clock.sleeps) == 2 + 3*14 + 1  # reflected response confirm read
 
 
 def test_bot_settle_timeout_saves_screenshot_without_clicks(tmp_path, settle_clock):
@@ -946,7 +946,9 @@ def test_ui_safe_details(failure):
 
 
 def test_selected_mismatch_has_each_attempted_path_and_coordinates():
-    p = results()[3]['public']; s = visible(p); a = recorded_action(p)
+    p = deepcopy(results()[3]['public'])
+    p['pending'].update(reflections=0, bounces=0)
+    s = visible(p); a = recorded_action(p)
     plan = prepare(s,p,a,'SyntheticName')
     class MissingSecondCard:
         def __init__(self): self.clicks = 0
@@ -1734,6 +1736,7 @@ def test_bot_unknown_events_logged_or_strict_stop(tmp_path, capsys, strict):
 def test_large_defense_counts_images_without_row_assumptions(count, pane):
     from gfrl.official_ui import selected, same_confirmation
     p = deepcopy(results()[3]['public'])
+    p['pending'].update(reflections=0, bounces=0)
     p['hand'] = [dict(id=i+100, face=130, used=False, disguised=False) for i in range(count)]
     s = visible(p)
     s['texts'][0]['x'] = pane-30
@@ -1909,7 +1912,7 @@ def test_empty_response_allow_button_once(tmp_path, settle_clock, monkeypatch, a
             return super().send(c)
     probe = AllowProbe(tmp_path)
     directory = private_directory(tmp_path/'log'); journal = Journal(directory)
-    report = run(probe,advisor,journal,name='SyntheticName',timeout=7,settle_timeout=0)
+    report = run(probe,advisor,journal,name='SyntheticName',timeout=7,settle_timeout=.5)
     journal.close()
     rows = list(map(json.loads,(directory/'moves.jsonl').read_text().splitlines()))
     row = next(r for r in rows if r.get('state',{}).get('update') == 2)
@@ -1978,7 +1981,7 @@ def test_selected_response_never_uses_allow_button(tmp_path, settle_clock):
             return super().send(c)
     probe = RejectSelected(tmp_path)
     directory = private_directory(tmp_path/'log'); journal = Journal(directory)
-    report = run(probe,advisor,journal,name='SyntheticName',timeout=7,settle_timeout=0)
+    report = run(probe,advisor,journal,name='SyntheticName',timeout=7,settle_timeout=.5)
     journal.close()
     assert report['reason'] == 'acceptance_timeout'
     assert point(690,423) not in probe.commands

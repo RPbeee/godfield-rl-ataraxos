@@ -17,7 +17,7 @@ import tempfile
 import time
 
 from .official import ROOT, OfficialSession, OfficialStreams, conflict_detail, exception_detail, parser_module
-from .official_ui import UIUnsupported, require, prepare, execute, ready, wait_visible, PUBLIC_PATHS
+from .official_ui import UIUnsupported, require, prepare, execute, ready, wait_visible, PUBLIC_PATHS, REFLECT_MODELS
 
 
 class ReceiveAdvanced(Exception):
@@ -445,6 +445,21 @@ def summary(public):
     return {k: public[k] for k in ('update', 'gf', 'phase', 'actor', 'viewer', 'is_over')}
 
 
+def selection_check_detail(detail):
+    """Whitelist comparison diagnostics; never persist visible text or geometry."""
+    keys = ('verify', 'hand_images', 'own_selected_images',
+            'other_selected_images', 'band_texts', 'targetArrow')
+    detail = detail if isinstance(detail, dict) else {}
+    checks = detail.get('checks', {})
+    counts = detail.get('counts', {})
+    checks = checks if isinstance(checks, dict) else {}
+    counts = counts if isinstance(counts, dict) else {}
+    return dict(checks={k: checks[k] for k in keys if type(checks.get(k)) is bool},
+                counts={k: {side: row[side] for side in ('before', 'after')
+                            if type(row.get(side)) is int and row[side] >= 0}
+                        for k in keys[1:-1] if isinstance((row := counts.get(k)), dict)})
+
+
 def run(probe, advisor, journal, *, name, games=1, mode='training', password=None,
         dry_run=False, timeout=20, settle_timeout=30, on_stop='save',
         room_start='human', room_wait=1800, turn_wait=900, strict_events=False, chance_delay=3):
@@ -457,6 +472,7 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
         enter_room(probe, name, mode, password, timeout=settle_timeout, room_wait=room_wait,
                    login_timeout=timeout, baseline=room_baseline, strict_events=strict_events)
         for game_index in range(games):
+            previous_reflect = False
             baseline = room_baseline if mode == 'room' else capture(probe)
             if mode == 'room':
                 viewer = wait_room_start(probe, name, baseline, room_start=room_start, room_wait=room_wait, strict_events=strict_events)
@@ -546,7 +562,8 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                     if not dry_run:
                         plan = execute(probe, state, public, advice['action'], name,
                                 commands=current_record['clicks'], settle_timeout=settle_timeout,
-                                refresh=refresh, dream_last_resort=advice.get('dream_last_resort') is True)
+                                refresh=refresh, dream_last_resort=advice.get('dream_last_resort') is True,
+                                previous_reflect=previous_reflect)
                 except ReceiveAdvanced as advanced:
                     current_record.update(status='superseded', received_update=advanced.result['public']['update'])
                     journal.write(current_record); current_record = None
@@ -598,6 +615,8 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 except ReceiveAdvanced as advanced:
                     result = advanced.result
                 current_record.update(status='accepted', accepted=True, received_update=result['public']['update'])
+                previous_reflect = (advice['action']['kind'] == 'defend' and any(
+                    c['model'] in REFLECT_MODELS for c in advice['action']['cards']))
                 kind = advice['action']['kind']
                 if kind not in successful_kinds:
                     current_record['first_success_kind'] = kind
@@ -613,6 +632,8 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
             detail = probe_failure_detail(detail)
         # Advice is an external/model boundary; a failing payload must not be
         # copied wholesale into stopped rows (even if it contains a name).
+        if isinstance(detail, dict) and 'selection_check' in detail:
+            detail = dict(detail, selection_check=selection_check_detail(detail['selection_check']))
         stopped = dict(status='stopped', reason=code, detail=detail)
         if current_record is not None:
             stopped.update(state=current_record['state'], clicks=current_record['clicks'], accepted=False)

@@ -33,6 +33,56 @@ def item_paths():
 
 PATHS = item_paths()
 PUBLIC_PATHS = frozenset(PATHS.values())
+REFLECT_MODELS = frozenset(c['id'] for c in json.loads(
+    (ROOT / 'third_party/goodfield/data/official-v2/cards.json').read_text())
+    if c.get('ability') in ('reflectWeapon', 'reflectMiracle'))
+
+
+def band_texts(state):
+    # Top name/target bands are semantic, including for the pixel arrow probe.
+    # Include the central pane's text below them when checking animation settling.
+    return [r for r in state.get('texts', []) if 55 <= r['y'] < 480
+            and 195 <= r['x'] < 840]
+
+
+def transient_band(row):
+    # Never classify a top name/target band (or a card description containing
+    # these words) as animation. Only standalone reflection/redirect notices.
+    return (95 < row['y'] < 480 and 195 <= row['x'] < 840
+            and row['text'] in ('反射した', '反射された', '跳ね返した', '跳ね返された'))
+
+
+def selection_checks(state, before, public, name, plan, expected):
+    try:
+        verify(state, public, name, plan, expected)
+        verified = True
+    except UIUnsupported:
+        verified = False
+    pairs = dict(hand_images=(hand_images(before), hand_images(state)),
+                 own_selected_images=(selected_images(before, plan['pane']), selected_images(state, plan['pane'])),
+                 other_selected_images=(selected_images(before, 1040-plan['pane']), selected_images(state, 1040-plan['pane'])),
+                 band_texts=(band_texts(before), band_texts(state)))
+    checks = dict(verify=verified, **{k: a == b for k, (a, b) in pairs.items()},
+                  targetArrow=state.get('targetArrow') == before.get('targetArrow'))
+    counts = {k: dict(before=len(a), after=len(b)) for k, (a, b) in pairs.items()}
+    return dict(checks=checks, counts=counts)
+
+
+def wait_response_stable(probe, state, public, name, plan, expected, *, timeout, refresh=None):
+    # wait_visible supplies the bounded interval and checks receives before each
+    # comparison. The supplied state is the first read; require one fresh read.
+    previous = deepcopy(state)
+    first = True
+    def check(current):
+        nonlocal previous, first
+        detail = selection_checks(current, previous, public, name, plan, expected)
+        fresh = not first
+        first = False
+        previous = deepcopy(current)
+        require(fresh and all(detail['checks'].values()), 'response_ui_unstable',
+                dict(selection_check=detail))
+    return wait_visible(probe, state, check, timeout=timeout, refresh=refresh)
+
 
 
 def card_detail(expected, actual, clicks=()):
@@ -406,7 +456,7 @@ def verify(state, public, name, plan, expected):
     verify_scene(state, public)
 
 
-def execute(probe, state, public, action, name, *, commands=None, settle_timeout=30, refresh=None, dream_last_resort=False):
+def execute(probe, state, public, action, name, *, commands=None, settle_timeout=30, refresh=None, dream_last_resort=False, previous_reflect=False):
     """Send one click at a time and verify its resulting visible state.
 
     Caller owns capture/update acceptance and saving a screenshot on failure.
@@ -414,6 +464,16 @@ def execute(probe, state, public, action, name, *, commands=None, settle_timeout
     """
     plan = prepare(state, public, action, name, dream_last_resort=dream_last_resort)
     commands = commands if commands is not None else []
+    # Counters (e.g. ring counter-attacks) also arrive right after an animation.
+    pending = public.get('pending') or {}
+    redirected = public['phase'] == 1 and (previous_reflect or bool(pending.get('counter')) or any(
+        pending.get(k, 0) > 0 for k in ('reflections', 'bounces')))
+    if redirected:
+        state = wait_response_stable(probe, state, public, name, plan, {},
+                                     timeout=settle_timeout, refresh=refresh)
+        # Geometry may have settled into a different hand arrangement.
+        ready(state, public, name)
+        plan = prepare(state, public, action, name, dream_last_resort=dream_last_resort)
     expected = {}
     def settled(state, expected, values=None, initial=False, final=False):
         def check(s):
@@ -443,8 +503,23 @@ def execute(probe, state, public, action, name, *, commands=None, settle_timeout
             if str(error) != 'selected_cards_mismatch' or settle_timeout <= 0:
                 raise
             state = probe.send(dict(kind='state'))['state']
-            if not same_selection(state, before, public, name, plan, previous):
-                raise error
+            detail = selection_checks(state, before, public, name, plan, previous)
+            if not all(detail['checks'].values()):
+                checks = detail['checks']
+                only_bands = all(v for k, v in checks.items() if k != 'band_texts')
+                semantic_before = [r for r in band_texts(before) if not transient_band(r)]
+                semantic_after = [r for r in band_texts(state) if not transient_band(r)]
+                if not (public['phase'] == 1 and only_bands and semantic_before == semantic_after):
+                    error.detail['selection_check'] = detail
+                    raise error
+                state = wait_response_stable(probe, state, public, name, plan, previous,
+                                             timeout=settle_timeout, refresh=refresh)
+                # Stability alone cannot authorize a different decision.
+                detail = selection_checks(state, before, public, name, plan, previous)
+                if (not all(v for k, v in detail['checks'].items() if k != 'band_texts')
+                        or [r for r in band_texts(state) if not transient_band(r)] != semantic_before):
+                    error.detail['selection_check'] = detail
+                    raise error
             if refresh is not None:
                 refresh()
             plan.setdefault('selection_retries', []).append(index)
@@ -495,18 +570,7 @@ def execute(probe, state, public, action, name, *, commands=None, settle_timeout
 
 def same_selection(state, before, public, name, plan, expected):
     """A missing click is retryable only while the decision remains unchanged."""
-    try:
-        verify(state, public, name, plan, expected)
-        def bands(s):
-            return [r for r in s.get('texts', []) if 55 <= r['y'] <= 95
-                    and 195 <= r['x'] < 840]
-        return (hand_images(state) == hand_images(before)
-                and selected_images(state, plan['pane']) == selected_images(before, plan['pane'])
-                and selected_images(state, 1040-plan['pane']) == selected_images(before, 1040-plan['pane'])
-                and bands(state) == bands(before)
-                and state.get('targetArrow') == before.get('targetArrow'))
-    except UIUnsupported:
-        return False
+    return all(selection_checks(state, before, public, name, plan, expected)['checks'].values())
 
 
 def same_confirmation(state, public, action, name, plan):

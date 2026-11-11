@@ -161,7 +161,8 @@ def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject, a
         return advisor(result)
     directory = private_directory(tmp_path/'log')
     journal = Journal(directory)
-    report = run(probe, advising, journal, name='SyntheticName', timeout=.05, settle_timeout=0)
+    # The replay includes a later reflected response requiring one confirm read.
+    report = run(probe, advising, journal, name='SyntheticName', timeout=.05, settle_timeout=.5)
     journal.close()
     rows = [json.loads(line) for line in (directory/'moves.jsonl').read_text().splitlines()]
     row = next(r for r in rows if r.get('state', {}).get('update') == 3)
