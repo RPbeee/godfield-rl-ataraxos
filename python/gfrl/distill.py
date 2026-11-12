@@ -72,6 +72,46 @@ def load_shard(path):
     return data
 
 
+def select_rows(data, rows):
+    """Copy a compact CPU shard subset, rebasing both ragged offset columns."""
+    rows = torch.as_tensor(rows, dtype=torch.long)
+    co, so = data['candidate_offsets'], data['stage_offsets']
+    counts = co[rows+1]-co[rows]
+    candidates = torch.cat([torch.arange(int(co[r]), int(co[r+1])) for r in rows])
+    stage_counts = so[candidates+1]-so[candidates]
+    stages = torch.cat([torch.arange(int(so[c]), int(so[c+1])) for c in candidates])
+    subset = dict(format_version=data['format_version'], metadata=data['metadata'],
+                  obs={k: v[rows].clone() for k, v in data['obs'].items()},
+                  prefix={k: v[stages].clone() for k, v in data['prefix'].items()},
+                  candidate_offsets=torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(0))),
+                  stage_offsets=torch.cat((torch.zeros(1, dtype=torch.long), stage_counts.cumsum(0))))
+    for k in ('game', 'seat', 'decision', 'phase', 'outcome'):
+        subset[k] = data[k][rows].clone()
+    for k in ('probabilities', 'q', 'log_pi', 'log_rho', 'valid_worlds'):
+        subset[k] = data[k][candidates].clone()
+    subset['choice'] = data['choice'][stages].clone()
+    return subset
+
+
+def search_values(batch):
+    """Root-actor search expectation; every candidate must have finite q."""
+    owners, q = batch['candidate_owners'], batch['q']
+    n = len(batch['outcome'])
+    finite = torch.isfinite(q)
+    invalid = q.new_zeros(n).index_add(0, owners, (~finite).float())
+    expected = q.new_zeros(n).index_add(0, owners, batch['probabilities']*q.nan_to_num())
+    return expected, invalid == 0
+
+
+def value_targets(outcome, search_value, valid, mix=0.):
+    """Mix outcome with T(v) in win/loss/draw order; missing search falls back."""
+    if mix == 0:
+        return outcome
+    v = search_value.clamp(-1, 1)
+    target = torch.stack(((1+v)/2, (1-v)/2, torch.zeros_like(v)), -1)
+    return torch.where(valid[:, None], (1-mix)*outcome+mix*target, outcome)
+
+
 def prepare_batch(data, rows, device='cpu'):
     rows = torch.as_tensor(rows, dtype=torch.long)
     co, so = data['candidate_offsets'], data['stage_offsets']
@@ -100,7 +140,8 @@ def forward_paths(model, batch):
     return lp, paths, value
 
 
-def objective(model, reference, batch, kl_coef=.1, value_coef=.5):
+def objective(model, reference, batch, kl_coef=.1, value_coef=.5,
+              value_target_mix=0., policy_coef=1.):
     lp, paths, value = forward_paths(model, batch)
     with torch.no_grad():
         ref_lp, ref_paths, _ = forward_paths(reference, batch)
@@ -112,8 +153,11 @@ def objective(model, reference, batch, kl_coef=.1, value_coef=.5):
     p, n = batch['probabilities'], len(value)
     policy = -(p*paths).sum()/n
     anchor = (p*kl_c).sum()/n
-    ce = -(batch['outcome']*F.log_softmax(value, -1)).sum(-1).mean()
-    loss = policy + kl_coef*anchor + value_coef*ce
+    search_value, valid = search_values(batch)
+    target = value_targets(batch['outcome'], search_value, valid, value_target_mix)
+    log_value = F.log_softmax(value, -1)
+    ce = -(target*log_value).sum(-1).mean()
+    loss = policy_coef*policy + kl_coef*anchor + value_coef*ce
     metrics = dict(policy=float(policy.detach()), anchor_kl=float(anchor.detach()),
                    value_ce=float(ce.detach()), value_accuracy=float((value.argmax(-1) == batch['outcome'].argmax(-1)).float().mean()))
     with torch.no_grad():
@@ -132,16 +176,18 @@ def objective(model, reference, batch, kl_coef=.1, value_coef=.5):
             indices = indices.masked_fill(scores != maximum[owners], len(scores))
             return indices.new_full((n,), len(scores)).scatter_reduce_(0, owners, indices, reduce='amin')
         agreement = (argmax_by_root(paths) == argmax_by_root(p)).float().mean()
-        finite = torch.isfinite(batch['q'])
-        invalid = paths.new_zeros(n).index_add(0, owners, (~finite).float())
-        valid = invalid == 0
         q = batch['q'].nan_to_num()
         q_count = int(valid.sum())
         q_metrics = {}
         for name, probabilities in (('q_theta', theta.exp()), ('q_ref', ref.exp()), ('q_search', p)):
             expected = paths.new_zeros(n).index_add(0, owners, probabilities*q)
             q_metrics[name] = float(expected[valid].sum())/max(q_count, 1)
-        metrics.update(candidate_kl=float(candidate_kl), search_to_policy_kl=float(search_to_policy_kl),
+        prediction = value.softmax(-1)[:, 0]-value.softmax(-1)[:, 1]
+        outcome_scalar = batch['outcome'][:, 0]-batch['outcome'][:, 1]
+        metrics.update(outcome_ce=float(-(batch['outcome']*log_value).sum(-1).mean()),
+                       outcome_brier=float((prediction-outcome_scalar).square().mean()),
+                       search_value_mse=float((prediction[valid]-search_value[valid]).square().sum())/max(q_count, 1),
+                       candidate_kl=float(candidate_kl), search_to_policy_kl=float(search_to_policy_kl),
                        top1=float(agreement),
                        q_roots=q_count, **q_metrics)
     return loss, metrics

@@ -130,6 +130,10 @@ def test_training_cli_reduces_policy_and_loads(tmp_path):
                '--lr', '.002', '--value-coef', '0', '--warmup-steps', '0', '--log-every', '1000']
     subprocess.run(command, check=True, capture_output=True, text=True)
     metrics = [json.loads(s) for s in (run/'metrics.jsonl').read_text().splitlines()]
+    for report in metrics:
+        assert {'outcome_ce', 'outcome_brier', 'search_value_mse'} <= report['val'].keys()
+        assert report['val']['value_ce'] == report['val']['outcome_ce']
+    assert metrics[0]['step'] == 0
     assert metrics[-1]['val']['policy'] < metrics[0]['val']['policy']
     trained = load_policy_model(run/'best.pt')
     for k, v in model.value_head.state_dict().items():
@@ -138,6 +142,10 @@ def test_training_cli_reduces_policy_and_loads(tmp_path):
     first = torch.load(run/'last.pt', weights_only=False)['iteration']
     subprocess.run(command+['--resume', '--epochs', '3'], check=True, capture_output=True, text=True)
     assert torch.load(run/'last.pt', weights_only=False)['iteration'] > first
+    changed = subprocess.run(command+['--resume', '--policy-coef', '0'], capture_output=True, text=True)
+    assert changed.returncode != 0 and 'resume setting mismatch: policy_coef' in changed.stderr
+    changed = subprocess.run(command+['--resume', '--value-target-mix', '.5'], capture_output=True, text=True)
+    assert changed.returncode != 0 and 'resume setting mismatch: value_target_mix' in changed.stderr
 
 
 def test_belief_conditions_on_current_actor_and_response_paths():
@@ -212,3 +220,255 @@ def test_generator_resume_and_outcomes(tmp_path):
     for path in paths:
         d = load_shard(path)
         assert (d['outcome'].sum(1) == 1).all()
+
+
+def legacy_terms(model, reference, batch):
+    """Original objective, retained independently for exact default parity."""
+    from torch.nn import functional as F
+    lp, paths, value = forward_paths(model, batch)
+    with torch.no_grad():
+        ref_lp, _, _ = forward_paths(reference, batch)
+    mask = batch['prefix']['mask'].bool()
+    stage = (lp.exp().masked_fill(~mask, 0) *
+             (lp.masked_fill(~mask, 0)-ref_lp.masked_fill(~mask, 0))).sum(-1)
+    candidate = paths.new_zeros(len(paths)).index_add(0, batch['stage_owners'], stage)
+    p, n = batch['probabilities'], len(value)
+    return (-(p*paths).sum()/n, (p*candidate).sum()/n,
+            -(batch['outcome']*F.log_softmax(value, -1)).sum(-1).mean())
+
+
+def assert_gradients_equal(a, b):
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        assert (pa.grad is None) == (pb.grad is None)
+        if pa.grad is not None:
+            torch.testing.assert_close(pa.grad, pb.grad, atol=0, rtol=0)
+
+
+def test_zero_mix_exact_legacy_loss_and_gradients():
+    from gfrl.distill import objective
+    model, records = recorded()
+    reference = deepcopy(model).requires_grad_(False)
+    with torch.no_grad():
+        model.value_head.bias.add_(.03)
+        model.kind_head.bias.add_(torch.linspace(-.1, .1, 10))
+    old = deepcopy(model)
+    batch = prepare_batch(pack_records(records, dict(seed=1)), np.arange(len(records)))
+    policy, anchor, value = legacy_terms(old, reference, batch)
+    expected = policy+.1*anchor+.5*value
+    actual, metrics = objective(model, reference, batch, value_target_mix=0.)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert metrics['value_ce'] == metrics['outcome_ce']
+    expected.backward()
+    actual.backward()
+    assert_gradients_equal(model, old)
+
+
+@pytest.mark.parametrize('mix', [0., .5, 1.])
+def test_value_target_expectation_and_missing_search(mix):
+    from gfrl.distill import search_values, value_targets
+    # Includes a root with only one invalid candidate among several, and Inf.
+    batch = dict(outcome=torch.eye(3)[torch.tensor([0, 1, 2, 0, 1, 2])],
+                 candidate_owners=torch.tensor([0, 0, 1, 2, 3, 3, 4, 5]),
+                 probabilities=torch.tensor([.25, .75, 1., 1., .5, .5, 1., 1.]),
+                 q=torch.tensor([-.8, .4, -2., 2., .5, float('nan'), float('nan'), float('inf')]))
+    search, valid = search_values(batch)
+    torch.testing.assert_close(valid, torch.tensor([True, True, True, False, False, False]))
+    target = value_targets(batch['outcome'], search, valid, mix)
+    assert torch.isfinite(target).all()
+    torch.testing.assert_close(target.sum(-1), torch.ones(6))
+    assert (target >= 0).all()
+    outcome = batch['outcome'][:, 0]-batch['outcome'][:, 1]
+    expectation = torch.where(valid, (1-mix)*outcome+mix*search.clamp(-1, 1), outcome)
+    torch.testing.assert_close(target[:, 0]-target[:, 1], expectation)
+    torch.testing.assert_close(target[~valid], batch['outcome'][~valid], atol=0, rtol=0)
+    if mix == 0:
+        assert target is batch['outcome']
+    if mix == 1:
+        torch.testing.assert_close(target[:3], torch.tensor([[.55, .45, 0.], [0., 1., 0.], [1., 0., 0.]]))
+
+
+def test_policy_zero_keeps_anchor_loss_and_gradients():
+    from gfrl.distill import objective
+    model, records = recorded()
+    reference = deepcopy(model).requires_grad_(False)
+    with torch.no_grad():
+        model.kind_head.bias.add_(torch.linspace(-.5, .5, 10))
+    manual = deepcopy(model)
+    batch = prepare_batch(pack_records(records, dict(seed=1)), np.arange(len(records)))
+    _, anchor, ce = legacy_terms(manual, reference, batch)
+    expected = .1*anchor+ce
+    actual, metrics = objective(model, reference, batch, value_coef=1., policy_coef=0.)
+    assert metrics['policy'] > 0 and metrics['anchor_kl'] > 0
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    expected.backward()
+    actual.backward()
+    assert_gradients_equal(model, manual)
+    assert model.kind_head.bias.grad.abs().sum() > 0
+    model.zero_grad(set_to_none=True)
+    loss, _ = objective(model, reference, batch, kl_coef=0., value_coef=1., policy_coef=0.)
+    loss.backward()
+    assert model.kind_head.bias.grad.abs().sum() == 0
+    assert model.value_head.weight.grad.abs().sum() > 0
+    assert model.type_embedding.weight.grad.abs().sum() > 0
+
+
+def train_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('train_distill', 'scripts/train_distill.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_validation_cache_metrics_match_uncached(tmp_path, monkeypatch):
+    from gfrl.distill import objective, select_rows
+    train = train_module()
+    model, records = recorded()
+    reference = deepcopy(model).requires_grad_(False)
+    expanded = []
+    for g in range(12):
+        for record in records:
+            record = deepcopy(record)
+            record['game'] = g
+            if g % 4 == 0:
+                record['candidates'][0]['q'] = None
+            expanded.append(record)
+    paths, cached = [], []
+    for seed in (1, 2):
+        path = tmp_path/f'shard-{seed}.pt.gz'
+        save_shard(path, pack_records(expanded, dict(seed=seed)))
+        paths.append(path)
+        data = load_shard(path)
+        rows = np.flatnonzero(train.validation_mask(data, .4, 17))
+        cached.append(select_rows(data, rows))
+        original = prepare_batch(data, rows)
+        subset = prepare_batch(cached[-1], np.arange(len(rows)))
+        for k, value in original.items():
+            if isinstance(value, dict):
+                for field in value:
+                    torch.testing.assert_close(value[field], subset[k][field], atol=0, rtol=0)
+            else:
+                torch.testing.assert_close(value, subset[k], atol=0, rtol=0, equal_nan=True)
+    with torch.no_grad():
+        model.value_head.bias.add_(torch.tensor([.2, -.1, 0.]))
+        uncached = []
+        for path in paths:
+            data = load_shard(path)
+            rows = np.flatnonzero(train.validation_mask(data, .4, 17))
+            for lo in range(0, len(rows), 7):
+                rr = rows[lo:lo+7]
+                _, metrics = objective(model, reference, prepare_batch(data, rr), .1, 1., .5, 0.)
+                uncached.append((len(rr), metrics))
+    def no_reload(*args, **kwargs):
+        pytest.fail('validation must use cached rows')
+    monkeypatch.setattr(train, 'load_shard', no_reload)
+    for _ in range(2):
+        actual = train.average_metrics(train.validation_parts(model, reference, cached, 7, 'cpu', .1, 1., .5, 0.))
+        assert actual == train.average_metrics(uncached)
+    # Search MSE uses the finite-q root count rather than all roots as denominator.
+    assert actual['search_value_mse'] == pytest.approx(sum(n['search_value_mse']*n['q_roots'] for _, n in uncached)/actual['q_roots'])
+    all_missing = deepcopy(cached[0])
+    all_missing['q'].fill_(float('nan'))
+    missing = train.average_metrics(train.validation_parts(model, reference, [all_missing], 7, 'cpu', .1, 1., 1., 0.))
+    assert missing['search_value_mse'] is None
+    assert missing['value_ce'] == missing['outcome_ce']
+    json.dumps(missing, allow_nan=False)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason='Metal device unavailable')
+def test_distill_mps_compact_columns_and_backward():
+    from gfrl.distill import objective
+    model, records = recorded()
+    data = pack_records(records, dict(seed=1))
+    assert data['probabilities'].dtype == torch.float64
+    assert any(v.dtype in (torch.int8, torch.uint8) for v in data['prefix'].values())
+    batch = prepare_batch(data, np.arange(len(records)), 'mps')
+    assert batch['probabilities'].dtype == batch['q'].dtype == torch.float32
+    model = model.to('mps')
+    reference = deepcopy(model).requires_grad_(False)
+    loss, metrics = objective(model, reference, batch, value_target_mix=.5, policy_coef=0.)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(model.value_head.weight.grad).all()
+    assert all(np.isfinite(v) for v in metrics.values())
+
+
+@pytest.mark.parametrize('mix', [.5, 1.])
+def test_objective_soft_targets_and_validation_metrics(mix):
+    from gfrl.distill import objective
+    model, records = recorded()
+    reference = deepcopy(model).requires_grad_(False)
+    data = pack_records(records, dict(seed=1))
+    batch = prepare_batch(data, np.arange(len(records)))
+    # Ensure both searched and fallback roots occur, independently of search behavior.
+    batch['q'].copy_(torch.linspace(-.8, .8, len(batch['q'])))
+    batch['q'][0] = float('nan')
+    _, paths, logits = forward_paths(model, batch)
+    targets, valid_search = [], []
+    for root in range(len(records)):
+        candidates = batch['candidate_owners'] == root
+        q, p = batch['q'][candidates], batch['probabilities'][candidates]
+        outcome = batch['outcome'][root]
+        if torch.isfinite(q).all():
+            search = (p*q).sum()
+            valid_search.append((root, search))
+            v = search.clamp(-1, 1)
+            targets.append((1-mix)*outcome+mix*torch.stack(((1+v)/2, (1-v)/2, v.new_zeros(()))))
+        else:
+            targets.append(outcome)
+    expected_ce = -(torch.stack(targets)*logits.log_softmax(-1)).sum(-1).mean()
+    expected_policy = -(batch['probabilities']*paths).sum()/len(records)
+    loss, metrics = objective(model, reference, batch, kl_coef=0., value_coef=1.,
+                              value_target_mix=mix, policy_coef=.3)
+    torch.testing.assert_close(loss, .3*expected_policy+expected_ce)
+    prediction = logits.softmax(-1)[:, 0]-logits.softmax(-1)[:, 1]
+    scalar_outcome = batch['outcome'][:, 0]-batch['outcome'][:, 1]
+    assert metrics['value_ce'] == pytest.approx(float(expected_ce.detach()))
+    assert metrics['outcome_ce'] == pytest.approx(float(-(batch['outcome']*logits.log_softmax(-1)).sum(-1).mean().detach()))
+    assert metrics['outcome_brier'] == pytest.approx(float((prediction-scalar_outcome).square().mean().detach()))
+    expected_mse = torch.stack([(prediction[i]-v).square() for i, v in valid_search]).mean()
+    assert metrics['search_value_mse'] == pytest.approx(float(expected_mse.detach()))
+
+
+def test_value_focused_training_cli(tmp_path):
+    model, records = recorded()
+    expanded = []
+    for game in range(20):
+        for record in records:
+            record = deepcopy(record)
+            record['game'] = game
+            expanded.append(record)
+    data_dir = tmp_path/'data'
+    data_dir.mkdir()
+    save_shard(data_dir/'shard-000000.pt.gz', pack_records(expanded, dict(seed=900000)))
+    checkpoint = tmp_path/'initial.pt'
+    torch.save(dict(model=model.state_dict(), ema=model.state_dict(), model_config=asdict(model.config),
+                    iteration=0, config={}, pool=[]), checkpoint)
+    run = tmp_path/'train'
+    subprocess.run([sys.executable, 'scripts/train_distill.py', '--checkpoint', str(checkpoint),
+                    '--data-dir', str(data_dir), '--run-dir', str(run), '--epochs', '1',
+                    '--minibatch', '32', '--validation-fraction', '.4', '--lr', '.001',
+                    '--value-coef', '1', '--policy-coef', '0', '--value-target-mix', '.5',
+                    '--log-every', '1000'], check=True, capture_output=True, text=True)
+    reports = [json.loads(line) for line in (run/'metrics.jsonl').read_text().splitlines()]
+    assert reports[0]['step'] == 0 and reports[-1]['epoch_end']
+    assert {'outcome_ce', 'outcome_brier', 'search_value_mse'} <= reports[0]['val'].keys()
+    assert reports[-1]['val']['value_ce'] != reports[-1]['val']['outcome_ce']
+    trained = load_policy_model(run/'last.pt')
+    assert not torch.equal(trained.value_head.weight, model.value_head.weight)
+    state = torch.load(run/'last.pt', weights_only=False)
+    assert state['config']['policy_coef'] == 0
+    assert state['config']['value_target_mix'] == .5
+
+
+@pytest.mark.parametrize('option,value', [('--value-target-mix', '-.1'), ('--value-target-mix', '1.1'),
+                                         ('--value-target-mix', 'nan'), ('--policy-coef', '-1'),
+                                         ('--policy-coef', 'nan'), ('--policy-coef', 'inf')])
+def test_invalid_loss_options(option, value, monkeypatch, capsys):
+    train = train_module()
+    monkeypatch.setattr(sys, 'argv', ['train_distill.py', '--checkpoint', 'unused.pt',
+                                     '--data-dir', 'unused', '--run-dir', 'unused', option, value])
+    with pytest.raises(SystemExit) as error:
+        train.main()
+    assert error.value.code == 2
+    assert 'error:' in capsys.readouterr().err

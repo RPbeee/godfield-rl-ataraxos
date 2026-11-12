@@ -91,10 +91,20 @@ Standalone:
 
 Training starts from checkpoint EMA. The frozen reference is that initial
 model. Each microbatch encodes each root once, then indexes its encoding for
-candidate stages. The loss is target-weighted path NLL + target-weighted sum
-of masked stage KL(theta || reference) + outcome value CE, averaged over roots.
+candidate stages. The loss is `policy_coef * policy + kl_coef * anchor_kl + value_coef * value_ce`,
+averaged over roots. `policy` is target-weighted path NLL, and `anchor_kl` is
+the target-weighted sum of masked stage KL(theta || reference).
+`--policy-coef` defaults to 1; setting it to 0 removes the policy imitation loss
+while retaining the KL anchor on recorded prefixes and training the shared
+encoder and value head.
 `--value-coef 0` freezes value-head weights. Adam defaults to lr 1e-5 with ten
 warmup updates, gradient clipping 1, minibatch 1024 roots and two epochs.
+`--value-target-mix w` (default 0, range [0,1]) trains against the soft target
+`(1-w)*outcome + w*[(1+v)/2, (1-v)/2, 0]`, ordered win/loss/draw. Here `v` is
+`sum(probabilities*q)` from the root actor's view, clipped to [-1,1]. If any
+candidate q is nonfinite (including singleton-skipped roots), that root uses
+its outcome unchanged. At w=0 the loss and gradients match the original
+outcome-only objective exactly.
 Microbatches (default eight roots) bound activation memory without changing the
 minibatch loss weighting. CPU, CUDA and MPS use the same code path.
 
@@ -102,6 +112,17 @@ minibatch loss weighting. CPU, CUDA and MPS use the same code path.
 metrics. `policy` is path cross entropy; `candidate_kl` is
 KL(renormalized policy paths || search), and `search_to_policy_kl` is its reverse.
 Search probabilities are floored at 1e-30 for finite KL diagnostics only.
+`value_ce` is CE against the **training target**, so its meaning changes with
+`--value-target-mix`. Always-computed `outcome_ce` is CE against the real game
+outcome; `outcome_brier` is scalar MSE of P(win)-P(loss) against win=1/loss=-1/draw=0
+(not the three-class Brier score). `search_value_mse` is scalar MSE against the
+unclipped search expectation, aggregated only over roots whose candidate q
+values are all finite. It is null if none qualify. These metrics are also in
+the step-0 validation of the initial frozen reference. Validation subsets,
+including their candidates and prefixes, are copied to CPU memory once per
+shard during split counting; periodic validation never reopens gzip shards.
+Compact integer columns retain their types in the CPU cache; floating-point
+probabilities/q are converted to float32 before device transfer (including MPS).
 `anchor_kl` is the unscaled target-weighted stage KL. q expectations use only
 roots with finite q for every retained candidate; `q_roots` reports that count.
 Validation evaluates the exported weights, including optional `--ema-decay`.

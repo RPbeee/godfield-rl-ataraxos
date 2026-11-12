@@ -12,7 +12,7 @@ from time import perf_counter
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 import numpy as np
 import torch
-from gfrl.distill import load_shard, prepare_batch, objective
+from gfrl.distill import load_shard, prepare_batch, objective, select_rows
 from gfrl.evaluation import load_policy_model
 from gfrl.runtime import configure_precision
 
@@ -28,13 +28,28 @@ def average_metrics(parts):
     total = sum(n for n, _ in parts)
     if not total:
         return None
-    out = {k: sum(n*m[k] for n, m in parts)/total for k in parts[0][1] if k != 'q_roots'}
+    out = {k: sum(n*m[k] for n, m in parts)/total for k in parts[0][1] if k not in ('q_roots', 'q_theta', 'q_ref', 'q_search', 'search_value_mse')}
     q_count = sum(m['q_roots'] for _, m in parts)
-    for k in ('q_theta', 'q_ref', 'q_search'):
-        out[k] = sum(m[k]*m['q_roots'] for _, m in parts)/q_count if q_count else None
+    for k in ('q_theta', 'q_ref', 'q_search', 'search_value_mse'):
+        out[k] = sum(m[k]*m['q_roots'] for _, m in parts if m['q_roots'])/q_count if q_count else None
     out['q_roots'] = q_count
     out['roots'] = total
     return out
+
+
+def validation_parts(model, reference, shards, microbatch, device, kl_coef, value_coef,
+                     value_target_mix=0., policy_coef=1., autocast=nullcontext):
+    """Evaluate CPU validation subsets without reopening their source shards."""
+    parts = []
+    with torch.no_grad():
+        for data in shards:
+            for lo in range(0, len(data['outcome']), microbatch):
+                rows = np.arange(lo, min(lo+microbatch, len(data['outcome'])))
+                with autocast():
+                    _, metrics = objective(model, reference, prepare_batch(data, rows, device),
+                                           kl_coef, value_coef, value_target_mix, policy_coef)
+                parts.append((len(rows), metrics))
+    return parts
 
 
 def main():
@@ -49,15 +64,19 @@ def main():
     for name, default in (('epochs', 2), ('minibatch', 1024), ('microbatch', 8), ('threads', 1),
                           ('warmup-steps', 10), ('seed', 17), ('log-every', 10)):
         p.add_argument('--'+name, type=int, default=default)
-    for name, default in (('kl-coef', .1), ('value-coef', .5), ('lr', 1e-5), ('grad-clip', 1.),
+    for name, default in (('kl-coef', .1), ('policy-coef', 1.), ('value-target-mix', 0.), ('value-coef', .5), ('lr', 1e-5), ('grad-clip', 1.),
                           ('ema-decay', 0.), ('max-hours', .75), ('validation-fraction', .03)):
         p.add_argument('--'+name, type=float, default=default)
     args = p.parse_args()
     if min(args.epochs, args.minibatch, args.microbatch, args.threads, args.log_every) <= 0:
         p.error('epochs, batch sizes, threads and log-every must be positive')
+    if not 0 <= args.value_target_mix <= 1:
+        p.error('require 0 <= value-target-mix <= 1')
+    if args.device == 'mps' and not torch.backends.mps.is_available():
+        p.error('MPS is unavailable in this process; select a runtime with Metal access')
     if not 0 < args.validation_fraction < 1 or not 0 <= args.ema_decay < 1:
         p.error('require 0 < validation-fraction < 1 and 0 <= ema-decay < 1')
-    if not np.isfinite([args.max_hours, args.lr, args.kl_coef, args.value_coef, args.grad_clip]).all() or min(args.max_hours, args.lr, args.kl_coef, args.value_coef, args.grad_clip, args.warmup_steps) < 0:
+    if not np.isfinite([args.max_hours, args.lr, args.kl_coef, args.value_coef, args.policy_coef, args.grad_clip]).all() or min(args.max_hours, args.lr, args.kl_coef, args.value_coef, args.policy_coef, args.grad_clip, args.warmup_steps) < 0:
         p.error('finite nonnegative optimizer/loss/time settings required')
     paths = sorted(args.data_dir.glob('shard-*.pt.gz'))
     if not paths:
@@ -77,11 +96,15 @@ def main():
     optimizer = torch.optim.Adam((v for v in model.parameters() if v.requires_grad), lr=args.lr)
     start, steps, best = perf_counter(), 0, float('inf')
     split_counts = [0, 0]
+    validation_shards = []
     for path in paths:
         d = load_shard(path)
         mask = validation_mask(d, args.validation_fraction, args.seed)
         split_counts[0] += int((~mask).sum())
         split_counts[1] += int(mask.sum())
+        if mask.any():
+            validation_shards.append(select_rows(d, np.flatnonzero(mask)))
+    del d
     if not all(split_counts):
         p.error(f'deterministic game split has train={split_counts[0]}, val={split_counts[1]} roots; '
                 'generate more games or increase --validation-fraction for smoke tests')
@@ -90,9 +113,9 @@ def main():
     resume_path = args.run_dir/'last.pt'
     if args.resume and resume_path.exists():
         state = torch.load(resume_path, map_location=args.device, weights_only=False)
-        for key in ('checkpoint', 'data_dir', 'lr', 'kl_coef', 'value_coef', 'ema_decay', 'seed', 'validation_fraction'):
+        for key in ('checkpoint', 'data_dir', 'lr', 'kl_coef', 'value_coef', 'policy_coef', 'value_target_mix', 'ema_decay', 'seed', 'validation_fraction'):
             value = str(getattr(args, key)) if isinstance(getattr(args, key), Path) else getattr(args, key)
-            if state['config'][key] != value:
+            if state['config'].get(key, {'policy_coef': 1., 'value_target_mix': 0.}.get(key)) != value:
                 p.error(f'resume setting mismatch: {key}')
         if state['source_md5'] != source_md5 or state['split_counts'] != split_counts:
             p.error('resume checkpoint or dataset changed')
@@ -121,19 +144,11 @@ def main():
         torch.save(state, temp)
         temp.replace(args.run_dir/(name+'.pt'))
     def validate():
-        parts = []
         # Metrics assess the exact weights exported in checkpoint['ema'].
         evaluated = ema if args.ema_decay else model
-        with torch.no_grad():
-            for path in paths:
-                d = load_shard(path)
-                rows = np.flatnonzero(validation_mask(d, args.validation_fraction, args.seed))
-                for lo in range(0, len(rows), args.microbatch):
-                    rr = rows[lo:lo+args.microbatch]
-                    with autocast():
-                        _, m = objective(evaluated, reference, prepare_batch(d, rr, args.device), args.kl_coef, args.value_coef)
-                    parts.append((len(rr), m))
-        return average_metrics(parts)
+        return average_metrics(validation_parts(
+            evaluated, reference, validation_shards, args.microbatch, args.device,
+            args.kl_coef, args.value_coef, args.value_target_mix, args.policy_coef, autocast))
     def log(epoch, train, final=False):
         nonlocal best
         val = validate()
@@ -163,7 +178,7 @@ def main():
                 for off in range(0, len(rr), args.microbatch):
                     micro = rr[off:off+args.microbatch]
                     with autocast():
-                        loss, m = objective(model, reference, prepare_batch(d, micro, args.device), args.kl_coef, args.value_coef)
+                        loss, m = objective(model, reference, prepare_batch(d, micro, args.device), args.kl_coef, args.value_coef, args.value_target_mix, args.policy_coef)
                     (loss*len(micro)/len(rr)).backward()
                     parts.append((len(micro), m))
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
