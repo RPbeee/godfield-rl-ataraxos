@@ -70,6 +70,7 @@ public:
            bool track_projection = false, bool search = false, std::size_t max_decisions = 512);
     std::vector<EvalResult> eval_results() const;
     bool eval_done() const;
+    // -1 freezes a live decision at substep zero, preserving every buffer/stat.
     void step(std::span<const std::int32_t> choices);
     Stats stats() const;
     std::vector<int> determinize_support(std::span<const std::int32_t> rows) const;

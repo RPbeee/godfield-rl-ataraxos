@@ -251,14 +251,21 @@ void VecEnv::step(std::span<const std::int32_t> choices) {
     std::lock_guard lock(api_mutex_);
     if (choices.size() != num_envs) throw std::invalid_argument("choices must have shape [num_envs]");
     for (std::size_t i = 0; i < num_envs; ++i) {
-        if(envs_[i].waiting || !envs_[i].selection)continue;
         const int c = choices[i];
+        // Inactive rows ignore their choice, as before (rollout passes -1 there).
+        if(envs_[i].waiting || !envs_[i].selection)continue;
+        if (c == -1 && envs_[i].selection->substep == 0)
+            continue;
         if (c < 0 || c >= 21 || !envs_[i].selection->mask[c])
             throw std::invalid_argument("env " + std::to_string(i) + ": illegal choice " + std::to_string(c) +
                 " at stage " + std::to_string(stage[i]));
     }
     workers_.run([&](std::size_t worker) {
         for (std::size_t i = worker; i < num_envs; i += num_threads) {
+            // A frozen decision (-1 on a live substep-0 row) is a complete no-op,
+            // including published flags. -1 on inactive rows keeps the old path.
+            if(choices[i] == -1 && !envs_[i].waiting && envs_[i].selection
+               && envs_[i].selection->substep == 0)continue;
             if(search_)decision_done[i]=false;
             if(search_ && envs_[i].waiting)continue;
             decision_done[i] = episode_done[i] = truncated[i] = false;

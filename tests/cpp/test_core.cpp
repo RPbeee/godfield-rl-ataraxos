@@ -194,6 +194,7 @@ template<class T> void equal(const Buffer<T>& a, const Buffer<T>& b, const char*
 void equal_env(const VecEnv& a, const VecEnv& b) {
 #define EQ(name) equal(a.name, b.name, #name)
     EQ(stage); EQ(actor_seat); EQ(mask); EQ(chosen_kind); EQ(chosen_cards); EQ(chosen_count); EQ(substep);
+    EQ(chosen_target); EQ(chosen_alloc_hp); EQ(decisions); EQ(world_status); EQ(searcher_seat); EQ(result);
     EQ(decision_done); EQ(episode_done); EQ(outcome); EQ(truncated); EQ(episode_id);
     EQ(obs_type); EQ(obs_cards); EQ(obs_aux_card); EQ(obs_cat); EQ(obs_num); EQ(obs_valid);
     EQ(label_opp_hand); EQ(label_opp_hand_count);
@@ -251,7 +252,7 @@ void legality() {
 void invalid() {
     VecEnv env(8, 8, 11), reference(8, 1, 11);
     std::mt19937_64 rng(12);
-    for (int position = 0; position < 8; ++position) for (int value : {-1, 21, 100000}) {
+    for (int position = 0; position < 8; ++position) for (int value : {-2, 21, 100000}) {
         auto choices = random_choices({env.mask.data(), env.num_envs}, {env.stage.data(), env.num_envs}, rng);
         choices[position] = value;
         bool thrown = false;
@@ -293,6 +294,28 @@ void invalid() {
     const_cast<gf::MatchSnapshot&>(oversized.snapshot()).state = state;
     try { Selection rejected(oversized); check(false, "oversized hand accepted"); }
     catch (const std::runtime_error& e) { check(std::string(e.what()).find("18") != std::string::npos, "wrong hand error"); }
+}
+void freeze() {
+    VecEnv env(1, 2, 67), reference(1, 1, 67);
+    std::mt19937_64 rng(8);
+    int frozen = 0, rejected = 0;
+    for (int step = 0; step < 600; ++step) {
+        const std::vector<std::int32_t> pause{-1};
+        if (env.substep[0] == 0) {
+            for (int i = 0; i < 3; ++i) env.step(pause);
+            ++frozen;
+        } else {
+            bool thrown = false;
+            try { env.step(pause); } catch (const std::invalid_argument&) { thrown = true; }
+            check(thrown, "freeze accepted after substep zero");
+            ++rejected;
+        }
+        equal_env(env, reference);
+        auto choices = random_choices({env.mask.data(), 1}, {env.stage.data(), 1}, rng);
+        env.step(choices); reference.step(choices);
+    }
+    equal_env(env, reference);
+    check(frozen > 10 && rejected > 10, "freeze coverage");
 }
 void automatic() {
     VecEnv env(1, 1, 123);
@@ -363,6 +386,7 @@ int main(int argc, char** argv) {
         if (name == "tree") tree(); else if (name == "legality") legality();
         else if (name == "determinism") determinism(); else if (name == "automatic") automatic();
         else if (name == "invalid") invalid(); else if (name == "allocation") allocation();
+        else if (name == "freeze") freeze();
         else throw std::runtime_error("unknown test");
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

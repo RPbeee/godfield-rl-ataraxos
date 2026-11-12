@@ -114,3 +114,57 @@ def test_observations():
     assert VecEnv(1,1,1,history_len=0).obs_type.shape == (1,55)
     with pytest.raises(ValueError):
         VecEnv(1,1,1,history_len=4097)
+
+
+def test_freeze_rows_preserves_trajectory_and_all_buffers():
+    from gfrl.model import OBS_FIELDS
+    fields = (*FIELDS, *OBS_FIELDS, 'label_opp_hand', 'label_opp_hand_count')
+    env = VecEnv(2, 2, 67)
+    reference = VecEnv(1, 1, 67)
+    freezes = 0
+    for step in range(1000):
+        pause = env.substep[0] == 0 and step % 3 != 0
+        action = env.mask.argmax(axis=1).astype(np.int32)
+        if pause:
+            action[0] = -1
+            freezes += 1
+        else:
+            reference.step(action[:1].copy())
+        env.step(action)
+        for field in fields:
+            np.testing.assert_array_equal(getattr(env, field)[0], getattr(reference, field)[0])
+    assert freezes > 10
+
+
+def test_freeze_stats_flags_and_invalid_transaction():
+    env = VecEnv(2, 2, 11)
+    # All-frozen calls must preserve stats and every public field, even flags
+    # left over from a completed decision/episode.
+    for _ in range(500):
+        if np.all(env.substep == 0):
+            before = {k: getattr(env, k).copy() for k in FIELDS}
+            stats = env.stats()
+            env.step(np.full(2, -1, np.int32))
+            assert env.stats() == stats
+            for k, a in before.items():
+                np.testing.assert_array_equal(a, getattr(env, k))
+        action = env.mask.argmax(axis=1).astype(np.int32)
+        if env.substep[1] != 0:
+            bad = action.copy()
+            bad[1] = -1
+            before = {k: getattr(env, k).copy() for k in FIELDS}
+            with pytest.raises(ValueError, match='env 1.*-1'):
+                env.step(bad)
+            for k, a in before.items():
+                np.testing.assert_array_equal(a, getattr(env, k))
+        env.step(action)
+    with pytest.raises(ValueError, match='-2'):
+        env.step(np.full(2, -2, np.int32))
+
+
+def test_freeze_requires_live_decision():
+    from gfrl import SearchEnv
+    env = SearchEnv(1, 1)
+    # Idle rows ignore any choice, including -1 (rollout passes -1 there).
+    env.step(np.array([-1], np.int32))
+    env.step(np.array([-999], np.int32))
