@@ -25,6 +25,8 @@ def build_parser(*, sweep=False):
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--opponent', choices=('policy', 'greedy'), default='policy')
     p.add_argument('--opponent-checkpoint')
+    if not sweep:
+        p.add_argument('--opponent-belief', help='enable opponent search with this belief and the same search config')
     p.add_argument('--belief', required=True,
                    help='checkpoint path, b1, uniform, or oracle (evaluation-only diagnostic; cheats using true opponent hands)')
     add_belief_arguments(p, sweep=sweep, offline=True)
@@ -67,6 +69,8 @@ def validate_args(p, args):
         p.error('pairs, num-envs, threads must be positive')
     if not math.isfinite(args.progress_interval) or args.progress_interval < 0:
         p.error('progress-interval must be finite and nonnegative')
+    if getattr(args, 'opponent_belief', None) and args.opponent != 'policy':
+        p.error('--opponent-belief requires --opponent policy')
     try:
         validate_variants(**variant_options(args))
         if getattr(args, 'diagnostic_true_hand_nll', False) and (not args.fit or getattr(args, 'diagnostic_belief', args.belief) in ('uniform', 'b1', 'oracle')):
@@ -116,8 +120,14 @@ class TimedPolicy:
 def run_match(args, agent, callback=None):
     """Single shared paired-deal loop, including RNG isolation and progress."""
     if args.opponent == 'policy':
-        opponent = Actor(load_policy_model(args.opponent_checkpoint or args.checkpoint, args.device),
-                         VecEnv(1, 1, eval_pairs=0), args.device)
+        opponent_model = load_policy_model(args.opponent_checkpoint or args.checkpoint, args.device)
+        if getattr(args, 'opponent_belief', None):
+            opponent = SearchAgent(opponent_model,
+                                   load_search_belief(args.opponent_belief, args.fit, args.device, **variant_options(args)),
+                                   args.device, config=search_config(args), seed=args.seed+1,
+                                   num_threads=args.threads, profile=args.profile)
+        else:
+            opponent = Actor(opponent_model, VecEnv(1, 1, eval_pairs=0), args.device)
         return evaluate_policies(agent, opponent, args.pairs, args.num_envs, args.threads,
                                     args.seed, track_projection=True, progress=callback,
                                     progress_interval_s=args.progress_interval)

@@ -249,3 +249,78 @@ def test_streaming_cli_resume_and_metrics(tmp_path, kind, capsys):
     assert {r['model_type'] for r in result['results'] if 'model_type' in r} == {kind}
     assert len(json.loads(out.read_text())['results']) == 3
     assert '| Data | Model | Multiset NLL |' in capsys.readouterr().out
+
+
+def test_init_belief_run_and_resume(tmp_path, monkeypatch):
+    import json
+    from gfrl.belief_data import make_belief_data
+    spec = importlib.util.spec_from_file_location('init_belief_train', Path(__file__).resolve().parents[2]/'scripts/train_belief.py')
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    config = ModelConfig(d=16, depth=1, heads=4, ff=32)
+    policy = tmp_path/'policy.pt'
+    weights = Model(config).state_dict()
+    torch.save(dict(ema=weights, model_config=asdict(config),
+                    pool=[dict(iteration=1, weights=weights)]), policy)
+    initial = Belief(config, BeliefConfig(depth=1, heads=4))
+    init_path = tmp_path/'initial.pt'
+    optimizer = torch.optim.AdamW(initial.parameters())
+    module.save_checkpoint(init_path, initial, optimizer, 99, dict(checkpoint='old-policy.pt'), 8)
+    data = tmp_path/'validation.pt'
+    torch.save(make_belief_data(policy, positions=4, num_envs=2, sample_prob=1), data)
+    argv = ['--checkpoint', str(policy), '--run-dir', str(tmp_path/'run'),
+            '--steps', '1', '--buffer-size', '8', '--warmup-positions', '2',
+            '--batch-size', '2', '--microbatch', '2', '--num-envs', '2', '--threads', '1',
+            '--sample-prob', '1', '--decoder-depth', '1', '--decoder-heads', '4',
+            '--validation', str(data), '--presence-samples', '1']
+    saved = []
+    original_save = module.save_checkpoint
+    def save(path, model, opt, step, config, generation):
+        if step == 0:
+            for key, value in initial.state_dict().items():
+                torch.testing.assert_close(model.state_dict()[key], value, rtol=0, atol=0)
+            assert not opt.state
+            saved.append(step)
+        return original_save(path, model, opt, step, config, generation)
+    monkeypatch.setattr(module, 'save_checkpoint', save)
+    path = module.run(module.parse_args([*argv, '--init-belief', str(init_path)]))
+    assert saved == [0]
+    state = torch.load(path, weights_only=False)
+    assert state['step'] == 1 and state['generation'] == 1
+    assert {int(s['step']) for s in state['optimizer']['state'].values()} == {1}
+    assert state['config']['init_belief'] == str(init_path)
+    assert state['config']['init_belief_md5'] == hashlib.md5(init_path.read_bytes()).hexdigest()
+    reports = [json.loads(s) for s in path.with_name('metrics.jsonl').read_text().splitlines()]
+    assert reports[0]['step'] == 0 and str(data) in reports[0]['evaluation']
+    with pytest.raises(ValueError, match='already exists'):
+        module.run(module.parse_args(argv))
+    argv[argv.index('--steps')+1] = '2'
+    # Resume needs neither the source belief nor its original path to still exist.
+    init_path.unlink()
+    module.run(module.parse_args([*argv, '--resume']))
+    resumed = torch.load(path, weights_only=False)
+    assert resumed['step'] == 2 and resumed['generation'] == 2
+    assert resumed['config']['init_belief_md5'] == state['config']['init_belief_md5']
+    assert resumed['config']['init_belief'] == str(init_path)
+    assert sum(json.loads(s)['step'] == 0 for s in path.with_name('metrics.jsonl').read_text().splitlines()) == 1
+    with pytest.raises(SystemExit):
+        module.parse_args([*argv, '--resume', '--init-belief', 'some.pt'])
+
+
+@pytest.mark.parametrize('incompatibility', ['encoder', 'decoder', 'type'])
+def test_init_belief_incompatible(tmp_path, incompatibility):
+    spec = importlib.util.spec_from_file_location('incompatible_train', Path(__file__).resolve().parents[2]/'scripts/train_belief.py')
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    config = ModelConfig(d=16, depth=1, heads=4, ff=32)
+    policy = tmp_path/'policy.pt'
+    torch.save(dict(ema=Model(config).state_dict(), model_config=asdict(config)), policy)
+    other_config = ModelConfig(d=32, depth=1, heads=4, ff=32) if incompatibility == 'encoder' else config
+    belief_config = BeliefConfig(depth=2 if incompatibility == 'decoder' else 1, heads=4)
+    cls = IndependentBelief if incompatibility == 'type' else Belief
+    initial = cls(other_config, belief_config)
+    init_path = tmp_path/'init.pt'
+    module.save_checkpoint(init_path, initial, torch.optim.AdamW(initial.parameters()), 0, dict(checkpoint='old.pt'), 0)
+    args = module.parse_args(['--checkpoint', str(policy), '--init-belief', str(init_path),
+                              '--run-dir', str(tmp_path/'run'), '--decoder-depth', '1', '--decoder-heads', '4'])
+    with pytest.raises(ValueError, match='incompatible'):
+        module.run(args)
+    assert not (tmp_path/'run').exists()

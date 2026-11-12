@@ -3,6 +3,8 @@
 import argparse
 from dataclasses import asdict
 import json
+import hashlib
+import io
 import math
 from pathlib import Path
 import random
@@ -27,7 +29,9 @@ def parse_args(argv=None):
     p.add_argument('--presence-sample-batch-size', type=int, default=None)
     p.add_argument('--run-dir', default='runs/belief/train')
     p.add_argument('--device', choices=('cpu', 'cuda', 'mps'), default='cpu')
-    p.add_argument('--resume', nargs='?', const='auto')
+    initialization = p.add_mutually_exclusive_group()
+    initialization.add_argument('--resume', nargs='?', const='auto')
+    initialization.add_argument('--init-belief', help='belief weights only; fresh optimizer and schedule')
     p.add_argument('--validation', nargs='+', default=[])
     p.add_argument('--fit')
     p.add_argument('--tf32', action=argparse.BooleanOptionalAction, default=True)
@@ -75,7 +79,10 @@ def lr_at(step, args):
 def run(args):
     start = perf_counter()
     run_dir = Path(args.run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if run_dir.exists() and not args.resume:
+        raise ValueError(f'{run_dir} already exists; use --resume or a new --run-dir')
+    if args.resume and args.init_belief:
+        raise ValueError('--init-belief and --resume are mutually exclusive')
     path = run_dir/'checkpoint.pt'
     state = torch.load(path if args.resume == 'auto' else args.resume, map_location='cpu', weights_only=False) if args.resume else None
     if state:
@@ -87,6 +94,16 @@ def run(args):
     model_class = IndependentBelief if args.model == 'independent' else Belief
     model = (belief_from_checkpoint(state) if state else
              model_class.from_policy(args.checkpoint, BeliefConfig(args.decoder_depth, args.decoder_heads, args.decoder_ff)))
+    if args.init_belief and not state:
+        init_path = Path(args.init_belief)
+        payload = init_path.read_bytes()
+        initial = belief_from_checkpoint(torch.load(io.BytesIO(payload), map_location='cpu', weights_only=False))
+        if (belief_model_type(initial) != belief_model_type(model) or
+                initial.config != model.config or initial.belief_config != model.belief_config):
+            raise ValueError('incompatible init-belief model/belief config')
+        model.load_state_dict(initial.state_dict(), strict=True)
+        args.init_belief_md5 = hashlib.md5(payload).hexdigest()
+    run_dir.mkdir(parents=True, exist_ok=True)
     args.model = belief_model_type(model)
     model.to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
@@ -112,6 +129,33 @@ def run(args):
     validations = {p: torch.load(p, map_location='cpu', weights_only=False) for p in args.validation}
     baselines = fit_baselines(torch.load(args.fit, map_location='cpu', weights_only=False)) if args.fit else {}
     baseline_results = {p: {k: evaluate_baseline(b, data) for k, b in baselines.items()} for p, data in validations.items()}
+    def evaluate(metrics):
+        # Evaluation sampling cannot perturb the training RNG.
+        rng = torch.get_rng_state()
+        accel = torch.cuda.get_rng_state_all() if args.device == 'cuda' else None
+        mps_rng = torch.mps.get_rng_state() if args.device == 'mps' else None
+        torch.manual_seed(args.seed+12345)
+        metrics['evaluation'] = {}
+        print('| Data | Model | Multiset NLL | Count NLL | Count accuracy | ECE | Early / Middle / Late NLL |', flush=True)
+        print('|---|---|---:|---:|---:|---:|---|', flush=True)
+        for p, data in validations.items():
+            results = dict(baseline_results[p], belief=evaluate_belief(model, data, args.device, args.eval_batch_size, args.presence_samples, args.presence_sample_batch_size))
+            metrics['evaluation'][p] = results
+            for name, r in results.items():
+                phases = ' / '.join('—' if v['nll'] is None else f'{v["nll"]:.4f}' for v in r['phase_nll'].values())
+                print(f'| {Path(p).stem} | {name} | {r["multiset_nll"]:.4f} | {r["count_nll"]:.4f} | {r["count_accuracy"]:.2%} | {r["ece"]:.6f} | {phases} |', flush=True)
+        torch.set_rng_state(rng)
+        if accel is not None:
+            torch.cuda.set_rng_state_all(accel)
+        if mps_rng is not None:
+            torch.mps.set_rng_state(mps_rng)
+
+    if validations and not state:
+        initial_metrics = dict(step=0, elapsed_s=perf_counter()-start)
+        evaluate(initial_metrics)
+        with (run_dir/'metrics.jsonl').open('a') as f:
+            f.write(json.dumps(initial_metrics, allow_nan=False)+'\n')
+        save_checkpoint(path, model, optimizer, 0, config, generation)
     buffer, credit = None, 0.
     generated = learned = 0
     collect_s = learn_s = 0.
@@ -159,25 +203,7 @@ def run(args):
                            learn_positions_per_s=learned/max(learn_s, 1e-9), buffer_positions=buffer.size,
                            buffer_fill=buffer.size/args.buffer_size, elapsed_s=perf_counter()-start)
             if validations and ((args.eval_every and step % args.eval_every == 0) or step == args.steps):
-                # Evaluation sampling cannot perturb the training RNG.
-                rng = torch.get_rng_state()
-                accel = torch.cuda.get_rng_state_all() if args.device == 'cuda' else None
-                mps_rng = torch.mps.get_rng_state() if args.device == 'mps' else None
-                torch.manual_seed(args.seed+12345)
-                metrics['evaluation'] = {}
-                print('| Data | Model | Multiset NLL | Count NLL | Count accuracy | ECE | Early / Middle / Late NLL |', flush=True)
-                print('|---|---|---:|---:|---:|---:|---|', flush=True)
-                for p, data in validations.items():
-                    results = dict(baseline_results[p], belief=evaluate_belief(model, data, args.device, args.eval_batch_size, args.presence_samples, args.presence_sample_batch_size))
-                    metrics['evaluation'][p] = results
-                    for name, r in results.items():
-                        phases = ' / '.join('—' if v['nll'] is None else f'{v["nll"]:.4f}' for v in r['phase_nll'].values())
-                        print(f'| {Path(p).stem} | {name} | {r["multiset_nll"]:.4f} | {r["count_nll"]:.4f} | {r["count_accuracy"]:.2%} | {r["ece"]:.6f} | {phases} |', flush=True)
-                torch.set_rng_state(rng)
-                if accel is not None:
-                    torch.cuda.set_rng_state_all(accel)
-                if mps_rng is not None:
-                    torch.mps.set_rng_state(mps_rng)
+                evaluate(metrics)
             if step % args.log_every == 0 or step == args.steps or 'evaluation' in metrics:
                 with (run_dir/'metrics.jsonl').open('a') as f:
                     f.write(json.dumps(metrics, allow_nan=False)+'\n')
