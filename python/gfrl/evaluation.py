@@ -57,6 +57,9 @@ def pair_bootstrap(results, iters=2000, seed=0):
 def summarize(results, *, complete_pairs_only=False):
     """Summarize agent-relative game records, giving draws half credit.
 
+    mean_game_length / mean_win_decisions / mean_loss_decisions use external
+    decisions when supplied by evaluate_policies, otherwise engine decisions.
+    Existing mean_decisions always retains the engine's count.
     complete_pairs_only permits partial evaluations: only the bootstrap uses
     complete pairs; every other statistic includes all completed games.
     """
@@ -76,7 +79,15 @@ def summarize(results, *, complete_pairs_only=False):
         bootstrap_results = [r for r in results if r['pair'] in complete]
     def rate(rows):
         return sum((r['result'] + 1) / 2 for r in rows) / len(rows) if rows else None
+    def mean_length(outcome):
+        rows = [r for r in results if r['result'] == outcome]
+        return sum(r.get('external_decisions', r['decisions']) for r in rows) / len(rows) if rows else None
     return {
+        'mean_game_length': (sum(r.get('external_decisions', r['decisions']) for r in results) / n
+                             if n else None),
+        'truncations': sum(r['truncated'] for r in results),
+        'mean_win_decisions': mean_length(1),
+        'mean_loss_decisions': mean_length(-1),
         'games': n, 'win_rate': rate(results),
         'wilson_interval': wilson_interval(wins + draws / 2, n),
         'bootstrap_interval': pair_bootstrap(bootstrap_results),
@@ -91,9 +102,10 @@ def summarize(results, *, complete_pairs_only=False):
 class _EvaluationProgress:
     """Read completed records only at reporting boundaries; never sample RNGs."""
 
-    def __init__(self, callback, interval_s):
+    def __init__(self, callback, interval_s, transform=lambda rows: rows):
         if not math.isfinite(interval_s) or interval_s <= 0:
             raise ValueError('progress_interval_s must be finite and positive')
+        self.transform = transform
         self.callback = callback
         self.interval_s = interval_s
         self.last_time = monotonic()
@@ -105,7 +117,7 @@ class _EvaluationProgress:
             return
         # eval_results() already retains all completed games, including those
         # whose env slots have been reset/reused. No C++ accessor is needed.
-        results = env.eval_results()
+        results = self.transform(env.eval_results())
         if not final or len(results) != self.last_games:
             self.callback(summarize(results, complete_pairs_only=True))
             self.last_games = len(results)
@@ -146,13 +158,21 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
     uses complete pairs. Reporting uses a local NumPy generator, leaving policy
     RNGs untouched. The callback itself must not consume policy RNGs.
     """
-    reporter = _EvaluationProgress(progress, progress_interval_s) if progress is not None else None
+    # Count external decisions at their first stage, excluding automatic engine
+    # transitions and avoiding counting autoregressive stages more than once.
+    lengths = np.zeros(2*pairs, dtype=np.int64)
+    def records(rows):
+        return [dict(r, external_decisions=int(lengths[r['g']])) for r in rows]
+    reporter = (_EvaluationProgress(progress, progress_interval_s, records)
+                if progress is not None else None)
     with _policy_rng(eval_seed, (policy_a, policy_b)):
         env = _core.VecEnv(num_envs, num_threads, eval_pairs=pairs,
                            opponent='external', eval_seed=eval_seed,
                            track_projection=track_projection)
         while not env.eval_done():
             active = env.stage >= 0
+            starts = active & (env.substep == 0)
+            np.add.at(lengths, env.episode_id[starts].astype(np.int64), 1)
             a_turn = env.actor_seat == env.episode_id % 2
             choices = np.zeros(num_envs, dtype=np.int32)
             for policy, turn in ((policy_a, a_turn), (policy_b, ~a_turn)):
@@ -167,7 +187,7 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
                 reporter(env)
         if reporter is not None:
             reporter(env, final=True)
-        return summarize(env.eval_results())
+        return summarize(records(env.eval_results()))
 
 
 @contextmanager

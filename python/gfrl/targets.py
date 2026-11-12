@@ -3,11 +3,20 @@ import numpy as np
 import torch
 
 
-def sequence_targets(probabilities, outcome, lambda_v=0.8, lambda_a=0.5):
-    """Classes are win/loss/draw. Truncations must pass outcome=0."""
+def sequence_targets(probabilities, outcome, lambda_v=0.8, lambda_a=0.5, gamma=1.0):
+    """Discount once per own decision; classes are win/loss/draw.
+
+    Truncations must pass outcome=0. With terminal p_T = target_T =
+    onehot(outcome), target_t = gamma*((1-lambda_v)*p_{t+1} +
+    lambda_v*target_{t+1}) + (1-gamma)*onehot(draw). Mixing towards
+    draw makes E[target] the discounted scalar lambda-return.
+    GAE uses delta_t = gamma*V_{t+1}-V_t and gamma*lambda_a recursion.
+    """
     p = np.asarray(probabilities, dtype=np.float32)
     if p.ndim != 2 or p.shape[1] != 3 or outcome not in (-1, 0, 1):
         raise ValueError('expected [T,3] probabilities and outcome in {-1,0,1}')
+    if not 0 < gamma <= 1:
+        raise ValueError('gamma must be in (0,1]')
     if not 0 <= lambda_v <= 1 or not 0 <= lambda_a <= 1:
         raise ValueError('lambda must be in [0,1]')
     target = np.zeros_like(p)
@@ -17,15 +26,26 @@ def sequence_targets(probabilities, outcome, lambda_v=0.8, lambda_a=0.5):
     next_value, next_advantage = float(outcome), 0.0
     for t in range(len(p) - 1, -1, -1):
         target[t] = (1 - lambda_v) * next_p + lambda_v * next_target
+        if gamma != 1:
+            target[t] *= gamma
+            target[t, 2] += 1-gamma
         value = p[t, 0] - p[t, 1]
         advantage[t] = next_value - value + lambda_a * next_advantage
+        if gamma != 1:
+            advantage[t] = gamma*next_value - value + gamma*lambda_a*next_advantage
         next_p, next_target = p[t], target[t]
         next_value, next_advantage = value, advantage[t]
     return target, advantage
 
 
-def compute_targets(decisions, lambda_v=0.8, lambda_a=0.5):
-    """Preserve arrival order within each (env, game, seat), skip opponent turns."""
+def compute_targets(decisions, lambda_v=0.8, lambda_a=0.5, gamma=1.0):
+    """Preserve arrival order within (env, game, seat), skipping opponent turns.
+
+    Discount per own decision with the draw-mixture lambda-return and GAE
+    defined in sequence_targets, including terminal bootstraps.
+    """
+    if not 0 < gamma <= 1:
+        raise ValueError('gamma must be in (0,1]')
     if not 0 <= lambda_v <= 1 or not 0 <= lambda_a <= 1:
         raise ValueError('lambda must be in [0,1]')
     if hasattr(decisions, 'columns'):
@@ -61,8 +81,13 @@ def compute_targets(decisions, lambda_v=0.8, lambda_a=0.5):
         groups = np.flatnonzero(lengths > depth)
         rows = order[ends[groups]-1-depth]
         target[rows] = (1-lambda_v)*next_p[groups]+lambda_v*next_target[groups]
+        if gamma != 1:
+            target[rows] *= gamma
+            target[rows, 2] += 1-gamma
         value = p[rows,0]-p[rows,1]
         advantage[rows] = next_value[groups]-value+lambda_a*next_advantage[groups]
+        if gamma != 1:
+            advantage[rows] = gamma*next_value[groups]-value+gamma*lambda_a*next_advantage[groups]
         next_p[groups], next_target[groups] = p[rows], target[rows]
         next_value[groups], next_advantage[groups] = value, advantage[rows]
     return target, advantage

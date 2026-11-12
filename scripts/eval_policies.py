@@ -48,8 +48,8 @@ def main():
     actor_a = Actor(load_policy_model(args.a, args.device), idle_env,
                     args.device, sample=True)
     results = []
-    print('| B | Games | A win rate | Wilson 95% | Pair bootstrap 95% | First | Second | Draws |', flush=True)
-    print('|---|---:|---:|---|---|---:|---:|---:|', flush=True)
+    print('| B | Games | A win rate | Wilson 95% | Pair bootstrap 95% | First | Second | Draws | Mean decisions | A win decisions | A loss decisions | Truncations |', flush=True)
+    print('|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|', flush=True)
     for opponent in args.b:
         actor_b = Actor(load_policy_model(opponent, args.device), idle_env,
                         args.device, sample=True)
@@ -57,10 +57,13 @@ def main():
                                     args.threads, args.eval_seed)
         results.append(dict(a=args.a, b=opponent, **summary))
         interval = lambda v: f'{v[0]:.2%}–{v[1]:.2%}'
+        length = lambda key: f'{summary[key]:.2f}' if summary[key] is not None else '—'
         print(f"| {opponent} | {summary['games']} | {summary['win_rate']:.2%} | "
               f"{interval(summary['wilson_interval'])} | {interval(summary['bootstrap_interval'])} | "
               f"{summary['first_win_rate']:.2%} | {summary['second_win_rate']:.2%} | "
-              f"{summary['draws']} |", flush=True)
+              f"{summary['draws']} | {length('mean_game_length')} | "
+              f"{length('mean_win_decisions')} | {length('mean_loss_decisions')} | "
+              f"{summary['truncations']} |", flush=True)
         del actor_b
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(dict(pairs=args.pairs, eval_seed=args.eval_seed,

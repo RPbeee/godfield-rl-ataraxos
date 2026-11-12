@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 from dataclasses import asdict, fields
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -24,7 +25,9 @@ from gfrl.runtime import (add_runtime_args, configure_precision, configure_model
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config', type=Path)
-    p.add_argument('--resume', nargs='?', const='auto')
+    source = p.add_mutually_exclusive_group()
+    source.add_argument('--resume', nargs='?', const='auto')
+    source.add_argument('--init-from', type=Path)
     p.add_argument('--size', choices=['S', 'M', 'L'], default='S')
     p.add_argument('--device', choices=['cpu', 'mps', 'cuda'], default='cpu')
     p.add_argument('--rollout-storage', choices=['device', 'cpu'], default='device')
@@ -62,6 +65,10 @@ def parse_args(argv=None):
         p.error('microbatch-size must be nonnegative (0 = automatic)')
     if not 0 <= args.pool_fraction <= 1 or args.max_hours <= 0:
         p.error('invalid pool_fraction or max_hours')
+    if args.resume and args.init_from:
+        p.error('--resume and --init-from are mutually exclusive')
+    if not 0 < args.gamma <= 1:
+        p.error('gamma must be in (0,1]')
     return args
 
 
@@ -94,16 +101,34 @@ def evaluation_rng(seed, device):
                 torch.cuda.set_rng_state(accelerator_state, device)
 
 
-def save_checkpoint(path, learner, iteration, pool, positions, config, elapsed):
+def save_checkpoint(path, learner, iteration, pool, positions, config, elapsed, stop_reason=None):
     state = dict(model=learner.model.state_dict(), ema=learner.ema.state_dict(),
                  optimizer=learner.optimizer.state_dict(), iteration=iteration, pool=pool,
                  optimizer_steps=learner.optimizer_steps,
                  seed_positions=positions.copy(), config=config,
                  model_config=asdict(learner.model.config), elapsed_s=elapsed,
                  torch_rng=torch.get_rng_state(), numpy_rng=np.random.get_state())
+    state['stop_reason'] = stop_reason
+    state['init_from'] = config.get('init_from')
+    if learner.device.type == 'cuda':
+        state['cuda_rng'] = torch.cuda.get_rng_state_all()
+    elif learner.device.type == 'mps':
+        state['mps_rng'] = torch.mps.get_rng_state()
     temp = path.with_suffix('.tmp')
     torch.save(state, temp)
     temp.replace(path)
+
+
+def rollout_length_metrics(decisions):
+    """Mean own decisions per completed player/game sequence (pool seats excluded)."""
+    c = {k: decisions.columns[k].cpu().numpy() for k in ('env', 'game', 'seat', 'outcome')}
+    keys = np.column_stack([c[k] for k in ('env', 'game', 'seat')])
+    _, first, counts = np.unique(keys, axis=0, return_index=True, return_counts=True)
+    result = {'mean_own_decisions': float(counts.mean()) if len(counts) else None}
+    for name, outcome in (('win', 1), ('loss', -1)):
+        lengths = counts[c['outcome'][first] == outcome]
+        result[f'mean_{name}_own_decisions'] = float(lengths.mean()) if len(lengths) else None
+    return result
 
 
 def run(args):
@@ -112,6 +137,14 @@ def run(args):
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = run_dir / 'checkpoint.pt'
     state = None
+    provenance = None
+    if checkpoint.exists() and not args.resume:
+        raise ValueError(f'{checkpoint} already exists; use --resume auto')
+    if args.init_from and not args.resume:
+        source = Path(args.init_from).resolve()
+        with source.open('rb') as f:
+            provenance = dict(path=str(source), md5=hashlib.file_digest(f, 'md5').hexdigest())
+        state = torch.load(source, map_location='cpu', weights_only=False)
     if args.resume:
         state = torch.load(checkpoint if args.resume == 'auto' else args.resume,
                            map_location='cpu', weights_only=False)
@@ -121,6 +154,7 @@ def run(args):
                                                 'tf32', 'compile', 'compile_mode_actor', 'compile_mode_learner')}
         vars(args).update(state['config'])
         vars(args).update(runtime)
+        provenance = state.get('init_from', state['config'].get('init_from'))
     configure_precision(args.device, args.tf32)
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
@@ -145,9 +179,13 @@ def run(args):
         learner.optimizer_steps = state.get('optimizer_steps', 0)
         pool, iteration = state['pool'], state['iteration']
         positions = state['seed_positions'].copy()
-        elapsed_before = state['elapsed_s']
+        elapsed_before = state['elapsed_s'] if args.resume else 0.
         torch.set_rng_state(state['torch_rng'])
         np.random.set_state(state['numpy_rng'])
+        if args.device == 'cuda' and 'cuda_rng' in state:
+            torch.cuda.set_rng_state_all(state['cuda_rng'])
+        elif args.device == 'mps' and 'mps_rng' in state:
+            torch.mps.set_rng_state(state['mps_rng'])
     configure_model(learner.model, args)
     configure_model(learner.ema, args)
     # Native VecEnv owns its within-session per-env episode stream. Reserve a new
@@ -159,13 +197,14 @@ def run(args):
                           pool_fraction=args.pool_fraction, decision_capacity=args.decision_capacity,
                           stage_capacity=args.stage_capacity, rollout_storage=args.rollout_storage)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    config['init_from'] = provenance
     (run_dir / 'config.json').write_text(json.dumps(config, indent=2)+'\n')
     last_duration = 0.
     for _ in range(args.iterations):
         # Leave a full previous iteration of headroom before starting another.
         if perf_counter()-start + last_duration >= args.max_hours*3600:
             save_checkpoint(checkpoint, learner, iteration, pool, positions, config,
-                            elapsed_before+perf_counter()-start)
+                            elapsed_before+perf_counter()-start, 'time_budget')
             break
         compile_before = compiler_metrics()
         if args.device == 'cuda':
@@ -182,6 +221,7 @@ def run(args):
         if iteration % args.pool_every == 0:
             pool.append(learner.pool_entry(iteration))
             pool = pool[-args.pool_size:]
+        metrics.update(rollout_length_metrics(rollout.decisions))
         metrics.update(iteration=iteration, elapsed_s=elapsed_before+learned-start,
                        games=rollout.games, decisions=len(rollout.decisions),
                        sampled_decisions=rollout.sampled_decisions,

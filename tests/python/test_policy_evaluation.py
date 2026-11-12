@@ -148,3 +148,32 @@ def test_cli(checkpoints, tmp_path):
     run = subprocess.run([sys.executable, str(script), '--list', str(checkpoints[0])],
                          capture_output=True, text=True, check=True)
     assert json.loads(run.stdout)['iterations'] == [30]
+
+
+def test_external_game_lengths_independent_count():
+    lengths = {}
+    def policy(env, rows):
+        for row in rows:
+            if env.substep[row] == 0:
+                game = int(env.episode_id[row])
+                lengths[game] = lengths.get(game, 0)+1
+        return extreme_policy()(env, rows)
+    result = evaluate_policies(policy, policy, 4, 5, 1, 321)
+    assert result['mean_game_length'] == sum(lengths.values())/8
+    assert result['mean_game_length'] <= result['mean_decisions']
+
+
+def test_summary_win_loss_lengths_and_truncations():
+    from gfrl.evaluation import summarize
+    rows = [dict(pair=i//2, agent_seat=i%2, result=outcome, truncated=i==3,
+                 decisions=100, external_decisions=length)
+            for i, (outcome, length) in enumerate([(1, 10), (-1, 20), (1, 30), (0, 40)])]
+    result = summarize(rows)
+    assert result['mean_game_length'] == 25
+    assert result['mean_decisions'] == 100
+    assert result['mean_win_decisions'] == 20
+    assert result['mean_loss_decisions'] == 20
+    assert result['truncations'] == 1
+    empty = summarize([])
+    assert empty['mean_game_length'] is empty['mean_win_decisions'] is empty['mean_loss_decisions'] is None
+    assert empty['truncations'] == 0

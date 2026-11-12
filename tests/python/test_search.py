@@ -515,7 +515,9 @@ def test_exact_pre_task_games_and_reports(cache):
             env.step(result)
     assert actions == case['actions']
     assert json.dumps(reports, sort_keys=True) == json.dumps(case['reports'], sort_keys=True)
-    assert json.loads(json.dumps(summarize(env.eval_results()))) == case['summary']
+    summary = json.loads(json.dumps(summarize(env.eval_results())))
+    # Existing fields remain exact; game-length diagnostics are additive.
+    assert {k: summary[k] for k in case['summary']} == case['summary']
     # Frozen from HEAD parent + original (pre-response) goodfield in an isolated
     # build. Preserve every existing counter; new counters are additive.
     expected_counts = json.loads((Path(__file__).parent/'fixtures/search_counts_before.json').read_text())

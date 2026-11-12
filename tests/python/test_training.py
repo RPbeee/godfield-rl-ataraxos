@@ -310,3 +310,160 @@ def test_resume_optimizer_steps_without_updates(tmp_path, saved_steps):
     train.run(train.parse_args(argv + ['--resume']))
     resumed = torch.load(path, weights_only=False)
     assert resumed['optimizer_steps'] == (saved_steps or 0)
+
+
+@pytest.mark.parametrize('gamma', [.5, .98, .995])
+@pytest.mark.parametrize('outcome', [-1, 0, 1])
+@pytest.mark.parametrize('lv,la', [(0., 0.), (.8, .5), (1., 1.)])
+def test_discounted_targets_reference(gamma, outcome, lv, la):
+    # Independent forward-view n-step mixture, no backwards target recursion.
+    p = np.array([[.4, .2, .4], [.6, .1, .3], [.3, .4, .3]], dtype=np.float32)
+    terminal = np.eye(3)[{1: 0, -1: 1, 0: 2}[outcome]]
+    bootstraps = np.vstack([p, terminal])
+    values = bootstraps[:, 0]-bootstraps[:, 1]
+    expected, advantages, scalar = [], [], []
+    draw = np.array([0., 0., 1.])
+    for t in range(len(p)):
+        distribution = np.zeros(3)
+        value_return = 0.
+        for n in range(1, len(p)-t+1):
+            weight = lv**(n-1) * (1-lv if t+n < len(p) else 1)
+            distribution += weight*(gamma**n*bootstraps[t+n]+(1-gamma**n)*draw)
+            value_return += weight*gamma**n*values[t+n]
+        expected.append(distribution)
+        scalar.append(value_return)
+        advantages.append(sum((gamma*la)**k*(gamma*values[t+k+1]-values[t+k])
+                              for k in range(len(p)-t)))
+    records = [Decision({}, 0, 0, 1, row, outcome=outcome) for row in p]
+    for target, advantage in (sequence_targets(p, outcome, lv, la, gamma),
+                              compute_targets(records, lv, la, gamma)):
+        np.testing.assert_allclose(target, expected, atol=1e-7)
+        np.testing.assert_allclose(advantage, advantages, atol=1e-7)
+        np.testing.assert_allclose(target[:, 0]-target[:, 1], scalar, atol=1e-7)
+        np.testing.assert_allclose(target.sum(1), 1, atol=1e-7)
+
+
+def test_discount_half_hand_computed():
+    p = [[.4, .2, .4], [.6, .1, .3]]
+    for target, advantage in (sequence_targets(p, 1, gamma=.5),
+                              compute_targets([Decision({}, 0, 0, 0, row, outcome=1)
+                                               for row in p], gamma=.5)):
+        np.testing.assert_allclose(target, [[.26, .01, .73], [.5, 0, .5]], atol=1e-7)
+        np.testing.assert_allclose(advantage, [.05, 0], atol=1e-7)
+
+
+def test_gamma_one_bit_identical_to_original():
+    spec = importlib.util.spec_from_file_location('original_targets', Path(__file__).parent/'legacy/targets.py')
+    legacy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(legacy)
+    rng = np.random.default_rng(817)
+    records = []
+    for i in range(200):
+        p = rng.dirichlet([1, 1, 1]).astype(np.float32)
+        records.append(Decision({}, i % 3, i % 2, i % 5, p, outcome=(i % 3)-1))
+    # Compare each implementation to its own original arithmetic (scalar GAE
+    # and batched GAE historically differ in scalar promotion on some NumPy).
+    for outcome in (-1, 0, 1):
+        p = np.array([r.old_value for r in records])
+        for actual, expected in zip(sequence_targets(p, outcome, gamma=1), legacy.sequence_targets(p, outcome)):
+            np.testing.assert_array_equal(actual, expected)
+    # Load the pre-change batched implementation from an independent frozen fixture.
+    spec = importlib.util.spec_from_file_location('original_columnar_targets', Path(__file__).parent/'legacy/columnar_targets.py')
+    original = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(original)
+    for actual, expected in zip(compute_targets(records, gamma=1), original.compute_targets(records)):
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize('gamma', [0, -.1, 1.01, float('nan'), float('inf')])
+def test_invalid_gamma(gamma):
+    for fn, args in ((sequence_targets, (np.zeros((0, 3)), 0)), (compute_targets, ([],))):
+        with pytest.raises(ValueError, match='gamma'):
+            fn(*args, gamma=gamma)
+    with pytest.raises(ValueError, match='gamma'):
+        Learner(tiny(), LearnerConfig(gamma=gamma))
+    with pytest.raises(SystemExit):
+        train_module().parse_args(['--gamma', str(gamma)])
+
+
+def test_init_from_full_state_and_config_resume(tmp_path):
+    train = train_module()
+    source_dir, new_dir = tmp_path/'source', tmp_path/'new'
+    common = ['--device', 'cpu', '--threads', '2', '--num-envs', '8', '--games-per-iter', '2',
+              '--iterations', '1', '--eval-every', '0', '--pool-every', '1']
+    source = train.run(train.parse_args(common+['--d', '32', '--depth', '1', '--run-dir', str(source_dir)]))
+    before = torch.load(source, weights_only=False)
+    argv = common+['--run-dir', str(new_dir), '--init-from', str(source), '--gamma', '.98',
+                   '--lr', '.00003', '--games-per-iter', '3', '--max-hours', '1e-12']
+    path = train.run(train.parse_args(argv))
+    after = torch.load(path, weights_only=False)
+    def equal(a, b):
+        if torch.is_tensor(a):
+            assert torch.equal(a, b)
+        elif isinstance(a, np.ndarray):
+            np.testing.assert_array_equal(a, b)
+        elif isinstance(a, dict):
+            assert a.keys() == b.keys()
+            for k in a:
+                equal(a[k], b[k])
+        elif isinstance(a, (list, tuple)):
+            assert len(a) == len(b)
+            for x, y in zip(a, b):
+                equal(x, y)
+        else:
+            assert a == b
+    for key in ('model', 'ema', 'optimizer', 'optimizer_steps', 'pool', 'iteration',
+                'torch_rng', 'numpy_rng', 'model_config'):
+        equal(before[key], after[key])
+    assert after['seed_positions'] == dict(train=before['seed_positions']['train']+1,
+                                         evaluation=before['seed_positions']['evaluation'])
+    assert after['config']['gamma'] == .98 and after['config']['lr'] == 3e-5
+    assert after['config']['games_per_iter'] == 3
+    assert after['elapsed_s'] < before['elapsed_s']
+    import hashlib
+    with source.open('rb') as f:
+        expected = dict(path=str(source.resolve()), md5=hashlib.file_digest(f, 'md5').hexdigest())
+    assert after['init_from'] == after['config']['init_from'] == expected
+    assert json.loads((new_dir/'config.json').read_text())['init_from'] == expected
+    with pytest.raises(ValueError, match='use --resume'):
+        train.run(train.parse_args(argv))
+    with pytest.raises(ValueError, match='use --resume'):
+        train.run(train.parse_args(common+['--run-dir', str(new_dir)]))
+    train.run(train.parse_args(common+['--run-dir', str(new_dir), '--resume', 'auto']))
+    resumed = torch.load(path, weights_only=False)
+    assert resumed['iteration'] == before['iteration']+1
+    assert resumed['config']['gamma'] == .98
+    assert resumed['config']['games_per_iter'] == 3
+    assert resumed['init_from'] == expected
+    metrics = json.loads((new_dir/'metrics.jsonl').read_text().splitlines()[-1])
+    assert metrics['lr'] == 3e-5
+    assert metrics['mean_own_decisions'] > 0
+
+
+def test_rollout_own_lengths_group_by_seat():
+    from gfrl.rollout import RolloutBatch
+    columns = {k: torch.tensor(v) for k, v in dict(env=[0]*6, game=[0, 0, 0, 1, 1, 2],
+                seat=[0, 0, 1, 0, 0, 1], outcome=[1, 1, -1, -1, -1, 0]).items()}
+    assert train_module().rollout_length_metrics(RolloutBatch(columns, {})) == dict(
+        mean_own_decisions=1.5, mean_win_own_decisions=2., mean_loss_own_decisions=1.5)
+
+
+@pytest.mark.parametrize('gamma', [.5, .98])
+def test_discounted_interleaved_columnar(gamma):
+    from gfrl.rollout import RolloutBatch
+    records = [Decision({}, 0, 0, 1, np.array([.4, .2, .4]), outcome=1),
+               Decision({}, 1, 1, 1, np.array([.1, .6, .3]), outcome=-1),
+               Decision({}, 0, 1, 1, np.array([.3, .3, .4]), outcome=-1),
+               Decision({}, 0, 0, 2, np.array([.2, .6, .2]), outcome=0),
+               Decision({}, 0, 0, 1, np.array([.6, .1, .3]), outcome=1)]
+    expected_target = np.empty((5, 3), dtype=np.float32)
+    expected_advantage = np.empty(5, dtype=np.float32)
+    for rows in ([0, 4], [1], [2], [3]):
+        t, a = sequence_targets([records[i].old_value for i in rows], records[rows[-1]].outcome, gamma=gamma)
+        expected_target[rows], expected_advantage[rows] = t, a
+    columns = {k: torch.as_tensor(np.array([getattr(r, k) for r in records]))
+               for k in ('env', 'game', 'seat', 'old_value', 'outcome')}
+    for batch in (records, RolloutBatch(columns, {})):
+        target, advantage = compute_targets(batch, gamma=gamma)
+        np.testing.assert_allclose(target, expected_target, atol=1e-7)
+        np.testing.assert_allclose(advantage, expected_advantage, atol=1e-7)

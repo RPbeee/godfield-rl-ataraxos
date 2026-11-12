@@ -25,6 +25,7 @@ class LearnerConfig:
     filtering: bool = False
     kl_coef: float = 0.1
     clip: float = 0.2
+    gamma: float = 1.0
     lambda_v: float = 0.8
     lambda_a: float = 0.5
     ema: float = 0.999
@@ -65,6 +66,8 @@ class Learner:
         self.config = config or LearnerConfig()
         if self.config.minibatch_size <= 0 or self.config.microbatch_size < 0:
             raise ValueError('batch sizes must be positive')
+        if not 0 < self.config.gamma <= 1:
+            raise ValueError('gamma must be in (0,1]')
         self.device = torch.device(device)
         self.dtype = dtype
         self.model = model.to(self.device)
@@ -134,11 +137,11 @@ class Learner:
         timings = dict(transfer=0., forward=0., backward=0., targets=0., optimizer=0.)
         update_begin = self._tick()
         since = self._tick()
-        xi, advantages = compute_targets(decisions, cfg.lambda_v, cfg.lambda_a)
+        xi, advantages = compute_targets(decisions, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
         timings['targets'] = self._tick()-since
         keep = (np.abs(advantages) >= max(float(np.quantile(np.abs(advantages), .75)), .01)
                 if cfg.filtering else np.ones(len(decisions), dtype=bool))
-        metrics = dict(policy_loss=0., kl_loss=0., magnet_loss=0., value_loss=0.,
+        metrics = dict(policy_loss=0., kl=0., kl_loss=0., magnet_loss=0., value_loss=0.,
                        entropy=0., ratio_mean=0., clip_fraction=0., value_accuracy=0.)
         # Dropout remains off to match the behavior policies (gradients stay enabled).
         self.model.eval()
@@ -196,7 +199,7 @@ class Learner:
                 since = self._tick()
                 loss.backward()
                 timings['backward'] += self._tick()-since
-                values = dict(policy_loss=policy*selected, kl_loss=cfg.kl_coef*terms['kl']*selected,
+                values = dict(policy_loss=policy*selected, kl=terms['kl'], kl_loss=cfg.kl_coef*terms['kl']*selected,
                               magnet_loss=alpha*terms['magnet']*selected, value_loss=ce,
                               entropy=terms['entropy'], ratio_mean=ratio,
                               clip_fraction=((ratio-1).abs() > cfg.clip).float(),

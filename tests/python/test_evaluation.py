@@ -43,7 +43,8 @@ def test_summary():
     s = summarize(records([1, -1, 0, 0]))
     assert s == dict(games=4, win_rate=.5, wilson_interval=wilson_interval(2, 4),
                      bootstrap_interval=(.5, .5), wins=1, losses=1, draws=2,
-                     truncation_rate=0, mean_decisions=10,
+                     truncation_rate=0, mean_decisions=10, truncations=0,
+                     mean_game_length=10, mean_win_decisions=10, mean_loss_decisions=10,
                      first_win_rate=.75, second_win_rate=.25)
     assert summarize([])['win_rate'] is None
 
