@@ -22,11 +22,13 @@ OPPONENT_TYPES = {'self': 0, 'pool': 1, 'greedy': 2}
 
 def collect_positions(policies, *, positions, opponent='self', pool_fraction=.2,
                       sample_prob=.1, labels_only=False, seed=0, num_envs=64,
-                      threads=1, on_record=None):
+                      threads=1, on_record=None, finish_games=False):
     """Collect exactly positions rows; policies = [latest, *uniform pool].
 
-    Optional on_record(env, rows, saved_slice) is a test hook, invoked before
-    actions. Determinism requires the same batching, device and policies.
+    Optional on_record(env, rows, saved_slice) runs before actions. finish_games
+    completes recorded games and adds terminal minus current engine decision
+    counts. It does not change which positions are recorded. Determinism
+    requires the same batching, device and policies.
     Buffers are preallocated once; there is no list/concatenation copy.
     """
     if positions <= 0 or num_envs <= 0 or threads <= 0:
@@ -37,6 +39,12 @@ def collect_positions(policies, *, positions, opponent='self', pool_fraction=.2,
         raise ValueError('self with pool_fraction > 0 requires a saved pool')
     env = _core.VecEnv(num_envs, threads, seed,
                        controllers=('external', 'external' if opponent == 'self' else 'greedy'))
+    # Offline diagnostics need terminal engine decision numbers. The existing
+    # public play trace includes terminal views, even across automatic reset.
+    if finish_games:
+        for row in range(num_envs):
+            env.enable_play_trace(row, 0)
+        data_end = {}
     fields = ('label_opp_hand', 'label_opp_hand_count') + (() if labels_only else OBS_FIELDS)
     data = {}
     for name in fields:
@@ -54,7 +62,10 @@ def collect_positions(policies, *, positions, opponent='self', pool_fraction=.2,
     written = 0
     decision_index = env.obs_schema()['num']['decisions']
     with _policy_rng(seed, policies):
-        while written < positions:
+        while True:
+            if written == positions and (not finish_games or
+                    all(int(g) in data_end for g in arrays['game_id'])):
+                break
             games = env.episode_id.astype(np.int64) * num_envs + np.arange(num_envs)
             for r in np.flatnonzero(games != previous):
                 route[r] = (routing_rng.integers(1, len(policies))
@@ -76,7 +87,7 @@ def collect_positions(policies, *, positions, opponent='self', pool_fraction=.2,
                 if on_record is not None:
                     on_record(env, selected, {k: v[dest] for k, v in arrays.items()})
                 written += len(selected)
-            if written == positions:
+            if written == positions and not finish_games:
                 break
             choices = np.zeros(num_envs, dtype=np.int32)
             turn_route = np.where(env.actor_seat == 0, 0, route)
@@ -84,6 +95,16 @@ def collect_positions(policies, *, positions, opponent='self', pool_fraction=.2,
                 rows = np.flatnonzero(active & (turn_route == index))
                 choices[rows] = policies[index](env, rows)[rows]
             env.step(choices)
+            if finish_games:
+                for row in range(num_envs):
+                    for event in env.take_play_trace(row):
+                        if event['after']['terminated'] or event['after']['truncated']:
+                            data_end[int(games[row])] = event['after']['decisions']
+    if finish_games:
+        data['decisions_to_end'] = torch.tensor(
+            [data_end[int(g)] - int(d) for g, d in zip(arrays['game_id'], arrays['decision'])],
+            dtype=torch.int32)
+        assert (data['decisions_to_end'] >= 0).all()
     data['config'] = dict(format_version=1, positions=positions, opponent=opponent,
                           pool_fraction=pool_fraction, sample_prob=sample_prob,
                           labels_only=labels_only, seed=seed, num_envs=num_envs,
