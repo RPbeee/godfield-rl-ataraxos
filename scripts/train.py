@@ -163,7 +163,7 @@ def run(args):
         # Resume the saved experiment settings; execution length/device/path remain caller-controlled.
         runtime = {k: getattr(args, k) for k in ('iterations', 'device', 'threads', 'run_dir',
                                                 'resume', 'max_hours', 'config', 'microbatch_size', 'rollout_storage',
-                                                'tf32', 'compile', 'compile_mode_actor', 'compile_mode_learner', 'env_backend','selfplay_streams','gpu_arena_bytes','gpu_pooled_arena')}
+                                                'tf32', 'compile', 'compile_mode_actor', 'compile_mode_learner', 'env_backend','selfplay_streams','gpu_arena_bytes','gpu_pooled_arena', 'learner_backend')}
         if args.env_backend=='cuda':
             runtime['pool_fraction']=args.pool_fraction
         vars(args).update(state['config'])

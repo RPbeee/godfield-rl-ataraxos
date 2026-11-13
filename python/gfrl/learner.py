@@ -31,6 +31,7 @@ class LearnerConfig:
     ema: float = 0.999
     minibatch_size: int = 4096
     microbatch_size: int = 0  # automatic: CPU 32, CUDA full minibatch
+    learner_backend: str = 'eager'  # CUDA packed-* execution; see docs/gpu_learner.md
 
 
 def schedules(config, iteration):
@@ -74,6 +75,9 @@ class Learner:
         self.ema = deepcopy(model).eval().requires_grad_(False)
         self.optimizer = torch.optim.Adam(model.parameters(), lr=self.config.lr)
         self.optimizer_steps = 0
+        if self.config.learner_backend != 'eager':
+            from .fast_learner import configure_fast_learner
+            configure_fast_learner(self, self.config.learner_backend)
 
     def autocast(self):
         return (nullcontext() if self.dtype == 'fp32' else torch.autocast(
@@ -104,6 +108,8 @@ class Learner:
     def forward(self, decisions):
         if hasattr(decisions, 'columns'):
             decisions = self._prepare(decisions, torch.arange(len(decisions), device=self.device))
+        if isinstance(decisions, dict) and hasattr(self, '_packed_forward'):
+            return self._packed_forward(decisions)
         if isinstance(decisions, dict):
             obs = {k: decisions[k] for k in OBS_FIELDS}
             prefix = {k: decisions[k] for k in PREFIX_FIELDS}
@@ -124,25 +130,55 @@ class Learner:
         return terms, value
 
     def _tick(self):
+        if hasattr(self, '_packed_forward'):
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return event
         synchronize(self.device)
         return perf_counter()
+
+    def _elapsed(self, since, name, timings):
+        now = self._tick()
+        if hasattr(self, '_packed_forward'):
+            self._timing_events.append((name, since, now))
+        else:
+            timings[name] += now-since
 
     def update(self, decisions, iteration):
         if not decisions:
             raise ValueError('no completed training decisions')
         cfg = self.config
+        fast = hasattr(self, '_packed_forward')
+        if fast:
+            # Checkpoint loading restores the saved execution flags as well.
+            for group in self.optimizer.param_groups:
+                group.update(fused=True, foreach=False)
+            for state in self.optimizer.state.values():
+                if 'step' in state and state['step'].device != self.device:
+                    state['step'] = state['step'].to(self.device)
         lr, alpha = schedules(cfg, iteration)
         for group in self.optimizer.param_groups:
             group['lr'] = lr
         timings = dict(transfer=0., forward=0., backward=0., targets=0., optimizer=0.)
-        update_begin = self._tick()
+        synchronize(self.device)
+        update_begin = perf_counter()
+        self._timing_events = []
         since = self._tick()
-        xi, advantages = compute_targets(decisions, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
-        timings['targets'] = self._tick()-since
-        keep = (np.abs(advantages) >= max(float(np.quantile(np.abs(advantages), .75)), .01)
-                if cfg.filtering else np.ones(len(decisions), dtype=bool))
+        if fast and hasattr(decisions, 'columns') and decisions.env.is_cuda:
+            from .gpu.targets import compute_targets as gpu_targets
+            xi, advantages = gpu_targets(decisions, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
+        else:
+            xi, advantages = compute_targets(decisions, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
+        self._elapsed(since, 'targets', timings)
+        if torch.is_tensor(advantages):
+            keep = ((advantages.abs() >= advantages.abs().quantile(.75).clamp_min(.01))
+                    if cfg.filtering else torch.ones_like(advantages, dtype=torch.bool))
+        else:
+            keep = (np.abs(advantages) >= max(float(np.quantile(np.abs(advantages), .75)), .01)
+                    if cfg.filtering else np.ones(len(decisions), dtype=bool))
         metrics = dict(policy_loss=0., kl=0., kl_loss=0., magnet_loss=0., value_loss=0.,
                        entropy=0., ratio_mean=0., clip_fraction=0., value_accuracy=0.)
+        metric_sums = []
         # Dropout remains off to match the behavior policies (gradients stay enabled).
         self.model.eval()
         order = np.random.permutation(len(decisions))
@@ -158,13 +194,14 @@ class Learner:
             xi, advantages, keep = self._tensor(xi), self._tensor(advantages), self._tensor(keep)
         for start in range(0, len(order), cfg.minibatch_size):
             batch = order[start:start+cfg.minibatch_size]
-            policy_count = max(int(keep[batch].sum()), 1)
+            policy_count = (len(batch) if fast and not cfg.filtering else
+                            max(int(keep[batch].sum()), 1))
             self.optimizer.zero_grad(set_to_none=True)
             packed = None
             if columnar and not cpu_storage:
                 since = self._tick()
                 packed = self._prepare(decisions, batch, xi, advantages, keep)
-                timings['transfer'] += self._tick()-since
+                self._elapsed(since, 'transfer', timings)
                 stage_offsets = torch.cat((batch.new_zeros(1), decisions.stage_count[batch].cumsum(0)))
             microbatch = cfg.microbatch_size or (len(batch) if self.device.type == 'cuda' else 32)
             # Accumulate microbatches for bounded activation memory; one Adam step per minibatch.
@@ -173,17 +210,20 @@ class Learner:
                 if cpu_storage:
                     since = self._tick()
                     inputs = self._prepare(decisions, rows, xi, advantages, keep)
-                    timings['transfer'] += self._tick()-since
+                    self._elapsed(since, 'transfer', timings)
                 since = self._tick()
                 if cpu_storage:
                     terms, value = self.forward(inputs)
                     advantage, selected, target = inputs['advantage'], inputs['selected'], inputs['xi']
                 elif packed is not None:
                     end = offset+len(rows)
-                    stage_slice = slice(int(stage_offsets[offset]), int(stage_offsets[end]))
-                    inputs = {k: v[offset:end] if k in (*OBS_FIELDS, 'xi', 'advantage', 'selected')
-                              else v[stage_slice] for k,v in packed.items()}
-                    inputs['owners'] = inputs['owners']-offset
+                    if offset == 0 and end == len(batch):
+                        inputs = packed
+                    else:
+                        stage_slice = slice(int(stage_offsets[offset]), int(stage_offsets[end]))
+                        inputs = {k: v[offset:end] if k in (*OBS_FIELDS, 'xi', 'advantage', 'selected')
+                                  else v[stage_slice] for k,v in packed.items()}
+                        inputs['owners'] = inputs['owners']-offset
                     terms, value = self.forward(inputs)
                     advantage, selected, target = inputs['advantage'], inputs['selected'], inputs['xi']
                 else:
@@ -195,34 +235,49 @@ class Learner:
                 ce = -(target*F.log_softmax(value, -1)).sum(-1)
                 total_policy = policy + cfg.kl_coef*terms['kl'] + alpha*terms['magnet']
                 loss = (total_policy*selected).sum()/policy_count + ce.sum()/len(batch)
-                timings['forward'] += self._tick()-since
+                self._elapsed(since, 'forward', timings)
                 since = self._tick()
                 loss.backward()
-                timings['backward'] += self._tick()-since
+                self._elapsed(since, 'backward', timings)
                 values = dict(policy_loss=policy*selected, kl=terms['kl'], kl_loss=cfg.kl_coef*terms['kl']*selected,
                               magnet_loss=alpha*terms['magnet']*selected, value_loss=ce,
                               entropy=terms['entropy'], ratio_mean=ratio,
                               clip_fraction=((ratio-1).abs() > cfg.clip).float(),
                               value_accuracy=(value.argmax(-1) == target.argmax(-1)).float())
-                for key, val in values.items():
-                    metrics[key] += float(val.detach().sum().cpu())
+                if hasattr(self, '_packed_forward'):
+                    metric_sums.append(torch.stack([v.detach().sum() for v in values.values()]))
+                else:
+                    for key, val in values.items():
+                        metrics[key] += float(val.detach().sum().cpu())
             since = self._tick()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             decay = min(cfg.ema, (1 + self.optimizer_steps) / (10 + self.optimizer_steps))
             self.optimizer_steps += 1
             with torch.no_grad():
-                for ema, current in zip(self.ema.parameters(), self.model.parameters()):
-                    ema.lerp_(current, 1-decay)
+                if hasattr(self, '_packed_forward'):
+                    torch._foreach_lerp_(list(self.ema.parameters()), list(self.model.parameters()), 1-decay)
+                else:
+                    for ema, current in zip(self.ema.parameters(), self.model.parameters()):
+                        ema.lerp_(current, 1-decay)
                 for ema, current in zip(self.ema.buffers(), self.model.buffers()):
                     ema.copy_(current)
-            timings['optimizer'] += self._tick()-since
+            self._elapsed(since, 'optimizer', timings)
+        if metric_sums:
+            # Preserve the original microbatch sum and Python double accumulation.
+            for sums in torch.stack(metric_sums).cpu().tolist():
+                for key, value in zip(metrics, sums):
+                    metrics[key] += value
         for key in metrics:
             denom = max(int(keep.sum()), 1) if key in ('policy_loss', 'kl_loss', 'magnet_loss') else len(decisions)
             metrics[key] /= denom
         metrics.update(lr=lr, alpha=alpha, filtering_fraction=float(keep.float().mean())
                        if columnar else float(keep.mean()))
-        timings['other'] = self._tick()-update_begin-sum(timings.values())
+        synchronize(self.device)
+        for name, begin, end in self._timing_events:
+            timings[name] += begin.elapsed_time(end)/1000
+        self._timing_events = []
+        timings['other'] = perf_counter()-update_begin-sum(timings.values())
         metrics.update({'learn_'+k+'_s': v for k,v in timings.items()})
         return metrics
 
