@@ -69,8 +69,8 @@ def parse_args(argv=None):
         p.error('microbatch-size must be nonnegative (0 = automatic)')
     if not 0 <= args.pool_fraction <= 1 or args.max_hours <= 0:
         p.error('invalid pool_fraction or max_hours')
-    if args.env_backend == 'cuda' and (args.device != 'cuda' or args.pool_fraction != 0 or args.rollout_storage != 'device' or args.compile != 'off'):
-        p.error('CUDA env backend requires --device cuda --pool-fraction 0 --rollout-storage device --compile off')
+    if args.env_backend == 'cuda' and (args.device != 'cuda' or args.rollout_storage != 'device' or args.compile != 'off'):
+        p.error('CUDA env backend requires --device cuda --rollout-storage device --compile off')
     if args.selfplay_streams>args.num_envs or (args.env_backend=='cpu' and args.selfplay_streams!=1):
         p.error('selfplay-streams requires CUDA backend and cannot exceed num-envs')
     if args.gpu_arena_bytes is not None and (args.gpu_arena_bytes<4096 or args.gpu_arena_bytes%16):
@@ -164,8 +164,6 @@ def run(args):
         runtime = {k: getattr(args, k) for k in ('iterations', 'device', 'threads', 'run_dir',
                                                 'resume', 'max_hours', 'config', 'microbatch_size', 'rollout_storage',
                                                 'tf32', 'compile', 'compile_mode_actor', 'compile_mode_learner', 'env_backend','selfplay_streams','gpu_arena_bytes','gpu_pooled_arena', 'learner_backend')}
-        if args.env_backend=='cuda':
-            runtime['pool_fraction']=args.pool_fraction
         vars(args).update(state['config'])
         vars(args).update(runtime)
         provenance = state.get('init_from', state['config'].get('init_from'))

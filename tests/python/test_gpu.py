@@ -82,14 +82,15 @@ def test_exact_replay(seed, history_len, canonical, pooled, execution, monkeypat
 
 @pytest.mark.parametrize('short_attention',[False,True])
 @pytest.mark.parametrize('tma',[False,True])
-def test_packed_encoder_dynamic_counts_and_weight_refresh(short_attention,tma):
+@pytest.mark.parametrize('width,heads',[(128,4),(384,8)])
+def test_packed_encoder_dynamic_counts_and_weight_refresh(short_attention,tma,width,heads):
     from types import SimpleNamespace
     from gfrl.model import Model, ModelConfig, OBS_FIELDS
     from gfrl.gpu.packed import PackedEncoder
     from gfrl.runtime import encoder_fastpath_disabled
     cpu = VecEnv(8, num_threads=2, base_seed=72, history_len=8)
     rng = np.random.default_rng(72)
-    model = Model(ModelConfig(d=128, depth=2, heads=4, ff=512)).cuda().eval()
+    model = Model(ModelConfig(d=width, depth=2, heads=heads, ff=4*width)).cuda().eval()
     obs = {k:torch.tensor(getattr(cpu,k).copy(), device='cuda') for k in OBS_FIELDS}
     env = SimpleNamespace(**obs, device=torch.device('cuda'))
     packed = PackedEncoder(model, env)
@@ -134,7 +135,8 @@ def test_long_rollout_resets_exact():
         assert cpu.stats() == gpu.stats()
 
 
-def test_sparse_heads_match_public_model():
+@pytest.mark.parametrize('width,heads',[(128,4),(384,8)])
+def test_sparse_heads_match_public_model(width,heads):
     from types import SimpleNamespace
     from gfrl.actor import PREFIX_FIELDS
     from gfrl.model import Model, ModelConfig, OBS_FIELDS
@@ -144,7 +146,7 @@ def test_sparse_heads_match_public_model():
     for _ in range(61):cpu.step(np.array([rng.choice(np.flatnonzero(m)) for m in cpu.mask],dtype=np.int32))
     fields={k:torch.tensor(getattr(cpu,k).copy(),device='cuda') for k in (*OBS_FIELDS,*PREFIX_FIELDS)}
     env=SimpleNamespace(**fields,num_envs=16,device=torch.device('cuda'))
-    model=Model(ModelConfig(d=128,depth=2,heads=4,ff=512)).cuda().eval()
+    model=Model(ModelConfig(d=width,depth=2,heads=heads,ff=4*width)).cuda().eval()
     heads=SparseHeads(model,env)
     with torch.inference_mode(),torch.autocast('cuda',dtype=torch.bfloat16):
         encoded=model.encode({k:fields[k] for k in OBS_FIELDS},pack=False)[:,:21].contiguous()
@@ -277,3 +279,121 @@ def test_paged_column_growth_gather_and_overlap_compaction():
     column.append(source[:5000],len(indices))
     expected=torch.cat((expected,source[:5000]))
     torch.testing.assert_close(column.gather(torch.arange(len(expected),device='cuda')),expected,atol=0,rtol=0)
+
+
+@pytest.mark.parametrize('size', ['M', 'L'])
+def test_routed_actor_matches_each_public_policy_and_capture_preserves_state(size):
+    from copy import deepcopy
+    from gfrl.gpu import FIELDS, GpuEnv
+    from gfrl.gpu.actor import RoutedGpuActor
+    from gfrl.model import Model, ModelConfig, OBS_FIELDS
+    from gfrl.actor import PREFIX_FIELDS
+    from gfrl.runtime import encoder_fastpath_disabled
+    torch.manual_seed(21)
+    model = Model(ModelConfig.preset(size)).cuda().eval()
+    opponent = deepcopy(model)
+    with torch.no_grad():
+        opponent.kind_head.bias.add_(torch.arange(10, device='cuda') * .2)
+    with GpuEnv(4, base_seed=31, history_len=8) as env:
+        seats = env.actor_seat.clone()
+        seats[0] = -1
+        policy = torch.full((4,), 17, device='cuda', dtype=torch.int64)
+        actor = RoutedGpuActor(model, env, opponents={17: opponent, 19: deepcopy(model)},
+                               opponent_seat=seats, opponent_policy=policy, sample=False)
+        for tick in range(2):
+            if tick:
+                with torch.no_grad():
+                    model.kind_head.bias.add_(torch.arange(10, device='cuda') * .3)
+                actor.refresh()
+            # A policy with zero routed rows is also captured and must stay finite.
+            with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16), encoder_fastpath_disabled():
+                encoded = actor.encode()
+                choices, actual, values = actor.act(encoded)
+                for selected, reference in [(env.actor_seat != seats, model),
+                                             (env.actor_seat == seats, opponent)]:
+                    features = reference.encode({k:getattr(env,k) for k in OBS_FIELDS}, pack=False)
+                    expected, expected_value = reference.heads(features, **{k:getattr(env,k) for k in PREFIX_FIELDS})
+                    torch.testing.assert_close(actual[selected], expected[selected], atol=.06, rtol=.03)
+                    torch.testing.assert_close(values[selected], expected_value[selected], atol=.04, rtol=.03)
+            if not tick:
+                before = {k:getattr(env,k).clone() for k in FIELDS}
+                stats = env.stats()
+                actor.capture(record=True)
+                for k in FIELDS:
+                    torch.testing.assert_close(getattr(env,k), before[k], atol=0, rtol=0)
+                assert env.stats() == stats
+            finished, data = actor.round(record=True)
+            assert finished.all()
+            assert torch.isfinite(data['stages'][0]['old_value']).all()
+
+
+@pytest.mark.parametrize('streams', [1, 2])
+@pytest.mark.parametrize('fraction', [0., .2, 1.])
+def test_pool_collector_routing_eviction_and_training_rows(streams, fraction, monkeypatch):
+    from gfrl.gpu.collector import GpuCollector
+    from gfrl.model import Model, ModelConfig
+    from gfrl.learner import Learner
+    from gfrl.pool import assign_opponents
+    from gfrl.gpu.actor import GpuActor, ParallelGpuActor
+    from gfrl.gpu import FIELDS
+    torch.manual_seed(19)
+    model = Model(ModelConfig(d=64, depth=1, heads=2, ff=256)).cuda()
+    entry = Learner(model).pool_entry(7)
+    other = dict(iteration=11, weights={k:v.clone() for k,v in entry['weights'].items()})
+    other['weights']['kind_head.bias'] += torch.arange(10) * .4
+    c = GpuCollector(model, num_envs=8, seed=81, streams=streams, pool_fraction=fraction)
+    cpu = VecEnv(8, num_threads=2, base_seed=81)
+    rng = np.random.default_rng(81)
+    assigned = np.zeros(8, dtype=bool)
+    seats = np.full(8, -1, dtype=np.int8)
+    policies = np.full(8, -1, dtype=np.int64)
+    expected_training = {}
+    seen_assignments = set()
+    pool = []
+    base_round = GpuActor.round if streams == 1 else ParallelGpuActor.round
+
+    def checked_round(actor, *, record=False):
+        if actor is not c.actor:
+            return base_round(actor, record=record)
+        if fraction:
+            fresh = np.flatnonzero(~assigned)
+            assign_opponents(rng, fresh, pool, fraction, seats, policies)
+            assigned[fresh] = True
+            np.testing.assert_array_equal(c.opponent_seat, seats)
+            np.testing.assert_array_equal(c.opponent_policy, policies)
+        for row in range(8):
+            game = int(cpu.episode_id[row])
+            expected_training[row, game] = int(seats[row])
+            seen_assignments.add((row, game, int(policies[row])))
+        finished, data = base_round(actor, record=record)
+        for stage in data['stages']:
+            actions = torch.where(stage['valid'], stage['choice'], -1).cpu().numpy().astype(np.int32)
+            cpu.step(actions)
+        for name in FIELDS:
+            np.testing.assert_array_equal(getattr(cpu,name), getattr(c.env,name).cpu().numpy(), err_msg=name)
+        ended = np.asarray(cpu.episode_done)
+        assigned[ended] = False
+        seats[ended] = policies[ended] = -1
+        return finished, data
+
+    monkeypatch.setattr(GpuActor if streams == 1 else ParallelGpuActor, 'round', checked_round)
+    try:
+        pending = 0
+        # Empty startup, full pool, eviction, then no available pool. A previously
+        # assigned snapshot remains pinned even when no longer offered for draws.
+        for pool in ([], [entry, other], [other], []):
+            batch = c.collect(24, pool)
+            assert batch.timings['carried_decisions'] == pending
+            pending = c.columns.size
+            for row, game, seat in zip(batch.env.cpu().tolist(), batch.game.cpu().tolist(), batch.seat.cpu().tolist()):
+                assert seat != expected_training[row, game]
+            assert batch.outcome.abs().max() <= 1
+            assert int(batch.stage_count.sum()) == len(batch.stages['choice'])
+            assert batch.stages['mask'].gather(1, batch.stages['choice'].long()[:, None]).all()
+            assert c.env.stats() == cpu.stats()
+        if fraction:
+            assert any(key >= 0 for _, _, key in seen_assignments)
+        else:
+            assert not c._models
+    finally:
+        c.close()

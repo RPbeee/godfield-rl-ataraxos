@@ -18,8 +18,9 @@ class GpuActor:
         self.model = model.to(device=env.device, dtype=torch.float32).eval()
         self.env, self.sample, self.dtype = env, sample, dtype
         self._graphs = {}
+        self._execute = torch.ones((), dtype=torch.bool, device=env.device)
         if packed is None:
-            packed = dtype == 'bf16' and not (model.config.d & (model.config.d-1))
+            packed = dtype == 'bf16'
         self.packed_encoder = None
         self.sparse_heads = None
         if packed:
@@ -35,11 +36,11 @@ class GpuActor:
             'cuda', dtype={'fp16':torch.float16, 'bf16':torch.bfloat16}[self.dtype]))
 
     @torch.inference_mode()
-    def encode(self):
+    def encode(self, active=None):
         # Fixed width avoids Model.encode's packed-width .tolist() sync. Heads
         # use only CLS and the original 18 hand slots, so discard other outputs.
         if self.packed_encoder is not None:
-            return self.packed_encoder()
+            return self.packed_encoder(active)
         with self._autocast():
             return self.model.encode({k:getattr(self.env,k) for k in OBS_FIELDS}, pack=False)[:, :21].contiguous()
 
@@ -64,7 +65,8 @@ class GpuActor:
         """
         env = self.env
         encoded = self.encode()
-        values = self.sparse_heads.values(encoded) if self.sparse_heads is not None else None
+        values = (self.sparse_heads.values(encoded)
+                  if self.sparse_heads is not None and isinstance(encoded, torch.Tensor) else None)
         finished = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         trajectory = None
         if record:
@@ -78,7 +80,8 @@ class GpuActor:
                 stage.update(valid=~finished, choice=choices, old_log_probs=lp,
                              old_value=value)
                 trajectory['stages'].append(stage)
-            env.step(torch.where(finished, -1, choices), _active=~finished)
+            active = ~finished & self._execute
+            env.step(torch.where(active, choices, -1), _active=active)
             finished = finished | env.decision_done
         if record:
             trajectory.update(finished=finished, outcome=env.outcome.clone(),
@@ -97,18 +100,23 @@ class GpuActor:
             raise RuntimeError('GpuEnv is closed')
         if record in self._graphs:
             return
-        # Warm up on a side stream before capture. These are real self-play
-        # decisions and callers must account for them as warmup.
+        # Compile/capture with every engine lane frozen at its decision start.
+        # Recapturing for a changed pool must never consume or discard a move
+        # from an unfinished trajectory. The execution gate is read on replay.
+        self._execute.fill_(False)
         stream = torch.cuda.Stream(device=self.env.device)
         stream.wait_stream(torch.cuda.current_stream(self.env.device))
-        with torch.cuda.stream(stream):
-            self._round(record=record)
-        torch.cuda.current_stream(self.env.device).wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            output = self._round(record=record)
-        torch.cuda.current_stream(self.env.device).wait_stream(stream)
-        self._graphs[record] = (graph, output)
+        try:
+            with torch.cuda.stream(stream):
+                self._round(record=record)
+            torch.cuda.current_stream(self.env.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                output = self._round(record=record)
+            torch.cuda.current_stream(self.env.device).wait_stream(stream)
+            self._graphs[record] = (graph, output)
+        finally:
+            self._execute.fill_(True)
 
     def round(self, *, record=False):
         if self.env._closed:
@@ -120,21 +128,72 @@ class GpuActor:
         return self._round(record=record)
 
 
+class RoutedGpuActor(GpuActor):
+    """Freeze game/seat routing for all stages of one external decision."""
+    def __init__(self, model, env, *, opponents, opponent_seat, opponent_policy,
+                 sample=True, dtype='bf16'):
+        super().__init__(model, env, sample=sample, dtype=dtype)
+        self.opponent_seat, self.opponent_policy = opponent_seat, opponent_policy
+        self.opponents = {key: GpuActor(policy, env, sample=sample, dtype=dtype)
+                          for key, policy in opponents.items()}
+
+    def encode(self, active=None):
+        route = torch.where(self.env.actor_seat == self.opponent_seat,
+                            self.opponent_policy, -1)
+        policies = [(-1, self), *self.opponents.items()]
+        encoded = []
+        for key, actor in policies:
+            rows = route == key
+            features = GpuActor.encode(actor, rows)
+            values = actor.sparse_heads.values(features) if actor.sparse_heads is not None else None
+            encoded.append((actor, rows, features, values))
+        return encoded
+
+    def act(self, encoded, active=None, value_logits=None):
+        lp = torch.zeros((self.env.num_envs, 21), device=self.env.device)
+        value = torch.zeros((self.env.num_envs, 3), device=self.env.device)
+        for actor, rows, features, cached_values in encoded:
+            live = rows if active is None else rows & active
+            if actor.sparse_heads is not None:
+                probs = actor.sparse_heads(features, live)
+                values = cached_values
+            else:
+                with actor._autocast():
+                    probs, values = actor.model.heads(features, **{
+                        k: getattr(self.env, k) for k in PREFIX_FIELDS})
+            lp = torch.where(rows[:, None], probs, lp)
+            value = torch.where(rows[:, None], values, value)
+        choices = torch.multinomial(lp.exp(), 1).squeeze(1) if self.sample else lp.argmax(-1)
+        return choices.to(torch.int32), lp, value
+
+    def refresh(self):
+        super().refresh()
+        # Opponent snapshots are immutable and have their own cached weights.
+
+
 class ParallelGpuActor:
     """Fork/join decision rounds over disjoint views in one CUDA Graph."""
     capture=GpuActor.capture
     round=GpuActor.round
 
-    def __init__(self,model,env,*,streams=2,sample=True,dtype='bf16'):
+    def __init__(self,model,env,*,streams=2,sample=True,dtype='bf16',
+                 opponents=None,opponent_seat=None,opponent_policy=None):
         if not 1<=streams<=env.num_envs:
             raise ValueError('streams must be in 1..num_envs')
         self.model,self.env,self.dtype=model,env,dtype
         self._graphs={}
+        self._execute=torch.ones((),dtype=torch.bool,device=env.device)
         self.actors=[]
         self.streams=[]
         for i in range(streams):
             start=env.num_envs*i//streams;stop=env.num_envs*(i+1)//streams
-            self.actors.append(GpuActor(model,env._slice(start,stop),sample=sample,dtype=dtype))
+            view=env._slice(start,stop)
+            actor=(GpuActor(model,view,sample=sample,dtype=dtype) if not opponents else
+                   RoutedGpuActor(model,view,sample=sample,dtype=dtype,opponents=opponents,
+                                  opponent_seat=opponent_seat[start:stop],
+                                  opponent_policy=opponent_policy[start:stop]))
+            actor._execute=self._execute
+            self.actors.append(actor)
             self.streams.append(torch.cuda.Stream(device=env.device))
         self.packed_encoder=self.actors[0].packed_encoder
 

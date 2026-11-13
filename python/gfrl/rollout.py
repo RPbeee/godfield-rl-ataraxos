@@ -11,6 +11,7 @@ import torch
 from . import VecEnv
 from .actor import Actor, PREFIX_FIELDS, synchronize
 from .model import OBS_FIELDS
+from .pool import assign_opponents
 from .transfer import tensor_batch
 
 
@@ -252,20 +253,13 @@ class Collector:
             new_games = active[~self.assigned[active]]
             if len(new_games):
                 self.assigned[new_games] = True
-                if pool:
-                    selected = new_games[self.rng.random(len(new_games)) < self.pool_fraction]
-                    entries = self.rng.integers(len(pool), size=len(selected))
-                    self.opponent_seat[selected] = self.rng.integers(2, size=len(selected))
-                    for j, entry in enumerate(pool):
-                        rows = selected[entries == j]
-                        if not len(rows):
-                            continue
-                        key = entry['iteration']
-                        if key not in self.actors:
-                            model = deepcopy(self.model)
-                            model.load_state_dict(entry['weights'])
-                            self.actors[key] = Actor(model, env, self.device, dtype=self.dtype)
-                        self.opponent_policy[rows] = key
+                selected = assign_opponents(self.rng, new_games, pool, self.pool_fraction,
+                                            self.opponent_seat, self.opponent_policy)
+                for key, entry in selected.items():
+                    if key not in self.actors:
+                        model = deepcopy(self.model)
+                        model.load_state_dict(entry['weights'])
+                        self.actors[key] = Actor(model, env, self.device, dtype=self.dtype)
             self.routing[fresh] = np.where(snapshot['actor_seat'][fresh] == self.opponent_seat[fresh],
                                             self.opponent_policy[fresh], -1)
             # Transfer each persistent native buffer once, before any row selection.

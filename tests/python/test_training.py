@@ -467,3 +467,11 @@ def test_discounted_interleaved_columnar(gamma):
         target, advantage = compute_targets(batch, gamma=gamma)
         np.testing.assert_allclose(target, expected_target, atol=1e-7)
         np.testing.assert_allclose(advantage, expected_advantage, atol=1e-7)
+
+
+def test_cuda_backend_accepts_main_training_pool_fraction():
+    args = train_module().parse_args(['--device', 'cuda', '--env-backend', 'cuda',
+                                      '--dtype', 'bf16', '--size', 'L',
+                                      '--learner-backend', 'packed-grouped'])
+    assert args.pool_fraction == .2
+    assert args.size == 'L'

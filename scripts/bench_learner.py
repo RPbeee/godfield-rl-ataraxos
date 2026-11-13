@@ -21,6 +21,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', type=Path, required=True)
     p.add_argument('--data', type=Path, required=True)
+    p.add_argument('--pool-fraction', type=float, default=0.)
     p.add_argument('--collect', action='store_true')
     p.add_argument('--num-envs', type=int, default=1024)
     p.add_argument('--games', type=int, default=2048)
@@ -45,21 +46,25 @@ def main():
     model.load_state_dict(state['model'])
     cfg = LearnerConfig(**{f.name: state['config'][f.name] for f in fields(LearnerConfig)
                            if f.name in state['config']})
+    # The requested benchmark backend overrides the checkpoint's runtime backend.
+    cfg.learner_backend = 'eager'
     cfg.minibatch_size, cfg.microbatch_size = args.minibatch_size, args.microbatch_size
     learner = Learner(model, cfg, 'cuda', args.dtype)
     learner.ema.load_state_dict(state['ema'])
     learner.optimizer.load_state_dict(state['optimizer'])
     learner.optimizer_steps = state.get('optimizer_steps', 0)
+    for group in learner.optimizer.param_groups:
+        group.update(fused=False, foreach=None)
     iteration = state['iteration'] + 1
     if args.collect:
         from gfrl.gpu.collector import GpuCollector
         collector = GpuCollector(model, num_envs=args.num_envs, seed=42, dtype='bf16',
-                                 pool_fraction=0, pooled=True, arena_bytes=262144)
+                                 pool_fraction=args.pool_fraction, pooled=True, arena_bytes=262144)
         for i in range(args.collect_warmup):
-            batch = collector.collect(128)
+            batch = collector.collect(128, state.get('pool',[]))
             print(json.dumps(dict(collect_warmup=i, decisions=len(batch))), flush=True)
             del batch
-        batch = collector.collect(args.games)
+        batch = collector.collect(args.games, state.get('pool',[]))
         torch.save(dict(columns={k:v.cpu() for k,v in batch.columns.items()},
                         stages={k:v.cpu() for k,v in batch.stages.items()}), args.data)
         print(json.dumps(dict(saved=str(args.data), decisions=len(batch))), flush=True)
@@ -85,6 +90,8 @@ def main():
         learner.model.load_state_dict(state['model'])
         learner.ema.load_state_dict(state['ema'])
         learner.optimizer.load_state_dict(state['optimizer'])
+        for group in learner.optimizer.param_groups:
+            group.update(fused=args.backend != 'eager', foreach=False if args.backend != 'eager' else None)
         learner.optimizer_steps = state['optimizer_steps']
         np.random.seed(42)
         measure(learner, batch, args, iteration)

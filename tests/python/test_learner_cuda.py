@@ -7,7 +7,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA requ
 
 
 @pytest.mark.parametrize('head_only', [False, True])
-def test_short_attention_forward_backward(head_only):
+@pytest.mark.parametrize('head_dim', [32, 48])
+def test_short_attention_forward_backward(head_only, head_dim):
     from gfrl.gpu.attention_training import short_attention
     from torch.nn.attention.varlen import varlen_attn
     from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -16,7 +17,7 @@ def test_short_attention_forward_backward(head_only):
     qlengths = lengths.clamp_max(21) if head_only else lengths
     ck = torch.nn.functional.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
     cq = torch.nn.functional.pad(qlengths.cumsum(0, dtype=torch.int32), (1, 0))
-    tensors = [torch.randn(int(total), 8, 32, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    tensors = [torch.randn(int(total), 8, head_dim, device='cuda', dtype=torch.bfloat16, requires_grad=True)
                for total in [cq[-1], ck[-1], ck[-1]]]
     clones = [t.detach().clone().requires_grad_(True) for t in tensors]
     actual = short_attention(*tensors, cq, ck, 21 if head_only else 119, 119)
@@ -94,7 +95,8 @@ def test_fp8_linear_backward_is_finite_and_close():
 
 
 @pytest.mark.parametrize('head_only', [False, True])
-def test_grouped_attention_interleaved_gradient(head_only):
+@pytest.mark.parametrize('head_dim', [32, 48])
+def test_grouped_attention_interleaved_gradient(head_only, head_dim):
     from gfrl.gpu.attention_packed_training import packed_attention
     from torch.nn.attention.varlen import varlen_attn
     from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -103,7 +105,7 @@ def test_grouped_attention_interleaved_gradient(head_only):
     qlengths=lengths.clamp_max(21) if head_only else lengths
     ck=torch.nn.functional.pad(lengths.cumsum(0,dtype=torch.int32),(1,0))
     cq=torch.nn.functional.pad(qlengths.cumsum(0,dtype=torch.int32),(1,0))
-    x=torch.randn(int(ck[-1]),3,8,32,device='cuda',dtype=torch.bfloat16,requires_grad=True)
+    x=torch.randn(int(ck[-1]),3,8,head_dim,device='cuda',dtype=torch.bfloat16,requires_grad=True)
     y=x.detach().clone().requires_grad_(True)
     q,k,v=y.unbind(1)
     if head_only:

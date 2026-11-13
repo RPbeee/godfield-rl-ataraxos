@@ -63,7 +63,7 @@ def _linear(X,W,B,Y,Map,Count,K:tl.constexpr,N:tl.constexpr,GATHER:tl.constexpr,
 def _embed(ObsType,ObsCards,ObsAux,ObsCat,Map,Count,Numeric,Types,Roles,Cards,Aux,Cats,Out,
            D:tl.constexpr,T:tl.constexpr,C:tl.constexpr,OFFSETS:tl.constexpr,SM:tl.constexpr,R:tl.constexpr=8):
     active=tl.load(Count)
-    d=tl.arange(0,D)
+    d=tl.arange(0,tr.next_power_of_2(D))
     for block in range(tl.program_id(0),tl.cdiv(active,R),SM):
         row=block*R+tl.arange(0,R)
         orig=tl.load(Map+row,row<active,0)
@@ -73,36 +73,36 @@ def _embed(ObsType,ObsCards,ObsAux,ObsCat,Map,Count,Numeric,Types,Roles,Cards,Au
         role=tl.where((pos>=3)&(pos<21),3,role);role=tl.where(pos==21,4,role);role=tl.where(pos==22,5,role)
         role=tl.where((pos>=23)&(pos<39),6,role);role=tl.where((pos>=39)&(pos<55),7,role)
         typ=tl.load(ObsType+orig,row<active,0).to(tl.int32)
-        x=tl.load(Types+typ[:,None]*D+d[None,:])+tl.load(Roles+role[:,None]*D+d[None,:])
+        x=tl.load(Types+typ[:,None]*D+d[None,:],d[None,:]<D,0)+tl.load(Roles+role[:,None]*D+d[None,:],d[None,:]<D,0)
         for j in tl.static_range(8):
             card=tl.load(ObsCards+orig*8+j,row<active,0).to(tl.int32)
-            x=x+tl.load(Cards+card[:,None]*D+d[None,:])
+            x=x+tl.load(Cards+card[:,None]*D+d[None,:],d[None,:]<D,0)
         aux=tl.load(ObsAux+orig,row<active,0).to(tl.int32)
-        x=x+tl.load(Aux+aux[:,None]*D+d[None,:]).to(tl.float32)
+        x=x+tl.load(Aux+aux[:,None]*D+d[None,:],d[None,:]<D,0).to(tl.float32)
         for j in tl.static_range(C):
             cat=tl.load(ObsCat+orig*C+j,row<active,0).to(tl.int32)
-            x=x+tl.load(Cats+(OFFSETS[j]+cat[:,None])*D+d[None,:])
-        numeric=tl.load(Numeric+row[:,None]*D+d[None,:],row[:,None]<active,0).to(tl.float32)
-        tl.store(Out+row[:,None]*D+d[None,:],x+numeric,row[:,None]<active)
+            x=x+tl.load(Cats+(OFFSETS[j]+cat[:,None])*D+d[None,:],d[None,:]<D,0)
+        numeric=tl.load(Numeric+row[:,None]*D+d[None,:],(row[:,None]<active)&(d[None,:]<D),0).to(tl.float32)
+        tl.store(Out+row[:,None]*D+d[None,:],x+numeric,(row[:,None]<active)&(d[None,:]<D))
 
 
 @tr.jit
 def _norm(X,Residual,Weight,Bias,Out,Sum,Count,D:tl.constexpr,EPS:tl.constexpr,
           ADD:tl.constexpr,SM:tl.constexpr,R:tl.constexpr=8,Map=None,GATHER_RESIDUAL:tl.constexpr=False):
-    active=tl.load(Count);d=tl.arange(0,D)
-    w=tl.load(Weight+d);b=tl.load(Bias+d)
+    active=tl.load(Count);d=tl.arange(0,tr.next_power_of_2(D))
+    w=tl.load(Weight+d,d<D,0);b=tl.load(Bias+d,d<D,0)
     for block in range(tl.program_id(0),tl.cdiv(active,R),SM):
         row=block*R+tl.arange(0,R)
-        x=tl.load(X+row[:,None]*D+d[None,:],row[:,None]<active,0).to(tl.float32)
+        x=tl.load(X+row[:,None]*D+d[None,:],(row[:,None]<active)&(d[None,:]<D),0).to(tl.float32)
         if ADD:
             source=tl.load(Map+row,row<active,0) if GATHER_RESIDUAL else row
-            x=x+tl.load(Residual+source[:,None]*D+d[None,:],row[:,None]<active,0)
-            tl.store(Sum+row[:,None]*D+d[None,:],x,row[:,None]<active)
+            x=x+tl.load(Residual+source[:,None]*D+d[None,:],(row[:,None]<active)&(d[None,:]<D),0)
+            tl.store(Sum+row[:,None]*D+d[None,:],x,(row[:,None]<active)&(d[None,:]<D))
         mean=tl.sum(x,1)/D
-        v=x-mean[:,None]
+        v=tl.where(d[None,:]<D,x-mean[:,None],0.)
         var=tl.sum(v*v,1)/D
         y=v*tl.rsqrt(var[:,None]+EPS)
-        tl.store(Out+row[:,None]*D+d[None,:],y*w[None,:]+b[None,:],row[:,None]<active)
+        tl.store(Out+row[:,None]*D+d[None,:],y*w[None,:]+b[None,:],(row[:,None]<active)&(d[None,:]<D))
 
 
 @tr.jit
@@ -116,16 +116,16 @@ def _residual(X,Y,Out,Count,D:tl.constexpr,SM:tl.constexpr,BLOCK:tl.constexpr=10
 
 @tr.jit
 def _unpack(X,Valid,Prefix,Weight,Bias,Out,Residual,N:tl.constexpr,T:tl.constexpr,D:tl.constexpr,EPS:tl.constexpr,R:tl.constexpr=8,ADD:tl.constexpr=False,HEAD_COMPACT:tl.constexpr=False):
-    row=tl.program_id(0)*R+tl.arange(0,R);d=tl.arange(0,D)
+    row=tl.program_id(0)*R+tl.arange(0,R);d=tl.arange(0,tr.next_power_of_2(D))
     orig=(row//21)*T+row%21
     valid=tl.load(Valid+orig,row<N*21,0)
     packed=tl.load(Prefix+(row if HEAD_COMPACT else orig),row<N*21,1)-1
-    x=tl.load(X+packed[:,None]*D+d[None,:],((row<N*21)&valid)[:,None],0).to(tl.float32)
+    x=tl.load(X+packed[:,None]*D+d[None,:],((row<N*21)&valid)[:,None]&(d[None,:]<D),0).to(tl.float32)
     if ADD:
-        x+=tl.load(Residual+packed[:,None]*D+d[None,:],((row<N*21)&valid)[:,None],0)
-    mean=tl.sum(x,1)/D;v=x-mean[:,None];var=tl.sum(v*v,1)/D
-    y=v*tl.rsqrt(var[:,None]+EPS)*tl.load(Weight+d)[None,:]+tl.load(Bias+d)[None,:]
-    tl.store(Out+row[:,None]*D+d[None,:],tl.where(valid[:,None],y,0),row[:,None]<N*21)
+        x+=tl.load(Residual+packed[:,None]*D+d[None,:],((row<N*21)&valid)[:,None]&(d[None,:]<D),0)
+    mean=tl.sum(x,1)/D;v=tl.where(d[None,:]<D,x-mean[:,None],0.);var=tl.sum(v*v,1)/D
+    y=v*tl.rsqrt(var[:,None]+EPS)*tl.load(Weight+d,d<D,0)[None,:]+tl.load(Bias+d,d<D,0)[None,:]
+    tl.store(Out+row[:,None]*D+d[None,:],tl.where(valid[:,None],y,0),(row[:,None]<N*21)&(d[None,:]<D))
 
 @tr.jit
 def _attention(Qkv,Cu,Out,H:tl.constexpr,D:tl.constexpr,HeadCu=None,HEAD_ONLY:tl.constexpr=False,Q:tl.constexpr=32,K:tl.constexpr=32):
@@ -136,31 +136,31 @@ def _attention(Qkv,Cu,Out,H:tl.constexpr,D:tl.constexpr,HeadCu=None,HEAD_ONLY:tl
         query_length=tl.load(HeadCu+sequence+1)-out_start
     else:
         out_start=start;query_length=length
-    d=tl.arange(0,D);r=tl.arange(0,Q);c=tl.arange(0,K)
+    d=tl.arange(0,tr.next_power_of_2(D));r=tl.arange(0,Q);c=tl.arange(0,K)
     for qb in range(tl.cdiv(query_length,Q)):
         rows=qb*Q+r
-        q=tl.load(Qkv+(start+rows[:,None])*3*H*D+head*D+d[None,:],rows[:,None]<length,0)
+        q=tl.load(Qkv+(start+rows[:,None])*3*H*D+head*D+d[None,:],(rows[:,None]<length)&(d[None,:]<D),0)
         maximum=tl.full((Q,),-float('inf'),tl.float32)
         denominator=tl.full((Q,),0,tl.float32)
-        accum=tl.full((Q,D),0,tl.float32)
+        accum=tl.full((Q,tr.next_power_of_2(D)),0,tl.float32)
         for kb in range(tl.cdiv(length,K)):
             cols=kb*K+c
-            k=tl.load(Qkv+(start+cols[None,:])*3*H*D+H*D+head*D+d[:,None],cols[None,:]<length,0)
+            k=tl.load(Qkv+(start+cols[None,:])*3*H*D+H*D+head*D+d[:,None],(cols[None,:]<length)&(d[:,None]<D),0)
             score=tl.dot(q,k)*(D**-0.5)
             score=tl.where(cols[None,:]<length,score,-float('inf'))
             new_max=tl.maximum(maximum,tl.max(score,1))
             prob=tl.exp(score-new_max[:,None]);scale=tl.exp(maximum-new_max)
             denominator=denominator*scale+tl.sum(prob,1)
-            v=tl.load(Qkv+(start+cols[:,None])*3*H*D+2*H*D+head*D+d[None,:],cols[:,None]<length,0)
+            v=tl.load(Qkv+(start+cols[:,None])*3*H*D+2*H*D+head*D+d[None,:],(cols[:,None]<length)&(d[None,:]<D),0)
             accum=accum*scale[:,None]+tl.dot(prob.to(tl.bfloat16),v)
             maximum=new_max
-        tl.store(Out+(out_start+rows[:,None])*H*D+head*D+d[None,:],accum/denominator[:,None],rows[:,None]<query_length)
+        tl.store(Out+(out_start+rows[:,None])*H*D+head*D+d[None,:],accum/denominator[:,None],(rows[:,None]<query_length)&(d[None,:]<D))
 
 
 class PackedEncoder:
+    # Model widths/head widths need not be powers of two. Only Triton lanes
+    # are padded; masks and LayerNorm denominators retain the real width.
     def __init__(self, model, env, weights=None):
-        if model.config.d & (model.config.d-1):
-            raise ValueError('packed encoder requires a power-of-two model width')
         self.model,self.env=model,env
         self.sm=torch.cuda.get_device_properties(env.device).multi_processor_count*2
         self.element_sm=self.sm*8
@@ -227,18 +227,19 @@ class PackedEncoder:
         return y
 
     @torch.inference_mode()
-    def __call__(self):
+    def __call__(self, active=None):
         env,model=self.env,self.model;n,t=env.obs_type.shape;d=self.d
+        obs_valid=env.obs_valid if active is None else env.obs_valid & active[:,None]
         self.capacity=cap=n*t
-        valid=env.obs_valid.flatten()
+        valid=obs_valid.flatten()
         prefix=torch.cumsum(valid.to(torch.int32),0,dtype=torch.int32)
         mapping=torch.empty(cap,device=env.device,dtype=torch.int32)
         _scatter_index[(tr.cdiv(cap,256),)](valid,prefix,mapping,cap,256)
-        lengths=env.obs_valid.sum(1,dtype=torch.int32)
+        lengths=obs_valid.sum(1,dtype=torch.int32)
         cu=torch.cat((torch.zeros(1,device=env.device,dtype=torch.int32),lengths.cumsum(0,dtype=torch.int32)))
         count=cu[-1:]
         if self.compact_final:
-            head_prefix=env.obs_valid[:,:21].reshape(-1).to(torch.int32).cumsum(0,dtype=torch.int32)
+            head_prefix=obs_valid[:,:21].reshape(-1).to(torch.int32).cumsum(0,dtype=torch.int32)
             head_count=head_prefix[-1:]
             head_cu=torch.cat((torch.zeros(1,device=env.device,dtype=torch.int32),head_prefix.reshape(n,21)[:,-1]))
             head_mapping=torch.empty(n*21,device=env.device,dtype=torch.int32)
@@ -307,6 +308,7 @@ class ChunkedPackedEncoder:
     def refresh(self):
         self.encoders[0].refresh()
 
-    def __call__(self):
-        encoded=[encoder() for encoder in self.encoders]
+    def __call__(self, active=None):
+        encoded=[encoder(None if active is None else active[i*self.chunk:(i+1)*self.chunk])
+                 for i,encoder in enumerate(self.encoders)]
         return encoded[0] if len(encoded)==1 else torch.cat(encoded,dim=0)

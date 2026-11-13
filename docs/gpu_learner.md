@@ -1,6 +1,6 @@
 # GPU PPO learner
 
-モデル M (`runs/play/m-2166.pt`) 向けに、CUDA の learner 実行経路を追加した。
+モデル M/L 向けに、CUDA の learner 実行経路を追加した。
 **180,000 decisions/s は未達**。同じ16,384 decisionの比較では、既存bf16が10,538/s、
 `packed-grouped` が53,876/s（10回合算、約5.11倍）だった。
 
@@ -42,13 +42,15 @@ export TORCHINDUCTOR_CACHE_DIR=/tmp/$USER-learner/inductor
 
 # 既存checkpointを読み、出力は新規ディレクトリへ置く。
 .venv/bin/python scripts/train.py --device cuda --env-backend cuda \
-  --dtype bf16 --pool-fraction 0 --rollout-storage device --compile off \
+  --dtype bf16 --pool-fraction .2 --rollout-storage device --compile off \
   --resume runs/play/m-2166.pt --run-dir /tmp/$USER-learner/new-training \
   --num-envs 4096 --threads 4 --learner-backend packed-grouped \
   --microbatch-size 4096
 ```
 
-`packed-grouped` はhead幅32、偶数head数、bf16専用（現在のMは該当）。
+`packed-grouped` はhead幅32/48/64、偶数head数、bf16専用。M（幅256/head幅32）と
+L（幅384/head幅48）の両方に対応する。head幅48のattention tileは64までzero-padし、
+実幅48だけを読み書きする。scale、モデル形状、パラメータ名、PPO/Adam/EMAの式は変えない。
 `packed` / `packed-eager` はPyTorch varlen attentionを使う比較経路。
 `packed-reduce`、`packed-short`、`packed-reduce-short`、`packed-bf16`は個別最適化の比較用。
 `packed-fp8`は動的E4M3量子化の実験経路で、今回の測定ではbf16より遅かった。
@@ -148,3 +150,114 @@ CUDAではattentionのforward/backward、paddingを含むembedding勾配、3種�
 約49,000〜50,400/sが全rolloutでの実測範囲であり、目標には達していない。
 最終版ではtrajectory数をTritonの実行時引数にし、小さいrolloutごとにtargetsを再compileする問題も除いた。
 その後のGPU上の関連11テストも合格した（`gfrl-learner-final-tests.txt`）。
+
+## 2026-11-14 pool / L の再検証
+
+TSUBAME H100 MIG 4g.47gb（64 SM）で、保存pool 8モデル、`pool_fraction=.2`、
+既定history長64、bf16、1 stream、pooled arena 256 KiB/環境相当を検証した。
+Mは既存`m-2166.pt`から2更新したcheckpoint、Lは`--size L`から8更新したcheckpoint。
+Lは動作検証用の初期学習モデルであり、Mとの棋力や学習成熟度の比較ではない。
+M/Lのモデル形状とパラメータ数（5,528,379 / 15,822,779）は変更していない。
+
+同じサイズ内のlearner比較は、同一checkpoint・同一の終局済み16,384 decisionを使用した。
+minibatch/microbatchは4096、warmup 2回の後に5回を合算、TF32無効。
+平均有効token数はM 44.58 / L 35.14、stage数は41,621 / 40,712。
+速度にはtargets、forward/backward、勾配clip、Adam、EMA、metrics、同期を含む。
+計測区間のcompile/recompile/guard failureはいずれも0だった。
+
+| モデル | 既存bf16 eager | packed-grouped | 速度比 |
+|---|---:|---:|---:|
+| M | 10,593 decision/s | 59,430 decision/s | 5.61倍 |
+| L | 7,543 decision/s | 35,489 decision/s | 4.70倍 |
+
+Lもcollectionとlearnerの両方でpacked経路を使用する。推論の幅384の行列積には
+既存のpersistent GEMMを使う。M向けTMAの幅上限は256であり、LをTMA使用と誤記しないよう
+collectionベンチマークではTMAの利用可否と実際の幅条件を分けて出力する。
+
+FP32との比較はforward/gradientが512 decision、更新が8,192 decision、3 update呼び出し
+（計6 Adam step）。全方式で同じshuffle・microbatch・初期optimizer/EMA状態を使った。
+Adam差は初期重みからの累積更新ベクトルに対する差である。
+
+| packed-grouped 対 FP32 | M | L |
+|---|---:|---:|
+| forward損失の絶対差 | 3.12e-5 | 3.05e-5 |
+| value logits 相対L2 | 0.197% | 0.403% |
+| gradient 相対L2 | 3.97% | 1.46% |
+| 6 Adam stepの累積更新 相対L2 | 7.09% | 6.46% |
+| 同更新の最大絶対差 | 2.39e-3 | 4.66e-4 |
+| EMA重みの最大絶対差 | 8.13e-6 | 3.81e-4 |
+
+元のbf16対FP32の勾配差はM 3.03% / L 1.12%、Adam累積更新差は4.74% / 4.81%。
+高速経路と元のbf16の直接比較では、勾配差が3.51% / 0.684%、Adam差が7.72% / 6.28%。
+LのEMAは初期学習中のため、保存されたoptimizer step数に応じたEMA decayもMと異なる。
+各モデル内で同じEMA則を比較している。長期間の棋力・収束の同等性は未検証。
+M/Lともgamma=1、0.995、0.5のtargetsとadvantagesはCPU計算と全要素がbit一致した。
+
+記録は [`measurements/pool_l_20261114`](../measurements/pool_l_20261114/)。
+`gfrl-pool-precision-{M,L}.txt` が詳細な数値誤差、`gfrl-pool-learner-*.txt` が各更新の速度、
+`gfrl-pool-train-{M,L}.txt` が実際のtrain.pyによる更新・pool保存の記録である。
+初回compileやpool構成変更時のgraph captureを含む小さい統合学習の速度は、上表には使用していない。
+
+
+継続収集は4,096環境で、128ゲーム要求のwarmupを20回、2,048ゲーム要求の計測を5回実行した。
+固定した保存pool 8モデルを使用する。checkpoint読み込みと初回compile/captureは計測から除く。
+実学習でpool構成が変わる際の再capture時間はtrain.pyの`collect_s`に含まれる。
+
+| モデル | 学習対象decision/s | 終局済み返却decision/s | 相手席も含む外部decision/s | 最後の平均有効token |
+|---|---:|---:|---:|---:|
+| M | 47,416 | 45,564 | 52,622 | 51.98 |
+| L | 34,664 | 34,827 | 38,057 | 38.04 |
+
+Lの独立した直前測定も34,680 decision/sだった。Lの返却数が今回のサンプル数を少し上回るのは、
+warmup中に記録した未完了ゲームのdecisionが終局して返却されるため。
+GPU peak allocatedはM 5.81 GiB / L 5.42 GiB。M/Lでpolicyと観測長が異なるため、
+この表をモデル幅だけの速度比較として扱わない。collectionとlearnerを別々に計測しており、
+両方を合わせた訓練全体のthroughputではない。
+
+収集側の推論精度も`validate_gpu_inference.py`で、同じ保存rolloutの512 decisionから比較した。
+Mは1,271 stage、Lは1,332 stage。無効なhand tokenとmask外log probabilityを誤差集計から除いた。
+
+| packed推論 対 FP32 | M | L |
+|---|---:|---:|
+| encoder出力 相対L2 | 0.229% | 0.255% |
+| 合法手log probability 相対L2 | 0.197% | 0.155% |
+| 同log probability 最大絶対差 | 0.210 | 0.0570 |
+| value logits 相対L2 | 0.159% | 0.231% |
+| argmax選択の相違 | 0 / 1,271 | 1 / 1,332 |
+
+元のbf16との直接比較では、合法手log probabilityの相対L2差はM 0.188% / L 0.136%。
+推論・サンプリング結果のbit一致は保証しない。エンジンの厳密一致条件は同じseedと明示選択列である。
+
+最終GPU関連テストは122件合格。pool fraction 0/.2/1、空poolからの追加、eviction、
+空poolへの変更、両席、未完了ゲーム、1/2 streams、現行重みrefreshを検証した。
+従来CPUの抽選をそのまま書いた独立参照ともNumPy RNG stateまで一致した。
+エンジンの全23出力と統計はmonolithic/split/compact、pooled/unpooled、
+複数seed/history/canonical設定で完全一致。別途、seed42の2,000 stepで32,016状態を完全比較した。
+Macの関連60テストも合格（全体実行は最終CLIテスト追加前に1,298合格・64 skip）。
+終了時には既存のnanobind reference-count警告が出るが、失敗や未保存はない。
+
+Lの8更新とMの2更新は`--pool-fraction .2 --learner-backend packed-grouped`で完了し、
+pool・optimizer・EMAを保存した。再現用checkpointと各16,384 decisionのrolloutを
+`measurements/pool_l_20261114/artifacts/`へ保存し、SHA-256を`manifest.json`に記録した。
+bench/validateスクリプトの`--checkpoint`と`--data`にこれらを指定すれば再検証できる。
+元の大きいrolloutのSHAは`gfrl-pool-sha-{M,L}.txt`、保存subsetのSHAはmanifestに分けて記録している。
+`summary.json`に測定の主要JSONを集約した。
+
+```sh
+ART=measurements/pool_l_20261114/artifacts
+.venv/bin/python scripts/bench_learner.py --checkpoint "$ART/checkpoint-L.pt" \
+  --data "$ART/rollout-L-16384.pt" --backend packed-grouped \
+  --microbatch-size 4096 --warmup 2 --iterations 5 --no-tf32
+.venv/bin/python scripts/validate_learner.py --checkpoint "$ART/checkpoint-L.pt" \
+  --data "$ART/rollout-L-16384.pt" --backend packed-grouped --limit 8192 \
+  --minibatch-size 4096 --microbatch-size 4096 --forward-limit 512 --steps 3
+```
+
+`gfrl-pool-collection-L-4096-final.txt`が表示項目整理後の最終収集測定。
+以前の同名`...L-4096.txt`と1024環境のログの`tma_linear=true`はTMAの利用可能性だけを
+示していた。Lで実際にTMA GEMMを実行した意味ではなく、最終版では両者を分離している。
+ソースは専用staging、build/cache/大きい出力は計算ノードのNVMeで扱った。
+既存runs、third_party/goodfield、official_*は変更せず、commitも作成していない。
+
+再現用4ファイルのSHA-256とモデル/pool/rolloutの形状をMacで確認済み。
+対話ジョブをexitで終了し、iqstatが空であることを確認した。homeの転送用大容量コピーも削除した。

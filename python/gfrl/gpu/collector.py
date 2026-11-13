@@ -1,15 +1,19 @@
 """GPU self-play trajectories compatible with the existing PPO learner."""
+from copy import deepcopy
 from time import perf_counter
+
+import numpy as np
 
 import torch
 
 from ..actor import PREFIX_FIELDS
 from ..model import OBS_FIELDS
+from ..pool import assign_opponents
 from ..rollout import RolloutBatch
 from . import GpuEnv
 from .storage import NumericStorage
 from .buffers import GpuColumnBuffer,PagedColumn
-from .actor import GpuActor,ParallelGpuActor,MAX_POLICY_STAGES
+from .actor import GpuActor,RoutedGpuActor,ParallelGpuActor,MAX_POLICY_STAGES
 
 
 def _compact_pending(array,indices,chunk=16384):
@@ -23,56 +27,106 @@ def _compact_pending(array,indices,chunk=16384):
 
 
 class GpuCollector:
-    """Both seats use the current model; complete decisions stay on the GPU.
+    """Game-pinned opponents; only the current policy supplies training rows.
 
     The host reads one episode counter every four decision rounds to bound an
     iteration. Observations, choices, histories, labels, routing of terminal
-    results and pending trajectories never enter host memory. Final ragged
-    compaction happens once at the learner boundary.
+    results and pending trajectories stay on device. With pool routing, only
+    per-row episode-ended flags return to the host for the shared CPU lottery.
+    Final ragged compaction happens once at the learner boundary.
     """
     def __init__(self, model, *, num_envs=256, threads=4, seed=0, device='cuda',
-                 dtype='bf16', pool_fraction=0, env=None, decision_capacity=4096,
+                 dtype='bf16', pool_fraction=.2, env=None, decision_capacity=4096,
                  stage_capacity=16384, rollout_storage='device', capture=True,
                  pooled=False,arena_bytes=None,streams=1):
-        if pool_fraction != 0:
-            raise ValueError('GPU collector currently requires pool_fraction=0')
+        if not 0 <= pool_fraction <= 1:
+            raise ValueError('pool_fraction must be in [0,1]')
+        if decision_capacity <= 0 or stage_capacity <= 0:
+            raise ValueError('buffer capacities must be positive')
         if rollout_storage != 'device':
             raise ValueError('GPU collector requires rollout_storage=device')
         self.env = env or GpuEnv(num_envs, base_seed=seed, device=device, pooled=pooled,arena_bytes=arena_bytes)
         self.model, self.device = model, self.env.device
-        self.actor = (GpuActor(model,self.env,dtype=dtype) if streams==1 else
-                      ParallelGpuActor(model,self.env,dtype=dtype,streams=streams))
+        self.dtype, self.streams, self.capture = dtype, streams, capture
+        self.pool_fraction = pool_fraction
+        self.rng = np.random.default_rng(seed)
+        n = self.env.num_envs
+        self.assigned = np.zeros(n, dtype=bool)
+        self.opponent_seat = np.full(n, -1, dtype=np.int8)
+        self.opponent_policy = np.full(n, -1, dtype=np.int64)
+        self._opponent_seat = torch.full((n,), -1, dtype=torch.int8, device=self.device)
+        self._opponent_policy = torch.full((n,), -1, dtype=torch.int64, device=self.device)
+        self._models = {}
+        self._actor_keys = None
+        self._configure_actor(())
         self.numeric=NumericStorage(self.device,self.env.history_len)
         self.columns = GpuColumnBuffer(self.device,decision_capacity,OBS_FIELDS,self.env.num_envs)
         self.stages = GpuColumnBuffer(self.device,decision_capacity,(*PREFIX_FIELDS,'choice','old_log_probs'),self.env.num_envs)
         self._env_rows = torch.arange(self.env.num_envs, device=self.device)
-        if capture:
+
+    def _configure_actor(self, pool):
+        entries = {entry['iteration']: entry for entry in pool} if self.pool_fraction else {}
+        needed = set(entries) | (set(self.opponent_policy.tolist()) - {-1})
+        if needed == self._actor_keys:
+            return
+        # Keep an evicted snapshot alive until its last assigned game ends.
+        for key in needed - self._models.keys():
+            policy = deepcopy(self.model)
+            policy.load_state_dict(entries[key]['weights'])
+            self._models[key] = policy.eval()
+        models = {key: self._models[key] for key in sorted(needed)}
+        if hasattr(self, 'actor'):
+            del self.actor
+        self._models = models
+        routing = dict(opponents=models, opponent_seat=self._opponent_seat,
+                       opponent_policy=self._opponent_policy)
+        if self.streams != 1:
+            self.actor = ParallelGpuActor(self.model, self.env, streams=self.streams,
+                                         dtype=self.dtype, **routing)
+        elif models:
+            self.actor = RoutedGpuActor(self.model, self.env, dtype=self.dtype, **routing)
+        else:
+            self.actor = GpuActor(self.model, self.env, dtype=self.dtype)
+        if self.capture:
             self.actor.capture(record=True)
+        self._actor_keys = needed
+
+    def _assign(self, pool):
+        new_games = np.flatnonzero(~self.assigned)
+        self.assigned[new_games] = True
+        assign_opponents(self.rng, new_games, pool, self.pool_fraction,
+                         self.opponent_seat, self.opponent_policy)
+        self._opponent_seat.copy_(torch.from_numpy(self.opponent_seat))
+        self._opponent_policy.copy_(torch.from_numpy(self.opponent_policy))
 
     def collect(self, games_per_iter, pool=()):
         if games_per_iter <= 0:
             raise ValueError('games_per_iter must be positive')
-        # A saved pool can be present in a checkpoint while its sampling
-        # fraction is zero; only the live current policy is used here.
+        self._configure_actor(pool)
         self.model.eval()
         self.actor.refresh()
         torch.cuda.synchronize(self.device)
         begin = perf_counter()
         games = torch.zeros((), dtype=torch.int64, device=self.device)
         truncated = torch.zeros_like(games)
+        sampled = torch.zeros_like(games)
         carried = self.columns.size
         rounds = 0
         encoded_tokens = torch.zeros((),dtype=torch.int64,device=self.device)
         n = self.env.num_envs
         while True:
+            if self.pool_fraction:
+                self._assign(pool)
             finished, data = self.actor.round(record=True)
             encoded_tokens += data['obs_valid'].sum() if self.actor.packed_encoder is not None else n*self.env.tokens
+            training = data['actor_seat'] != self._opponent_seat
+            sampled += training.sum()
             vl = data['stages'][0]['old_value']
             value = (vl-vl.max(dim=1, keepdim=True).values).exp()
             columns = {k:self.numeric.pack(data[k],data['obs_type']) if k=='obs_num' else data[k] for k in OBS_FIELDS}
             columns.update(env=self._env_rows, game=data['episode_id'].view(torch.int64),
                            seat=data['actor_seat'], old_value=value/value.sum(dim=1, keepdim=True),
-                           outcome=torch.full((n,), 2, dtype=torch.int8, device=self.device),
+                           outcome=torch.where(training, 2, 3).to(torch.int8),
                            label_opp_hand=data['label_opp_hand'],
                            label_opp_hand_count=data['label_opp_hand_count'])
             self.columns.append(columns)
@@ -89,6 +143,10 @@ class GpuCollector:
             c['outcome'][:m].copy_(torch.where(ended, terminal, c['outcome'][:m]))
             games += data['episode_done'].sum()
             truncated += (data['episode_done'] & data['truncated']).sum()
+            if self.pool_fraction:
+                ended = data['episode_done'].cpu().numpy()
+                self.assigned[ended] = False
+                self.opponent_seat[ended] = self.opponent_policy[ended] = -1
             rounds += 1
             if rounds % 4 == 0 and int(games) >= games_per_iter:
                 break
@@ -99,19 +157,21 @@ class GpuCollector:
         elapsed = perf_counter()-begin
         token_count = int(encoded_tokens)
         batch.games, batch.truncated = int(games), int(truncated)
-        batch.sampled_decisions = rounds*n
+        batch.sampled_decisions = int(sampled)
         batch.timings = dict(other=elapsed, env_step=0., inference=0., record=0.,
                              actor_calls=rounds, mean_actor_rows=n, steps=rounds*MAX_POLICY_STAGES,
                              carried_decisions=carried, pending_decisions=pending,
                              encoded_envs=rounds*n, encoder_tokens=token_count,
+                             total_decisions=rounds*n, opponent_decisions=rounds*n-int(sampled),
                              mean_packed_tokens=token_count/(rounds*n), mean_unpacked_tokens=self.env.tokens)
         return batch
 
     def _finish(self):
         n = self.columns.size
-        completed = torch.where(self.columns.data['outcome'][:n] != 2)[0]
+        # 3 is a private discard marker for opponent seats, never learner data.
+        outcomes = self.columns.data['outcome'][:n]
+        completed = torch.where((outcomes != 2) & (outcomes != 3))[0]
         pending = torch.where(self.columns.data['outcome'][:n] == 2)[0]
-        nc = len(completed)
         npending=len(pending)
         output={}
         # Keep one pending-column temporary live at a time. Reordering every

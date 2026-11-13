@@ -9,7 +9,7 @@ CPUの既定動作は変更していない。`third_party/goodfield` と `offici
 - 状態遷移、RNG、合法手カーソル、観測、両席の履歴、belief用正解ラベル、終局、自動リセットをCUDAで処理する。カーソルの選択、完了commandの実行、観測の生成を別カーネルに分ける。大きいbatchでは完了commandをGPU上でまとめて実行する。
 - `GpuActor` は観測を各decisionで1回だけencodeする。最長22段の選択をCUDA Graphに捕捉し、先に選択が終わった行はGPU上で凍結する。
 - `GpuCollector` は軌跡と未完了ゲームをGPUに保持し、既存のPPO learnerにRolloutBatchを渡す。
-- CUDA backendでは現在 `pool_fraction=0`、`rollout_storage=device`、`compile=off` が必要。評価bot、search、public-root制限、state import、相手poolからの対戦相手選択はCPU backendに残る。
+- CUDA backendは `pool_fraction` の0〜1、M/Lのモデル、`rollout_storage=device`、`compile=off` に対応する。評価bot、search、public-root制限、state importはCPU backendに残る。
 - ホストは初期化、カーネル起動、4 decision roundごとの終局数による収集停止判定、learner境界のragged compaction、統計出力を担当する。ゲーム状態・観測・履歴・選択をCPUへ往復させない。PPOのtarget計算などlearner内部は今回の移植対象外。
 
 ## 実装
@@ -18,9 +18,34 @@ CPUの既定動作は変更していない。`third_party/goodfield` と `offici
 
 NVRTCでPTXを作り、CUDA driver linkerでCUBINを生成してからロードする。直接PTXをmoduleへ渡すと、この大きな翻訳単位では非常に長いJIT時間が発生した。キャッシュは既定でジョブ内の一時領域に置く。初回コンパイルは数分かかり、計測のwarmupに含める。CPUエンジンの数値処理には `--fmad=false` を使う。
 
-モデルMのbf16推論には、GPU上で有効tokenをpackするencoderと、選択中の行だけを計算するpolicy headsを使う。既定の処理単位は256環境。Hopper以降ではTMAで行列演算の入力・出力を転送し、有効行数はdevice scalarから読む。長いFFNの射影には通常のpersistent GEMMを使う。attentionはquery幅64、key幅32。最終層ではpolicy headsが必要とする先頭21スロットだけをattention以後に計算する。FFN後の残差加算と次層のLayerNormをまとめる。
+モデルM/Lのbf16推論には、GPU上で有効tokenをpackするencoderと、選択中の行だけを計算するpolicy headsを使う。既定の処理単位は256環境。Hopper以降ではTMAで行列演算の入力・出力を転送し、有効行数はdevice scalarから読む。長いFFNの射影には通常のpersistent GEMMを使う。attentionはquery幅64、key幅32。最終層ではpolicy headsが必要とする先頭21スロットだけをattention以後に計算する。FFN後の残差加算と次層のLayerNormをまとめる。
 
 重みは各PPO更新後にrefreshする。これは既存bf16モデルとの許容誤差による数値検証であり、CPUとCUDAのモデル推論や乱数サンプリングのbit一致は保証しない。エンジンの一致条件は**同じseedと明示的な同じ合法選択列**である。今回のTMA・attention幅・処理単位の速度比較では、モデルMの既存GPU encoderとの最大差は0だった。FP8は使用していない。
+
+## 過去モデルとの対戦
+
+ゲーム開始時に確率 `pool_fraction`（既定0.2）でpool対戦を選び、保存poolのentryと
+相手席をそれぞれ一様に抽選する。抽選処理はCPU Collectorと共通の`pool.assign_opponents`で、
+同じnew-game行集合に対するNumPy RNGの消費順も従来のCPU実装と一致する。
+空poolでは両席とも現行モデルを使い、乱数を消費しない。
+一度決めた相手席・iteration・保存重みは終局まで保持する。更新境界やpool evictionをまたいでも
+再抽選しない。終局時に割当てを解除し、自動リセット後の次ゲームで抽選する。
+
+相手席のdecision/stageはlearnerへ渡さない。現行モデルの両席対戦では両席を学習に使う。
+終局結果は元の席・episodeに対応付け、打ち切りはdrawとして記録する。
+未完了ゲームの観測、old log probability、valueをそのまま次のcollectへ持ち越す。
+CUDA Graphのwarmup/captureは全環境を凍結するため、pool構成変更に伴う再captureでも
+ゲームや未完了軌跡を進めない。現行重みだけをPPO更新後にrefreshする。
+
+policyごとに担当行の有効tokenだけをpackし、同じdecision内の全stageを同じpolicyで選ぶ。
+pool有効時は各roundの終局フラグだけをホストへ読み、CPUと共通の抽選を行う。
+ゲーム状態・観測・選択はGPUに置く。GPUのroundごとに完了行を凍結する実行順序は
+CPU Collectorのstageごとの実行順序とは異なるため、完全な訓練runのサンプル列のbit一致は
+保証しない。同じseed・明示選択列に対するエンジン出力の完全一致は引き続き検証する。
+
+Lのモデル形状は変更しない（幅384、8層、8 heads、head幅48、FFN1536）。
+Tritonのtileだけを幅512/head幅64までzero-padし、読み書きとLayerNormのreductionを
+実幅でmaskする。attentionのscaleも実head幅48から計算する。
 
 ## 実行例
 
@@ -52,7 +77,7 @@ PYTHONPATH=python .venv/bin/python -m pytest tests/python/test_gpu.py -q
   --iterations 10 --pooled --arena-bytes 262144
 
 .venv/bin/python scripts/train.py --device cuda --env-backend cuda \
-  --dtype bf16 --pool-fraction 0 --rollout-storage device --compile off \
+  --dtype bf16 --pool-fraction .2 --rollout-storage device --compile off \
   --init-from runs/play/m-2166.pt --run-dir /tmp/$USER-gpu/train-new \
   --num-envs 4096 --threads 4
 ```
@@ -97,3 +122,27 @@ H100 MIG 4g.47gb、64 SM、32,768環境、history_len=64、seed=42、bf16、pool
 検証はGPUテスト36件、Macの関連CPUテスト65件に合格。長い独立差分replayは232,056 policy-stage状態を比較した。512回目の打ち切り・リセットも独立CPU oracleとの4状態比較を通過した。MからのPPO更新は1・2 streamsで各2回成功し、更新後の重みrefreshと未完了ゲームの持ち越しを実行した。
 
 測定値と実行ログは [`measurements/gpu_continue`](../measurements/gpu_continue/) に保存している。主な証跡は `gfrl-gpu-port-continue-final-engine.json`、`gfrl-gpu-port-continue-final-collection.json`、`gfrl-gpu-port-continue-full-suite.txt`、`gfrl-gpu-port-continue-tests-tma.txt`、`gfrl-gpu-port-continue-history-v2.txt`、`gfrl-gpu-port-continue-ppo-metrics-s{1,2}.jsonl`。
+
+## 2026-11-14 pool / L 対応
+
+`train.py` のCUDA経路で `--pool-fraction .2` を使用できる。CPUと同様、resume時は
+保存された実験のpool設定を引き継ぐ。Lを新規に開始する例は次の通り。
+既存checkpointを指定した場合は、そのcheckpointのモデル形状を使用する。
+
+```sh
+.venv/bin/python scripts/train.py --device cuda --env-backend cuda \
+  --learner-backend packed-grouped --dtype bf16 --size L \
+  --pool-fraction .2 --rollout-storage device --compile off \
+  --num-envs 4096 --threads 4 --minibatch-size 4096 --microbatch-size 4096 \
+  --gpu-pooled-arena --gpu-arena-bytes 262144 \
+  --run-dir /tmp/$USER-gpu/train-L-new
+```
+
+空poolから開始し、通常は `--pool-every 10 --pool-size 8` で保存モデルを追加する。
+20%は**ゲームをpool対戦にする確率**であり、そのゲームの片席だけが相手モデルになる。
+相手席のdecisionを `sampled_decisions` や学習用batchに含めない。
+`bench_gpu_collection.py --pool-fraction .2` はcheckpointの保存poolと現行学習重みを使い、
+全外部decision、学習対象decision、終局済みの返却decisionを別々に出力する。
+`positions_per_s` は学習対象decision/sである。
+
+測定・精度・検証の詳細は [gpu_learner.md](gpu_learner.md) の同日記録を参照。

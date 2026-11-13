@@ -10,18 +10,18 @@ def _forward_tile(Q,K,V,CQ,CK,O,LSE,H:tl.constexpr,D:tl.constexpr,
     seq=tl.program_id(0);head=tl.program_id(1);tile=tl.program_id(2)
     qs=tl.load(CQ+seq);qe=tl.load(CQ+seq+1)
     ks=tl.load(CK+seq);ke=tl.load(CK+seq+1)
-    r=tile*M+tl.arange(0,M);c=tl.arange(0,N);d=tl.arange(0,D)
+    r=tile*M+tl.arange(0,M);c=tl.arange(0,N);d=tl.arange(0,tr.next_power_of_2(D))
     if tile*M < qe-qs:
-        q=tl.load(Q+(qs+r[:,None])*SQ+head*D+d[None,:],r[:,None]<qe-qs,0)
-        k=tl.load(K+(ks+c[None,:])*SK+head*D+d[:,None],c[None,:]<ke-ks,0)
+        q=tl.load(Q+(qs+r[:,None])*SQ+head*D+d[None,:],(r[:,None]<qe-qs)&(d[None,:]<D),0)
+        k=tl.load(K+(ks+c[None,:])*SK+head*D+d[:,None],(c[None,:]<ke-ks)&(d[:,None]<D),0)
         score=tl.dot(q,k)*(D**-.5)
         score=tl.where(c[None,:]<ke-ks,score,-float('inf'))
         mx=tl.max(score,1)
         p=tl.exp(score-mx[:,None]);den=tl.sum(p,1)
         p=p/den[:,None]
-        v=tl.load(V+(ks+c[:,None])*SV+head*D+d[None,:],c[:,None]<ke-ks,0)
+        v=tl.load(V+(ks+c[:,None])*SV+head*D+d[None,:],(c[:,None]<ke-ks)&(d[None,:]<D),0)
         out=tl.dot(p.to(q.dtype),v)
-        tl.store(O+(qs+r[:,None])*H*D+head*D+d[None,:],out,r[:,None]<qe-qs)
+        tl.store(O+(qs+r[:,None])*H*D+head*D+d[None,:],out,(r[:,None]<qe-qs)&(d[None,:]<D))
         tl.store(LSE+(qs+r)*H+head,mx+tl.log(den),r<qe-qs)
 
 
@@ -31,15 +31,15 @@ def _backward_tile(Q,K,V,CQ,CK,O,LSE,DO,DQ,DK,DV,H:tl.constexpr,D:tl.constexpr,
     seq=tl.program_id(0);head=tl.program_id(1)
     qs=tl.load(CQ+seq);qe=tl.load(CQ+seq+1)
     ks=tl.load(CK+seq);ke=tl.load(CK+seq+1)
-    r=tl.arange(0,M);c=tl.arange(0,N);d=tl.arange(0,D)
-    k=tl.load(K+(ks+c[:,None])*SK+head*D+d[None,:],c[:,None]<ke-ks,0)
-    v=tl.load(V+(ks+c[:,None])*SV+head*D+d[None,:],c[:,None]<ke-ks,0)
-    dk=tl.full((N,D),0,tl.float32);dv=tl.full((N,D),0,tl.float32)
+    r=tl.arange(0,M);c=tl.arange(0,N);d=tl.arange(0,tr.next_power_of_2(D))
+    k=tl.load(K+(ks+c[:,None])*SK+head*D+d[None,:],(c[:,None]<ke-ks)&(d[None,:]<D),0)
+    v=tl.load(V+(ks+c[:,None])*SV+head*D+d[None,:],(c[:,None]<ke-ks)&(d[None,:]<D),0)
+    dk=tl.full((N,tr.next_power_of_2(D)),0,tl.float32);dv=tl.full((N,tr.next_power_of_2(D)),0,tl.float32)
     for tile in range(tl.cdiv(qe-qs,M)):
         rows=tile*M+r
-        q=tl.load(Q+(qs+rows[:,None])*SQ+head*D+d[None,:],rows[:,None]<qe-qs,0)
-        do=tl.load(DO+(qs+rows[:,None])*H*D+head*D+d[None,:],rows[:,None]<qe-qs,0)
-        out=tl.load(O+(qs+rows[:,None])*H*D+head*D+d[None,:],rows[:,None]<qe-qs,0).to(tl.float32)
+        q=tl.load(Q+(qs+rows[:,None])*SQ+head*D+d[None,:],(rows[:,None]<qe-qs)&(d[None,:]<D),0)
+        do=tl.load(DO+(qs+rows[:,None])*H*D+head*D+d[None,:],(rows[:,None]<qe-qs)&(d[None,:]<D),0)
+        out=tl.load(O+(qs+rows[:,None])*H*D+head*D+d[None,:],(rows[:,None]<qe-qs)&(d[None,:]<D),0).to(tl.float32)
         lse=tl.load(LSE+(qs+rows)*H+head,rows<qe-qs,0)
         score=tl.dot(q,tl.trans(k))*(D**-.5)
         p=tl.exp(score-lse[:,None])
@@ -50,9 +50,9 @@ def _backward_tile(Q,K,V,CQ,CK,O,LSE,DO,DQ,DK,DV,H:tl.constexpr,D:tl.constexpr,
         ds=(p*(dp-delta[:,None])*(D**-.5)).to(q.dtype)
         dq=tl.dot(ds,k)
         dk+=tl.dot(tl.trans(ds),q)
-        tl.store(DQ+(qs+rows[:,None])*H*D+head*D+d[None,:],dq,rows[:,None]<qe-qs)
-    tl.store(DK+(ks+c[:,None])*H*D+head*D+d[None,:],dk,c[:,None]<ke-ks)
-    tl.store(DV+(ks+c[:,None])*H*D+head*D+d[None,:],dv,c[:,None]<ke-ks)
+        tl.store(DQ+(qs+rows[:,None])*H*D+head*D+d[None,:],dq,(rows[:,None]<qe-qs)&(d[None,:]<D))
+    tl.store(DK+(ks+c[:,None])*H*D+head*D+d[None,:],dk,(c[:,None]<ke-ks)&(d[None,:]<D))
+    tl.store(DV+(ks+c[:,None])*H*D+head*D+d[None,:],dv,(c[:,None]<ke-ks)&(d[None,:]<D))
 
 
 @tr.jit

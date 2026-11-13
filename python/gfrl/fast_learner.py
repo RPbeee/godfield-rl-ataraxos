@@ -163,8 +163,8 @@ def configure_fast_learner(learner, backend='packed'):
     if low_precision and learner.dtype != 'bf16':
         raise ValueError(backend+' requires bf16')
     if low_precision and (learner.model.config.heads % 2 or
-                          learner.model.config.d // learner.model.config.heads != 32):
-        raise ValueError(backend+' requires an even head count and head dimension 32')
+                          learner.model.config.d // learner.model.config.heads not in (32, 48, 64)):
+        raise ValueError(backend+' requires an even head count and head dimension 32, 48 or 64')
     learner._packed_forward = PackedForward(
         learner, compile=backend != 'packed-eager',
         reduced='reduce' in backend or low_precision,
