@@ -51,3 +51,6 @@ add_test(NAME gfrl_search COMMAND gfrl_search_tests)
 # Public oracle from the existing goodfield wire/native replay witnesses.
 add_executable(gfrl_official_native_dump tests/cpp/official_native_dump.cpp)
 target_link_libraries(gfrl_official_native_dump PRIVATE gfrl_core)
+# Test-only state injection; the production CPU VecEnv remains the oracle.
+add_executable(gfrl_gpu_oracle EXCLUDE_FROM_ALL tests/cpp/gpu_oracle.cpp)
+target_link_libraries(gfrl_gpu_oracle PRIVATE gfrl_core)

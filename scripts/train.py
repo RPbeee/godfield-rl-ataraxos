@@ -30,6 +30,10 @@ def parse_args(argv=None):
     source.add_argument('--init-from', type=Path)
     p.add_argument('--size', choices=['S', 'M', 'L'], default='S')
     p.add_argument('--device', choices=['cpu', 'mps', 'cuda'], default='cpu')
+    p.add_argument('--env-backend', choices=['cpu', 'cuda'], default='cpu')
+    p.add_argument('--selfplay-streams',type=int,default=1)
+    p.add_argument('--gpu-arena-bytes',type=int)
+    p.add_argument('--gpu-pooled-arena',action=argparse.BooleanOptionalAction,default=False)
     p.add_argument('--rollout-storage', choices=['device', 'cpu'], default='device')
     p.add_argument('--dtype', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     for name, default in dict(num_envs=64, threads=4, games_per_iter=128, iterations=100,
@@ -55,7 +59,7 @@ def parse_args(argv=None):
             p.error('unknown config keys: '+', '.join(sorted(unknown)))
         for k, v in config.items():
             setattr(args, k, v)
-    positive = ('num_envs', 'threads', 'games_per_iter', 'iterations', 'pool_every',
+    positive = ('selfplay_streams','num_envs', 'threads', 'games_per_iter', 'iterations', 'pool_every',
                 'pool_size', 'eval_pairs', 'minibatch_size', 'decision_capacity', 'stage_capacity')
     if any(getattr(args, k) <= 0 for k in positive) or args.eval_every < 0:
         p.error('counts must be positive (eval_every may be zero)')
@@ -65,6 +69,14 @@ def parse_args(argv=None):
         p.error('microbatch-size must be nonnegative (0 = automatic)')
     if not 0 <= args.pool_fraction <= 1 or args.max_hours <= 0:
         p.error('invalid pool_fraction or max_hours')
+    if args.env_backend == 'cuda' and (args.device != 'cuda' or args.pool_fraction != 0 or args.rollout_storage != 'device' or args.compile != 'off'):
+        p.error('CUDA env backend requires --device cuda --pool-fraction 0 --rollout-storage device --compile off')
+    if args.selfplay_streams>args.num_envs or (args.env_backend=='cpu' and args.selfplay_streams!=1):
+        p.error('selfplay-streams requires CUDA backend and cannot exceed num-envs')
+    if args.gpu_arena_bytes is not None and (args.gpu_arena_bytes<4096 or args.gpu_arena_bytes%16):
+        p.error('gpu-arena-bytes must be >=4096 and divisible by 16')
+    if args.env_backend=='cpu' and (args.gpu_pooled_arena or args.gpu_arena_bytes is not None):
+        p.error('GPU arena settings require --env-backend cuda')
     if args.resume and args.init_from:
         p.error('--resume and --init-from are mutually exclusive')
     if not 0 < args.gamma <= 1:
@@ -151,7 +163,9 @@ def run(args):
         # Resume the saved experiment settings; execution length/device/path remain caller-controlled.
         runtime = {k: getattr(args, k) for k in ('iterations', 'device', 'threads', 'run_dir',
                                                 'resume', 'max_hours', 'config', 'microbatch_size', 'rollout_storage',
-                                                'tf32', 'compile', 'compile_mode_actor', 'compile_mode_learner')}
+                                                'tf32', 'compile', 'compile_mode_actor', 'compile_mode_learner', 'env_backend','selfplay_streams','gpu_arena_bytes','gpu_pooled_arena')}
+        if args.env_backend=='cuda':
+            runtime['pool_fraction']=args.pool_fraction
         vars(args).update(state['config'])
         vars(args).update(runtime)
         provenance = state.get('init_from', state['config'].get('init_from'))
@@ -192,67 +206,77 @@ def run(args):
     # namespace on every construction, so a restart never reuses unfinished deals.
     train_seed = stream_seed(args.seed, 0, positions['train'])
     positions['train'] += 1
-    collector = Collector(learner.model, num_envs=args.num_envs, threads=args.threads,
+    collector_class = Collector
+    collector_kwargs={}
+    if args.env_backend == 'cuda':
+        from gfrl.gpu.collector import GpuCollector
+        collector_class = GpuCollector
+        collector_kwargs.update(streams=args.selfplay_streams,pooled=args.gpu_pooled_arena,arena_bytes=args.gpu_arena_bytes)
+    collector = collector_class(learner.model, num_envs=args.num_envs, threads=args.threads,
                           seed=train_seed, device=args.device, dtype=args.dtype,
                           pool_fraction=args.pool_fraction, decision_capacity=args.decision_capacity,
-                          stage_capacity=args.stage_capacity, rollout_storage=args.rollout_storage)
-    config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    config['init_from'] = provenance
-    (run_dir / 'config.json').write_text(json.dumps(config, indent=2)+'\n')
-    last_duration = 0.
-    for _ in range(args.iterations):
-        # Leave a full previous iteration of headroom before starting another.
-        if perf_counter()-start + last_duration >= args.max_hours*3600:
+                          stage_capacity=args.stage_capacity, rollout_storage=args.rollout_storage,**collector_kwargs)
+    try:
+        config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+        config['init_from'] = provenance
+        (run_dir / 'config.json').write_text(json.dumps(config, indent=2)+'\n')
+        last_duration = 0.
+        for _ in range(args.iterations):
+            # Leave a full previous iteration of headroom before starting another.
+            if perf_counter()-start + last_duration >= args.max_hours*3600:
+                save_checkpoint(checkpoint, learner, iteration, pool, positions, config,
+                                elapsed_before+perf_counter()-start, 'time_budget')
+                break
+            compile_before = compiler_metrics()
+            if args.device == 'cuda':
+                torch.cuda.reset_peak_memory_stats(learner.device)
+            begin = perf_counter()
+            rollout = collector.collect(args.games_per_iter, pool)
+            collected = perf_counter()
+            iteration += 1
+            metrics = learner.update(rollout.decisions, iteration)
+            learned = perf_counter()
+            if args.device == 'cuda':
+                metrics.update(cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(learner.device),
+                               cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(learner.device))
+            if iteration % args.pool_every == 0:
+                pool.append(learner.pool_entry(iteration))
+                pool = pool[-args.pool_size:]
+            metrics.update(rollout_length_metrics(rollout.decisions))
+            metrics.update(iteration=iteration, elapsed_s=elapsed_before+learned-start,
+                           games=rollout.games, decisions=len(rollout.decisions),
+                           sampled_decisions=rollout.sampled_decisions,
+                           truncation_rate=rollout.truncated/rollout.games,
+                           collect_decisions_per_s=rollout.sampled_decisions/max(collected-begin, 1e-9),
+                           learn_decisions_per_s=len(rollout.decisions)/max(learned-collected, 1e-9),
+                           collect_s=collected-begin, learn_s=learned-collected,
+                           pool_iterations=[entry['iteration'] for entry in pool])
+            metrics.update({'collect_'+k+('_s' if k in ('env_step', 'inference', 'record', 'other') else ''): v
+                            for k,v in rollout.timings.items()})
+            if args.eval_every and iteration % args.eval_every == 0:
+                eval_seed = stream_seed(args.seed, 1, positions['evaluation'])
+                positions['evaluation'] += 1
+                metrics['evaluation'] = {}
+                for opponent in ('random', 'greedy'):
+                    # Evaluation uses its own torch RNG as well as its own deal stream.
+                    with evaluation_rng(eval_seed, args.device):
+                        actor = Actor(learner.ema, collector.env, args.device, sample=True, dtype=args.dtype)
+                        metrics['evaluation'][opponent] = evaluate_policy(
+                            actor, opponent, args.eval_pairs, args.num_envs, args.threads, eval_seed)
+            metrics.update(metric_delta(compile_before))
+            metrics['elapsed_s'] = elapsed_before+perf_counter()-start
+            with (run_dir / 'metrics.jsonl').open('a') as f:
+                f.write(json.dumps(metrics, allow_nan=False)+'\n')
+            print(json.dumps(metrics, allow_nan=False), flush=True)
             save_checkpoint(checkpoint, learner, iteration, pool, positions, config,
-                            elapsed_before+perf_counter()-start, 'time_budget')
-            break
-        compile_before = compiler_metrics()
-        if args.device == 'cuda':
-            torch.cuda.reset_peak_memory_stats(learner.device)
-        begin = perf_counter()
-        rollout = collector.collect(args.games_per_iter, pool)
-        collected = perf_counter()
-        iteration += 1
-        metrics = learner.update(rollout.decisions, iteration)
-        learned = perf_counter()
-        if args.device == 'cuda':
-            metrics.update(cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(learner.device),
-                           cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(learner.device))
-        if iteration % args.pool_every == 0:
-            pool.append(learner.pool_entry(iteration))
-            pool = pool[-args.pool_size:]
-        metrics.update(rollout_length_metrics(rollout.decisions))
-        metrics.update(iteration=iteration, elapsed_s=elapsed_before+learned-start,
-                       games=rollout.games, decisions=len(rollout.decisions),
-                       sampled_decisions=rollout.sampled_decisions,
-                       truncation_rate=rollout.truncated/rollout.games,
-                       collect_decisions_per_s=rollout.sampled_decisions/max(collected-begin, 1e-9),
-                       learn_decisions_per_s=len(rollout.decisions)/max(learned-collected, 1e-9),
-                       collect_s=collected-begin, learn_s=learned-collected,
-                       pool_iterations=[entry['iteration'] for entry in pool])
-        metrics.update({'collect_'+k+('_s' if k in ('env_step', 'inference', 'record', 'other') else ''): v
-                        for k,v in rollout.timings.items()})
-        if args.eval_every and iteration % args.eval_every == 0:
-            eval_seed = stream_seed(args.seed, 1, positions['evaluation'])
-            positions['evaluation'] += 1
-            metrics['evaluation'] = {}
-            for opponent in ('random', 'greedy'):
-                # Evaluation uses its own torch RNG as well as its own deal stream.
-                with evaluation_rng(eval_seed, args.device):
-                    actor = Actor(learner.ema, collector.env, args.device, sample=True, dtype=args.dtype)
-                    metrics['evaluation'][opponent] = evaluate_policy(
-                        actor, opponent, args.eval_pairs, args.num_envs, args.threads, eval_seed)
-        metrics.update(metric_delta(compile_before))
-        metrics['elapsed_s'] = elapsed_before+perf_counter()-start
-        with (run_dir / 'metrics.jsonl').open('a') as f:
-            f.write(json.dumps(metrics, allow_nan=False)+'\n')
-        print(json.dumps(metrics, allow_nan=False), flush=True)
-        save_checkpoint(checkpoint, learner, iteration, pool, positions, config,
-                        elapsed_before+perf_counter()-start)
-        # Release the output-buffer lease before the next collect starts.
-        del rollout
-        last_duration = perf_counter()-begin
-    return checkpoint
+                            elapsed_before+perf_counter()-start)
+            # Release the output-buffer lease before the next collect starts.
+            del rollout
+            last_duration = perf_counter()-begin
+        return checkpoint
+    finally:
+        if args.env_backend=='cuda':
+            collector.close()
 
 
 if __name__ == '__main__':
