@@ -25,6 +25,42 @@ NumPyのshuffleとminibatch単位のAdam更新を維持する。microbatchは勾
 GPU targetsはCPUと同じtrajectory順序・fp32の演算順を使い、FMAを無効にする。
 gamma=1、0.995、0.5でtargetsとadvantagesの全要素がbit一致した。
 
+### Moving magnet（R-NaD / magnetic mirror descent 風の実験）
+
+`--magnet` で正則化を有効にする。既定は従来の
+`--magnet-source uniform --alpha-schedule decay`（`alpha0 / iter^0.3`）。
+`--magnet-source reg` は、同じ観測・合法手mask・収集済みstage prefixで
+凍結ネットワーク `π_reg` を評価し、各stageの `KL(πθ || π_reg)` をdecision内で合算する。
+`--alpha-schedule constant` なら係数は常に `--alpha0`。PPO clip、old-policy KL、
+value targets、filteringの扱いは共通で、regには勾配を流さない。
+
+```sh
+# GPU学習コマンドの --resume を以下に置き換え、新しいrun-dirを使う。
+--init-from runs/ml-M/ckpt-2500.pt --magnet --magnet-source reg \
+  --alpha-schedule constant --alpha0 .05 --reg-update-every 100 --reg-source online
+```
+
+開始時はfresh / init-fromともにonlineの開始重みをregへコピーする。
+開始から `--reg-update-every K`（既定100）反復ごとに、その反復の全Adam/EMA更新が
+終わってから置き換える。`--reg-source online|ema`（既定online）でコピー元を選ぶ。
+例えばiteration 2500からinit-fromしK=100なら、最初の置き換えは2600終了時。
+`--resume auto` は保存したreg重み・最終更新iteration・実験設定を復元する。
+regを含まない旧checkpointはonline重みから初期化でき、init-fromは保存regを引き継がない。
+`reg_kl` は置き換え前、更新中の全decisionのKL平均（filter前）、`reg_updated` は
+その反復末の置き換え有無、`reg_last_update` は最終置き換えiteration。
+
+packed-groupedではpack情報・最終層のquery省略・精度をonlineと共有し、regの
+no-grad forwardではpolicy logitsだけを計算する。追加のbackwardやvalue headはない。
+1 epochで各prefixを1度だけ評価するため、rollout全体のlogits cacheは保持しない。
+uniformではregモデルを作成せず、元の損失・scheduleの演算を維持する。
+bf16のcompiled grad/no-grad graphは融合・丸め順が異なることがあり、同じ重みでも
+KLに微小な残差が出る。GPUの更新直後テストは絶対誤差1e-4、CPU fp32は1e-6で確認する。
+
+これはmoving KL正則化の実験であり、DeepNashのreward transformationは含めない。
+現在のvalue targetは勝/敗/分の確率分布で、任意の符号付きlog-ratio報酬を直接足せない。
+またpool相手の決定点は学習rolloutに保存しないため、相手手番の逆符号項には
+collectorとtarget設計の変更が必要になる。
+
 `packed-grouped` はencoderの残差とLayerNormの入出力もbf16にする。
 マスター重み、Adamのmoment、EMA、損失・log probabilityはfp32を維持する。
 数値精度と演算の加算順の差は以下に測定している。
@@ -261,3 +297,28 @@ ART=measurements/pool_l_20261114/artifacts
 
 再現用4ファイルのSHA-256とモデル/pool/rolloutの形状をMacで確認済み。
 対話ジョブをexitで終了し、iqstatが空であることを確認した。homeの転送用大容量コピーも削除した。
+
+## 2026-11-15 moving magnet 検証
+
+モデルMの `runs/ml-M/ckpt-2500.pt`、H100 MIG 4g.47gb、bf16、packed-groupedで検証した。
+同じ16,384 decisions / 41,403 stages（平均31.30有効token）、mini/microbatch 4096、
+alpha=.05 constant、3 warmup後の10回合算で、uniformは **80,517 decisions/s**、
+regは **61,808 decisions/s**。追加時間は30.3%、計測中compile/recompile/guard failureは0。
+以前の平均50 token前後のデータとの絶対速度比較には使わない。
+
+Mac full pytestは1312 passed / 64 skipped / 指定のMPSテスト1件deselected、ctestは18/18。
+TSUBAMEの関連テストは29 passed。更新直後KL、freeze、online/EMA、更新cadence、
+checkpoint継続、旧checkpointからのinit-fromを検証した。
+CPUの既定updateは変更前ソースとloss/online/EMA/Adamがbit一致した。
+GPUでは選択log-prob、ratio、uniform magnet、valueはbit一致するが、KL/entropyの集約に
+最大1.19e-7の差が残る。変更前同士のGPU updateにも非決定性があり、GPU更新全体の
+厳密なbit一致は保証しない。uniformのcompiled headsと呼び出し順は元のまま保持している。
+
+init-from後6反復＋resume auto後2反復（2501–2508）のGPU smokeを実施した。
+alpha=.05、K=2、online source、pool fraction=.2、計82,006 training decisions、truncation=0。
+reg更新は2502/2504/2506/2508終了時で、最終reg重みはonlineと全要素bit一致。
+reg KLの更新中平均は8.05e-5〜7.48e-4。長期学習・棋力改善の検証は実施していない。
+
+詳細な変更ファイル、精度、再現コマンド、smoke各反復のmetricsは
+[measurements/rnad_20261115/README.md](../measurements/rnad_20261115/README.md)を参照。
+計算ノードの対話ジョブは終了せず残している。

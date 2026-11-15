@@ -35,6 +35,10 @@ def main():
     p.add_argument('--limit', type=int, default=0)
     p.add_argument('--profile', action='store_true')
     p.add_argument('--backend', default='eager')
+    p.add_argument('--magnet-source', choices=['uniform', 'reg'])
+    p.add_argument('--alpha-schedule', choices=['decay', 'constant'])
+    p.add_argument('--alpha0', type=float)
+    p.add_argument('--reg-update-every', type=int)
     p.add_argument('--tf32', action=argparse.BooleanOptionalAction, default=True)
     args = p.parse_args()
     torch.set_num_threads(4)
@@ -48,6 +52,9 @@ def main():
                            if f.name in state['config']})
     # The requested benchmark backend overrides the checkpoint's runtime backend.
     cfg.learner_backend = 'eager'
+    for name in ('magnet_source', 'alpha_schedule', 'alpha0', 'reg_update_every'):
+        if getattr(args, name) is not None:
+            setattr(cfg, name, getattr(args, name))
     cfg.minibatch_size, cfg.microbatch_size = args.minibatch_size, args.microbatch_size
     learner = Learner(model, cfg, 'cuda', args.dtype)
     learner.ema.load_state_dict(state['ema'])
@@ -93,6 +100,7 @@ def main():
         for group in learner.optimizer.param_groups:
             group.update(fused=args.backend != 'eager', foreach=False if args.backend != 'eager' else None)
         learner.optimizer_steps = state['optimizer_steps']
+        learner.restore_reg(state, resume=True)
         np.random.seed(42)
         measure(learner, batch, args, iteration)
 

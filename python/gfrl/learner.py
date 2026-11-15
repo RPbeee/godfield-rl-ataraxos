@@ -22,6 +22,10 @@ class LearnerConfig:
     lr_max: float = 1e-4
     magnet: bool = False
     alpha0: float = 0.05
+    magnet_source: str = 'uniform'
+    alpha_schedule: str = 'decay'
+    reg_update_every: int = 100
+    reg_source: str = 'online'
     filtering: bool = False
     kl_coef: float = 0.1
     clip: float = 0.2
@@ -39,11 +43,12 @@ def schedules(config, iteration):
         raise ValueError('iteration is one-based')
     lr = (float(np.clip(config.lr_c / iteration**1.1, config.lr_min, config.lr_max))
           if config.lr_decay else config.lr)
-    alpha = config.alpha0 / iteration**0.3 if config.magnet else 0.0
+    alpha = (config.alpha0 if config.alpha_schedule == 'constant' else
+             config.alpha0 / iteration**0.3) if config.magnet else 0.0
     return lr, alpha
 
 
-def decision_terms(new_lp, old_lp, mask, choices, owners, count):
+def decision_terms(new_lp, old_lp, mask, choices, owners, count, reg_lp=None):
     """Sum stage log probabilities, KLs and entropy for each decision."""
     # Explicitly zero masked entries before arithmetic, including -inf inputs.
     new = new_lp.masked_fill(~mask, 0)
@@ -54,12 +59,14 @@ def decision_terms(new_lp, old_lp, mask, choices, owners, count):
     kl = (p * (new - old)).sum(-1)
     entropy = -(p * new).sum(-1)
     uniform_kl = mask.sum(-1).float().log() - entropy
+    magnet_kl = (uniform_kl if reg_lp is None else
+                 (p * (new - reg_lp.detach().masked_fill(~mask, 0))).sum(-1))
     def reduce(values):
         return values.new_zeros(count).index_add(0, owners, values)
     log_new, log_old = reduce(selected_new), reduce(selected_old)
     return dict(log_prob=log_new, old_log_prob=log_old,
                 ratio=(log_new-log_old).exp(), kl=reduce(kl),
-                magnet=reduce(uniform_kl), entropy=reduce(entropy))
+                magnet=reduce(magnet_kl), entropy=reduce(entropy))
 
 
 class Learner:
@@ -69,15 +76,47 @@ class Learner:
             raise ValueError('batch sizes must be positive')
         if not 0 < self.config.gamma <= 1:
             raise ValueError('gamma must be in (0,1]')
+        for name, choices in (('magnet_source', ('uniform', 'reg')),
+                              ('alpha_schedule', ('decay', 'constant')),
+                              ('reg_source', ('online', 'ema'))):
+            if getattr(self.config, name) not in choices:
+                raise ValueError(f'invalid {name}')
+        if self.config.reg_update_every <= 0:
+            raise ValueError('reg_update_every must be positive')
         self.device = torch.device(device)
         self.dtype = dtype
         self.model = model.to(self.device)
         self.ema = deepcopy(model).eval().requires_grad_(False)
+        self.reg = (deepcopy(model).eval().requires_grad_(False)
+                    if self.config.magnet_source == 'reg' else None)
+        self.reg_last_update = 0
         self.optimizer = torch.optim.Adam(model.parameters(), lr=self.config.lr)
         self.optimizer_steps = 0
         if self.config.learner_backend != 'eager':
             from .fast_learner import configure_fast_learner
             configure_fast_learner(self, self.config.learner_backend)
+
+    def reset_reg(self, iteration=0):
+        """Initialize from the starting online weights, including on init-from."""
+        if self.reg is not None:
+            self.reg.load_state_dict(self.model.state_dict())
+        self.reg_last_update = iteration
+
+    def restore_reg(self, state, *, resume):
+        if resume and self.reg is not None and state.get('reg') is not None:
+            self.reg.load_state_dict(state['reg'])
+            self.reg_last_update = state['reg_last_update']
+        else:
+            self.reset_reg(state['iteration'])
+
+    def update_reg(self, iteration):
+        """Refresh after the complete PPO/EMA update; cadence is relative to start."""
+        if self.reg is None or iteration-self.reg_last_update < self.config.reg_update_every:
+            return False
+        source = self.model if self.config.reg_source == 'online' else self.ema
+        self.reg.load_state_dict(source.state_dict())
+        self.reg_last_update = iteration
+        return True
 
     def autocast(self):
         return (nullcontext() if self.dtype == 'fp32' else torch.autocast(
@@ -126,7 +165,15 @@ class Learner:
             encoded = self.model.encode(obs)
             lp, _ = self.model.heads(encoded.index_select(0, owners), **prefix)
             value = self.model.value_head(encoded[:, self.model.positions['cls']]).float()
-        terms = decision_terms(lp, old_lp, prefix['mask'].bool(), choices, owners, len(value))
+        reg_lp = None
+        if self.reg is not None:
+            # Avoid the eval-only fused Transformer path, so equal weights use
+            # the same arithmetic as the differentiable online forward.
+            from .runtime import encoder_fastpath_disabled
+            with torch.no_grad(), self.autocast(), encoder_fastpath_disabled():
+                reg_encoded = self.reg.encode(obs)
+                reg_lp, _ = self.reg.heads(reg_encoded.index_select(0, owners), **prefix)
+        terms = decision_terms(lp, old_lp, prefix['mask'].bool(), choices, owners, len(value), reg_lp)
         return terms, value
 
     def _tick(self):
@@ -178,6 +225,8 @@ class Learner:
                     if cfg.filtering else np.ones(len(decisions), dtype=bool))
         metrics = dict(policy_loss=0., kl=0., kl_loss=0., magnet_loss=0., value_loss=0.,
                        entropy=0., ratio_mean=0., clip_fraction=0., value_accuracy=0.)
+        if self.reg is not None:
+            metrics['reg_kl'] = 0.
         metric_sums = []
         # Dropout remains off to match the behavior policies (gradients stay enabled).
         self.model.eval()
@@ -244,6 +293,8 @@ class Learner:
                               entropy=terms['entropy'], ratio_mean=ratio,
                               clip_fraction=((ratio-1).abs() > cfg.clip).float(),
                               value_accuracy=(value.argmax(-1) == target.argmax(-1)).float())
+                if self.reg is not None:
+                    values['reg_kl'] = terms['magnet']
                 if hasattr(self, '_packed_forward'):
                     metric_sums.append(torch.stack([v.detach().sum() for v in values.values()]))
                 else:
@@ -273,6 +324,9 @@ class Learner:
             metrics[key] /= denom
         metrics.update(lr=lr, alpha=alpha, filtering_fraction=float(keep.float().mean())
                        if columnar else float(keep.mean()))
+        if self.reg is not None:
+            metrics.update(reg_updated=int(self.update_reg(iteration)),
+                           reg_last_update=self.reg_last_update)
         synchronize(self.device)
         for name, begin, end in self._timing_events:
             timings[name] += begin.elapsed_time(end)/1000

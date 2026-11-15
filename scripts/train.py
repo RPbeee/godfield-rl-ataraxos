@@ -45,11 +45,14 @@ def parse_args(argv=None):
     p.add_argument('--run-dir', default='runs/train')
     p.add_argument('--max-hours', type=float, default=23.)
     defaults = LearnerConfig()
+    choices = dict(magnet_source=('uniform', 'reg'), alpha_schedule=('decay', 'constant'),
+                   reg_source=('online', 'ema'))
     for f in fields(defaults):
         value = getattr(defaults, f.name)
         p.add_argument('--'+f.name.replace('_', '-'), default=value,
                        **(dict(action=argparse.BooleanOptionalAction) if isinstance(value, bool)
-                          else dict(type=type(value))))
+                          else dict(type=type(value))),
+                       **(dict(choices=choices[f.name]) if f.name in choices else {}))
     add_runtime_args(p)
     args = p.parse_args(argv)
     if args.config:
@@ -60,7 +63,8 @@ def parse_args(argv=None):
         for k, v in config.items():
             setattr(args, k, v)
     positive = ('selfplay_streams','num_envs', 'threads', 'games_per_iter', 'iterations', 'pool_every',
-                'pool_size', 'eval_pairs', 'minibatch_size', 'decision_capacity', 'stage_capacity')
+                'pool_size', 'eval_pairs', 'minibatch_size', 'decision_capacity', 'stage_capacity',
+                'reg_update_every')
     if any(getattr(args, k) <= 0 for k in positive) or args.eval_every < 0:
         p.error('counts must be positive (eval_every may be zero)')
     if args.rollout_storage not in ('device', 'cpu'):
@@ -81,6 +85,9 @@ def parse_args(argv=None):
         p.error('--resume and --init-from are mutually exclusive')
     if not 0 < args.gamma <= 1:
         p.error('gamma must be in (0,1]')
+    for name, allowed in choices.items():
+        if getattr(args, name) not in allowed:
+            p.error('invalid '+name)
     return args
 
 
@@ -122,6 +129,8 @@ def save_checkpoint(path, learner, iteration, pool, positions, config, elapsed, 
                  torch_rng=torch.get_rng_state(), numpy_rng=np.random.get_state())
     state['stop_reason'] = stop_reason
     state['init_from'] = config.get('init_from')
+    if learner.reg is not None:
+        state.update(reg=learner.reg.state_dict(), reg_last_update=learner.reg_last_update)
     if learner.device.type == 'cuda':
         state['cuda_rng'] = torch.cuda.get_rng_state_all()
     elif learner.device.type == 'mps':
@@ -189,6 +198,7 @@ def run(args):
         learner.ema.load_state_dict(state['ema'])
         learner.optimizer.load_state_dict(state['optimizer'])
         learner.optimizer_steps = state.get('optimizer_steps', 0)
+        learner.restore_reg(state, resume=bool(args.resume))
         pool, iteration = state['pool'], state['iteration']
         positions = state['seed_positions'].copy()
         elapsed_before = state['elapsed_s'] if args.resume else 0.

@@ -41,6 +41,9 @@ def main():
     p.add_argument('--microbatch-size', type=int, default=4096)
     p.add_argument('--forward-limit', type=int, default=256)
     p.add_argument('--steps', type=int, default=3)
+    p.add_argument('--magnet-source', choices=['uniform', 'reg'], default='uniform')
+    p.add_argument('--alpha-schedule', choices=['decay', 'constant'], default='decay')
+    p.add_argument('--alpha0', type=float, default=.05)
     args = p.parse_args()
     torch.set_num_threads(4)
     configure_precision('cuda', False)
@@ -53,6 +56,8 @@ def main():
     cfg_dict = {f.name:state['config'][f.name] for f in fields(LearnerConfig)
                 if f.name in state['config']}
     cfg_dict.pop('learner_backend', None)
+    cfg_dict.update(magnet_source=args.magnet_source, alpha_schedule=args.alpha_schedule,
+                    alpha0=args.alpha0)
     cfg = LearnerConfig(**cfg_dict)
     xi, advantage = compute_targets(batch, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
     from gfrl.gpu.targets import compute_targets as gpu_targets
@@ -76,6 +81,10 @@ def main():
                 group.update(fused=True, foreach=False)
         learner.ema.load_state_dict(state['ema'])
         learner.optimizer_steps = state['optimizer_steps']
+        learner.restore_reg(state, resume=True)
+        if learner.reg is not None:
+            # Exercise nonzero KL and its gradient on an old checkpoint too.
+            learner.reg.load_state_dict(state['ema'])
         model.eval()
         rows = torch.arange(min(args.forward_limit, len(batch)), device='cuda')
         inputs = learner._prepare(batch, rows)

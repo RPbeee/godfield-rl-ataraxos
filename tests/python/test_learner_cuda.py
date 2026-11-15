@@ -118,3 +118,67 @@ def test_grouped_attention_interleaved_gradient(head_only, head_dim):
     grad=torch.randn_like(actual)
     actual.backward(grad);expected.backward(grad)
     assert float((x.grad.float()-y.grad.float()).norm()/y.grad.float().norm()) < .015
+
+
+def test_moving_magnet_packed_grouped_matches_eager():
+    from copy import deepcopy
+    from gfrl.learner import Learner, LearnerConfig
+    from gfrl.model import Model, ModelConfig
+    from gfrl.rollout import Collector, RolloutBatch
+    from gfrl.runtime import configure_precision
+    configure_precision('cuda', False)
+    torch.set_num_threads(4)
+    torch.manual_seed(42)
+    model = Model(ModelConfig(d=256, heads=8, depth=2, ff=1024)).eval()
+    batch = Collector(model, num_envs=16, threads=2, seed=7, pool_fraction=0).collect(2)[:64]
+    batch = RolloutBatch({k:v.cuda() for k,v in batch.columns.items()},
+                         {k:v.cuda() for k,v in batch.stages.items()})
+    cfg = LearnerConfig(magnet=True, magnet_source='reg', alpha_schedule='constant',
+                        alpha0=.5, reg_update_every=2, minibatch_size=64, microbatch_size=64)
+    eager = Learner(deepcopy(model), deepcopy(cfg), 'cuda', 'bf16')
+    cfg.learner_backend = 'packed-grouped'
+    fast = Learner(deepcopy(model), cfg, 'cuda', 'bf16')
+    inputs = eager._prepare(batch, torch.arange(len(batch)))
+    # bf16 compiled grad/no-grad graphs can fuse/round differently. The zero
+    # KL tolerance accounts for that bf16 rounding; CPU fp32 is tested at 1e-6.
+    for learner in (eager, fast):
+        terms, _ = learner.forward(inputs)
+        torch.testing.assert_close(terms['magnet'], torch.zeros_like(terms['magnet']), atol=1e-4, rtol=0,
+                                   msg=learner.config.learner_backend)
+    with torch.no_grad():
+        for p in eager.reg.parameters():
+            p.add_(torch.randn_like(p)*.002)
+    fast.reg.load_state_dict(eager.reg.state_dict())
+    initial = torch.cat([p.detach().flatten() for p in eager.model.parameters()])
+    results = []
+    for learner in (eager, fast):
+        terms, values = learner.forward(inputs)
+        loss = terms['log_prob'].mean()+terms['kl'].mean()*.1+terms['magnet'].mean()*.5+values.square().mean()
+        loss.backward()
+        gradient = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten()
+                              for p in learner.model.parameters()])
+        results.append((terms, values, gradient))
+        assert float(terms['magnet'].detach().mean()) > 1e-5
+        assert all(p.grad is None for p in learner.reg.parameters())
+    a, b = results
+    for key in b[0]:
+        torch.testing.assert_close(a[0][key], b[0][key], atol=.025, rtol=.02)
+    assert float(((a[1]-b[1]).norm()/a[1].norm()).detach()) < .01
+    assert float((a[2]-b[2]).norm()/a[2].norm()) < .06
+    for iteration in (1, 2, 3):
+        for learner in (eager, fast):
+            np.random.seed(123+iteration)
+            metrics = learner.update(batch, iteration)
+            assert metrics['reg_updated'] == (iteration == 2)
+            assert np.isfinite(metrics['reg_kl'])
+            if iteration == 2:
+                terms, _ = learner.forward(inputs)
+                torch.testing.assert_close(terms['magnet'], torch.zeros_like(terms['magnet']), atol=1e-4, rtol=0,
+                                           msg=learner.config.learner_backend)
+    updates = [torch.cat([p.detach().flatten() for p in l.model.parameters()])-initial for l in (eager, fast)]
+    assert float((updates[0]-updates[1]).norm()/updates[0].norm()) < .15
+    # Fresh-run EMA uses ~0.1 decay, so its error tracks Adam's update error.
+    # Compare cumulative updates; the production-checkpoint validation also
+    # reports absolute EMA error with the mature 0.999 decay.
+    emas = [torch.cat([p.detach().flatten() for p in l.ema.parameters()])-initial for l in (eager, fast)]
+    assert float((emas[0]-emas[1]).norm()/emas[0].norm()) < .15

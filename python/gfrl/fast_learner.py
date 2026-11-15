@@ -118,10 +118,42 @@ def heads(model, encoded, inputs):
                            inputs['choice'], owners, b), value
 
 
+def magnet_heads(model, encoded, inputs, reg_lp=None, policy_only=False):
+    # Intentionally separate from heads: even optional inputs can change
+    # Inductor's fusion/reduction choices for the legacy uniform graph.
+    owners = inputs['owners']
+    stage = inputs['stage'].long()
+    b, _, d = encoded.shape
+    slots = inputs['chosen_cards'].long().clamp(min=0)
+    # Gather just the selected hand tokens, not [stages,all_tokens,d].
+    hand = encoded[:, 3:21]
+    selected = hand[owners[:, None], slots]
+    valid = torch.arange(18, device=slots.device)[None] < inputs['chosen_count'][:, None]
+    selected = (selected * valid.unsqueeze(-1)).sum(1)
+    cls = encoded[:, 0]
+    q = model.query(torch.cat((cls[owners],
+        model.kind_embedding(inputs['chosen_kind'].long()+1), selected,
+        model.stage_embedding(stage), model.target_embedding(inputs['chosen_target'].long()+1),
+        model.hp_embedding(inputs['chosen_alloc_hp'].long()+1)), -1))
+    kind = F.pad(model.kind_head(q), (0, 11))
+    card = F.pad(torch.cat(((hand[owners]*model.card_query(q)[:, None]).sum(-1),
+                            model.stop_head(q)), -1), (0, 2))
+    target = F.pad(model.target_head(q), (0, 18))
+    alternatives = torch.stack((kind, card, target, model.hp_head(q), model.mp_head(q)), 1)
+    logits = alternatives.gather(1, stage[:, None, None].expand(-1, 1, 21)).squeeze(1)
+    lp = F.log_softmax(logits.float().masked_fill(~inputs['mask'].bool(), -1e9), -1)
+    if policy_only:
+        return lp
+    value = model.value_head(cls).float()
+    return decision_terms(lp, inputs['old_lp'], inputs['mask'].bool(),
+                           inputs['choice'], owners, b, reg_lp), value
+
+
 class PackedForward:
     def __init__(self, learner, compile=True, reduced=False, short=False, fp8=False, low_precision=False, grouped=False):
         self.learner = learner
         self.embed, self.encode, self.heads = embed, encode, heads
+        self.magnet_heads = magnet_heads
         if reduced:
             self.embed = lambda model, obs, positions: embed(model, obs, positions, reduced=True)
         if short or fp8 or low_precision or grouped:
@@ -130,6 +162,7 @@ class PackedForward:
             self.embed = torch.compile(self.embed, dynamic=True, fullgraph=True)
             self.encode = torch.compile(self.encode, dynamic=True, fullgraph=True)
             self.heads = torch.compile(heads, dynamic=True)
+            self.magnet_heads = torch.compile(magnet_heads, dynamic=True)
 
     def __call__(self, inputs):
         from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -143,10 +176,24 @@ class PackedForward:
         head_indices = torch.where((positions % t) < 21)[0]
         with learner.autocast(), sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             obs = {k: inputs[k] for k in ('obs_type', 'obs_cards', 'obs_aux_card', 'obs_cat', 'obs_num', 'obs_valid')}
-            x = self.embed(model, obs, positions)
-            x = self.encode(model, x, cu, head_indices, head_cu, t)
-            encoded = x.new_zeros((b*21, model.config.d)).index_copy(0, torch.where(head_valid.flatten())[0], x).view(b, 21, -1)
-            return self.heads(model, encoded, inputs)
+            if learner.reg is None:
+                # Preserve the original compiled uniform graph and call path.
+                x = self.embed(model, obs, positions)
+                x = self.encode(model, x, cu, head_indices, head_cu, t)
+                encoded = x.new_zeros((b*21, model.config.d)).index_copy(0, torch.where(head_valid.flatten())[0], x).view(b, 21, -1)
+                return self.heads(model, encoded, inputs)
+            output_indices = torch.where(head_valid.flatten())[0]
+
+            def run(network):
+                x = self.embed(network, obs, positions)
+                x = self.encode(network, x, cu, head_indices, head_cu, t)
+                return x.new_zeros((b*21, model.config.d)).index_copy(0, output_indices, x).view(b, 21, -1)
+
+            # Reuse all packing indices and the same kernels/precision. Only
+            # policy logits are needed: no value head, reductions or backward.
+            with torch.no_grad():
+                reg_lp = self.magnet_heads(learner.reg, run(learner.reg), inputs, policy_only=True)
+            return self.magnet_heads(model, run(model), inputs, reg_lp=reg_lp)
 
 
 BACKENDS = ('eager', 'packed', 'packed-eager', 'packed-reduce', 'packed-short',
