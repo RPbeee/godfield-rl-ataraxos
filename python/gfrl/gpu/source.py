@@ -44,7 +44,7 @@ def _read(path):
     return _clean((ROOT / path).read_text())
 
 
-def build_source(*, specialize_config=False, private_rules=False):
+def build_source(*, specialize_config=False, private_rules=False, search=False):
     base = 'third_party/goodfield/'
     headers = [_read(base + 'include/godfield/' + n + '.hpp') for n in (
         'official_catalog', 'official_rules', 'official_state', 'official_match')]
@@ -57,6 +57,11 @@ def build_source(*, specialize_config=False, private_rules=False):
     headers[-1] = headers[-1].replace('struct ActionBatch {', 'struct ActionBatch { std::int64_t gpu_launch_mp=0;')
     headers[-1] = headers[-1].replace('MatchStep step(const Command& command);', 'void step(const Command& command);')
     headers[-1] = re.sub(r'class MatchError : public std::runtime_error \{.*?\n\};', '', headers[-1], flags=re.S)
+    if search:
+        headers[-1] = headers[-1].replace('struct MatchSnapshot {',
+            'struct MatchSnapshot { bool gpu_lean=false;')
+        headers[-1] = headers[-1].replace('class Match {\npublic:',
+            'class Match {\npublic:\n    int gpu_search_status=0;')
     # Policy-only public selection restrictions are absent in training VecEnv.
     selh = _read('cpp/gfrl_core/selection.hpp')
     selh = selh[:selh.index('std::vector<std::int32_t> random_choices')] + '\n}\n'
@@ -64,7 +69,8 @@ def build_source(*, specialize_config=False, private_rules=False):
     ench = _read('cpp/gfrl_core/encoder.hpp')
     ench = ench.replace('std::vector<Token> encode(', 'void encode(').replace('std::span<const gf::ItemToken> order);', 'std::span<const gf::ItemToken> order, std::vector<Token>& out);')
     hish = _read('cpp/gfrl_core/history.hpp')
-    hish = hish.replace(' std::optional<Token> opposite;', '')
+    if not search:
+        hish = hish.replace(' std::optional<Token> opposite;', '')
     catalog = _read(base + 'src/official_catalog.cpp')
     # Device globals must be constant initialized, with no host string pointers.
     catalog = catalog.replace('constexpr std::array<Card, catalog_count> records',
@@ -86,7 +92,8 @@ def build_source(*, specialize_config=False, private_rules=False):
         'if(!history_only) for (const auto& instance : p.items) if (instance.used)')
     state = state.replace('if (own) for (const auto& instance : own->items)',
         'if (own && !history_only) for (const auto& instance : own->items)')
-    state = re.sub(r'    std::stable_sort\(out.hand.begin\(\), out.hand.end\(\), .*?\n    \}\);', '', state, flags=re.S)
+    if not search:
+        state = re.sub(r'    std::stable_sort\(out.hand.begin\(\), out.hand.end\(\), .*?\n    \}\);', '', state, flags=re.S)
 
     match = _read(base + 'src/official_match.cpp')
     match = match[:match.index('std::string Match::observe(')] + '\n}\n'
@@ -102,11 +109,18 @@ def build_source(*, specialize_config=False, private_rules=False):
     keep_methods = {'Match', 'reset', 'step', 'view',
                     'last_decision', 'legal_kinds', 'legal_extensions',
                     'gift_weight', 'gift_catalog', 'gift_supported'}
+    if search:
+        keep_methods.update({'restore', 'load_scene', 'determinize_support',
+                             'determinized', 'determinized_impl'})
     methods = set(re.findall(r'^.*?\bMatch::(\w+)\s*\(', match, re.M))
     for name in sorted(methods - keep_methods):
         match = _replace_function(match, 'Match::' + name)
-    for name in ('replay_launch', 'replay_response'):
-        match = _replace_function(match, name)
+    if not search:
+        for name in ('replay_launch', 'replay_response'):
+            match = _replace_function(match, name)
+    else:
+        from .search_source import checked_determinization
+        match = checked_determinization(match)
     # Commands come only from the GPU legal cursor. Invalid commands trap the
     # CUDA context, so copying the whole snapshot for CPU-style rollback adds
     # no useful transaction boundary on this path.
@@ -114,11 +128,21 @@ def build_source(*, specialize_config=False, private_rules=False):
     # Runtime payload construction needs the original owner's launch MP. The
     # full state and counters in ActionBatch's replay anchor are otherwise only
     # read by import/replay validation, which is absent on this training path.
-    match = _replace_function(match,'action_anchor','''ActionBatch action_anchor(const MatchSnapshot& s) {
+    if not search:
+        match = _replace_function(match,'action_anchor','''ActionBatch action_anchor(const MatchSnapshot& s) {
         ActionBatch batch;batch.owner=s.owner;batch.rng=s.rng;
         batch.gpu_launch_mp=find_player(s.state,s.owner)->mp;return batch;
     }''')
-    match = match.replace('find_player(batch.initial_state, batch.owner)->mp', 'batch.gpu_launch_mp')
+        match = match.replace('find_player(batch.initial_state, batch.owner)->mp', 'batch.gpu_launch_mp')
+    else:
+        # Root games retain complete replay anchors for determinization. Search
+        # worlds never become sources of another search: use the same lean
+        # launch anchor already validated by the ordinary GPU training engine.
+        match = match.replace('ActionBatch batch;\n    batch.initial_state = s.state;',
+            '''ActionBatch batch;batch.gpu_launch_mp=find_player(s.state,s.owner)->mp;
+    if(s.gpu_lean){batch.owner=s.owner;batch.rng=s.rng;return batch;}
+    batch.initial_state = s.state;''')
+        match = match.replace('find_player(batch.initial_state, batch.owner)->mp', 'batch.gpu_launch_mp')
     match = match.replace('const auto board=project_view(s.state,s.state.players[i].id);',
         'const auto board=project_view(s.state,s.state.players[i].id,true);')
 
@@ -225,9 +249,25 @@ def build_source(*, specialize_config=False, private_rules=False):
     for name in ('num_names', 'card_features'):
         encoder = _replace_function(encoder, name)
     history = _read('cpp/gfrl_core/history.cpp')
-    for name in ('project_history', 'History::set_projection', 'History::projected'):
-        history = _replace_function(history, name)
-    history = history.replace('{std::move(token),decision,std::nullopt}', '{std::move(token),decision}')
+    if not search:
+        for name in ('project_history', 'History::set_projection', 'History::projected'):
+            history = _replace_function(history, name)
+        history = history.replace('{std::move(token),decision,std::nullopt}', '{std::move(token),decision}')
+    else:
+        # Index the device ring backwards; same matching order as CPU reverse iterators.
+        history = _replace_function(history, 'History::set_projection', '''void History::set_projection(const History& projection) {
+            int end=int(projection.events_.size())-1;
+            for(int i=int(events_.size())-1;i>=0;--i) {
+                auto& src=events_[i];int found=end;
+                for(;found>=0;--found) {
+                    const auto& p=projection.events_[found];if(p.decision!=src.decision)continue;
+                    auto token=p.token;
+                    for(auto c:{Actor,Target,Origin,SourceSeat})if(token.cat[c])token.cat[c]=3-token.cat[c];
+                    if((token.type==Decision && src.token.type==Decision) || token==src.token)break;
+                }
+                if(found>=0){src.opposite=projection.events_[found].token;end=found-1;}
+            }
+        }''')
     text = '\n'.join([*headers, selh, ench, hish, catalog, rules, state, match,
                       _read('cpp/gfrl_gpu/selection.cuh'), selection, encoder, history])
     text = re.sub(r'\bthrow\s+[^;]+;', 'gpu_fail(__LINE__);', text)
@@ -235,5 +275,8 @@ def build_source(*, specialize_config=False, private_rules=False):
     # shared_ptr exists only for the unused public-root restriction path.
     if private_rules:
         text = '\nnamespace {\n' + text + '\n}\n'
-    return (ROOT / 'cpp/gfrl_gpu/compat.cuh').read_text() + text + (
-        ROOT / 'cpp/gfrl_gpu/kernels.cuh').read_text()
+    kernels = (ROOT / 'cpp/gfrl_gpu/kernels.cuh').read_text()
+    if search:
+        from .search_source import search_kernels
+        kernels = search_kernels(kernels)
+    return (ROOT / 'cpp/gfrl_gpu/compat.cuh').read_text() + text + kernels

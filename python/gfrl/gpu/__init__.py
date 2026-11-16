@@ -64,7 +64,7 @@ class GpuEnv:
             raise ValueError('arena_bytes must be >=4096 and divisible by 16')
         self._closed = True
         with torch.cuda.device(self.device):
-            self._module, state_bytes, c, f = _module(str(self.device))
+            self._module, state_bytes, c, f = self._load_module(str(self.device))
             self._state_bytes=state_bytes
             self._parent=None
             torch.cuda.current_stream().wait_event(self._module.ready)
@@ -91,9 +91,14 @@ class GpuEnv:
             self._storage = torch.empty(num_envs*state_bytes, dtype=torch.uint8, device=self.device)
             self._pointers = torch.tensor([getattr(self,k).data_ptr() for k in FIELDS] + [self._stats.data_ptr(),self._ready.data_ptr()],
                                           dtype=torch.int64, device=self.device)
-            self._module.launch('gpu_init', self._args()+[pointer(self._pool) if self._pool is not None else ct.c_void_p()], n=num_envs)
+            self._initialize()
             self._observe()
             self._closed = False
+
+    _load_module = staticmethod(_module)
+
+    def _initialize(self):
+        self._module.launch('gpu_init', self._args()+[pointer(self._pool) if self._pool is not None else ct.c_void_p()], n=self.num_envs)
 
     def _slice(self,start,stop):
         """Disjoint device view for parallel streams; parent owns its lifetime."""

@@ -8,17 +8,30 @@ CHECKPOINT=${CHECKPOINT:-runs/play/m-2166.pt}
 BELIEF=${BELIEF:-runs/belief/train-m/checkpoint.pt}
 DATA_DIR=${DATA_DIR:-${TMPDIR:-/tmp}/gfrl-distill}
 DEVICE=${DEVICE:-cuda}
+ENV_BACKEND=${ENV_BACKEND:-cpu}
 THREADS=${THREADS:-16}
+if [[ "$ENV_BACKEND" == cuda ]]; then
+  DATA_NUM_ENVS=${DATA_NUM_ENVS:-${NUM_ENVS:-8192}}
+  DATA_ROOT_BATCH_SIZE=${DATA_ROOT_BATCH_SIZE:-${ROOT_BATCH_SIZE:-128}}
+  GAMES_PER_SHARD=${GAMES_PER_SHARD:-8192}
+  export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
+else
+  DATA_NUM_ENVS=${DATA_NUM_ENVS:-${NUM_ENVS:-512}}
+  DATA_ROOT_BATCH_SIZE=${DATA_ROOT_BATCH_SIZE:-${ROOT_BATCH_SIZE:-0}}
+fi
 NUM_ENVS=${NUM_ENVS:-512}
 PAIRS=${PAIRS:-1000}
 mkdir -p "$OUT_DIR"
 runtime=(--device "$DEVICE" --threads "$THREADS" --num-envs "$NUM_ENVS")
 if [[ ${TF32:-1} == 1 ]]; then runtime+=(--tf32); else runtime+=(--no-tf32); fi
+data_runtime=(--device "$DEVICE" --threads "$THREADS" --num-envs "$DATA_NUM_ENVS")
+if [[ ${TF32:-1} == 1 ]]; then data_runtime+=(--tf32); else data_runtime+=(--no-tf32); fi
 search=(--belief "$BELIEF" --worlds "${WORLDS:-16}" --depth "${DEPTH:-3}"
   --candidates "${CANDIDATES:-16}" --candidate-samples "${CANDIDATE_SAMPLES:-64}"
   --alpha "${ALPHA:-0.002}" --beta "${BETA:-0.1}" --leaf-view "${LEAF_VIEW:-actor}"
   --select sample --search-response --skip-forced-inference --skip-single-candidate
   --max-inference-batch "${MAX_INFERENCE_BATCH:-8192}"
+  --root-batch-size "${ROOT_BATCH_SIZE:-0}"
   --search-cache-device "${SEARCH_CACHE_DEVICE:-auto}" --search-cache-mb "${SEARCH_CACHE_MB:-8192}")
 if [[ -n ${FIT:-} ]]; then search+=(--fit "$FIT"); fi
 if [[ -n ${BELIEF_HYBRID:-} ]]; then search+=(--belief-hybrid "$BELIEF_HYBRID"); fi
@@ -26,7 +39,7 @@ if [[ -n ${BELIEF_TEMPERATURE:-} ]]; then search+=(--belief-temperature "$BELIEF
 if [[ -n ${BELIEF_COUNT_TEMPERATURE:-} ]]; then search+=(--belief-count-temperature "$BELIEF_COUNT_TEMPERATURE"); fi
 if [[ -n ${BELIEF_MIX:-} ]]; then search+=(--belief-mix "$BELIEF_MIX"); fi
 if [[ ! -f "$OUT_DIR/data.complete" ]]; then
-  "$PYTHON" scripts/make_distill_data.py --checkpoint "$CHECKPOINT" "${runtime[@]}" "${search[@]}" \
+  "$PYTHON" scripts/make_distill_data.py --checkpoint "$CHECKPOINT" --env-backend "$ENV_BACKEND" --search-dtype "${SEARCH_DTYPE:-bf16}" "${data_runtime[@]}" "${search[@]}" --root-batch-size "$DATA_ROOT_BATCH_SIZE" \
     --out-dir "$DATA_DIR" --resume --seed "${DATA_SEED:-900000}" \
     --games "${DATA_GAMES:-1000000}" --games-per-shard "${GAMES_PER_SHARD:-512}" \
     --max-hours "${DATA_HOURS:-2.5}" --progress-interval "${PROGRESS_INTERVAL:-600}" \

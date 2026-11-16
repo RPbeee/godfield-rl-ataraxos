@@ -32,7 +32,7 @@ def _head_index(Valid,Prefix,HeadPrefix,Map,N:tl.constexpr,T:tl.constexpr,BLOCK:
 
 @tr.jit
 def _linear(X,W,B,Y,Map,Count,K:tl.constexpr,N:tl.constexpr,GATHER:tl.constexpr,
-            RELU:tl.constexpr,SM:tl.constexpr,BM:tl.constexpr=64,BN:tl.constexpr=64,BK:tl.constexpr=32,TRANSPOSE:tl.constexpr=False,GELU:tl.constexpr=False):
+            RELU:tl.constexpr,SM:tl.constexpr,BM:tl.constexpr=64,BN:tl.constexpr=64,BK:tl.constexpr=32,TRANSPOSE:tl.constexpr=False,GELU:tl.constexpr=False,FP32:tl.constexpr=False):
     active=tl.load(Count)
     tiles_n=tl.cdiv(N,BN)
     tiles_m=tl.cdiv(active,BM)
@@ -44,12 +44,14 @@ def _linear(X,W,B,Y,Map,Count,K:tl.constexpr,N:tl.constexpr,GATHER:tl.constexpr,
         accum=tl.full((BM,BN),0,tl.float32)
         for start in range(tl.cdiv(K,BK)):
             k=start*BK+kk
-            a=tl.load(X+rows[:,None]*K+k[None,:],(m[:,None]<active)&(k[None,:]<K),0).to(tl.bfloat16)
+            a=tl.load(X+rows[:,None]*K+k[None,:],(m[:,None]<active)&(k[None,:]<K),0)
+            if not FP32:a=a.to(tl.bfloat16)
             if TRANSPOSE:
                 w=tl.load(W+k[:,None]*N+n[None,:],(n[None,:]<N)&(k[:,None]<K),0)
             else:
                 w=tl.load(W+n[None,:]*K+k[:,None],(n[None,:]<N)&(k[:,None]<K),0)
-            accum=tl.dot(a,w,accum)
+            if FP32:accum=tl.dot(a,w,accum,input_precision="tf32x3")
+            else:accum=tl.dot(a,w,accum)
         bias=tl.load(B+n,n<N,0).to(tl.float32)
         out=accum+bias[None,:]
         if RELU:out=tl.maximum(out,0)
@@ -115,20 +117,21 @@ def _residual(X,Y,Out,Count,D:tl.constexpr,SM:tl.constexpr,BLOCK:tl.constexpr=10
 
 
 @tr.jit
-def _unpack(X,Valid,Prefix,Weight,Bias,Out,Residual,N:tl.constexpr,T:tl.constexpr,D:tl.constexpr,EPS:tl.constexpr,R:tl.constexpr=8,ADD:tl.constexpr=False,HEAD_COMPACT:tl.constexpr=False):
+def _unpack(X,Valid,Prefix,Weight,Bias,Out,Residual,N:tl.constexpr,T:tl.constexpr,D:tl.constexpr,EPS:tl.constexpr,R:tl.constexpr=8,ADD:tl.constexpr=False,HEAD_COMPACT:tl.constexpr=False,FULL:tl.constexpr=False):
     row=tl.program_id(0)*R+tl.arange(0,R);d=tl.arange(0,tr.next_power_of_2(D))
-    orig=(row//21)*T+row%21
-    valid=tl.load(Valid+orig,row<N*21,0)
-    packed=tl.load(Prefix+(row if HEAD_COMPACT else orig),row<N*21,1)-1
-    x=tl.load(X+packed[:,None]*D+d[None,:],((row<N*21)&valid)[:,None]&(d[None,:]<D),0).to(tl.float32)
+    width=T if FULL else 21
+    orig=row if FULL else (row//21)*T+row%21
+    valid=tl.load(Valid+orig,row<N*width,0)
+    packed=tl.load(Prefix+(row if HEAD_COMPACT else orig),row<N*width,1)-1
+    x=tl.load(X+packed[:,None]*D+d[None,:],((row<N*width)&valid)[:,None]&(d[None,:]<D),0).to(tl.float32)
     if ADD:
-        x+=tl.load(Residual+packed[:,None]*D+d[None,:],((row<N*21)&valid)[:,None]&(d[None,:]<D),0)
+        x+=tl.load(Residual+packed[:,None]*D+d[None,:],((row<N*width)&valid)[:,None]&(d[None,:]<D),0)
     mean=tl.sum(x,1)/D;v=tl.where(d[None,:]<D,x-mean[:,None],0.);var=tl.sum(v*v,1)/D
     y=v*tl.rsqrt(var[:,None]+EPS)*tl.load(Weight+d,d<D,0)[None,:]+tl.load(Bias+d,d<D,0)[None,:]
-    tl.store(Out+row[:,None]*D+d[None,:],tl.where(valid[:,None],y,0),(row[:,None]<N*21)&(d[None,:]<D))
+    tl.store(Out+row[:,None]*D+d[None,:],tl.where(valid[:,None],y,0),(row[:,None]<N*width)&(d[None,:]<D))
 
 @tr.jit
-def _attention(Qkv,Cu,Out,H:tl.constexpr,D:tl.constexpr,HeadCu=None,HEAD_ONLY:tl.constexpr=False,Q:tl.constexpr=32,K:tl.constexpr=32):
+def _attention(Qkv,Cu,Out,H:tl.constexpr,D:tl.constexpr,HeadCu=None,HEAD_ONLY:tl.constexpr=False,Q:tl.constexpr=32,K:tl.constexpr=32,FP32:tl.constexpr=False):
     sequence=tl.program_id(0)//H;head=tl.program_id(0)%H
     start=tl.load(Cu+sequence);end=tl.load(Cu+sequence+1);length=end-start
     if HEAD_ONLY:
@@ -146,13 +149,13 @@ def _attention(Qkv,Cu,Out,H:tl.constexpr,D:tl.constexpr,HeadCu=None,HEAD_ONLY:tl
         for kb in range(tl.cdiv(length,K)):
             cols=kb*K+c
             k=tl.load(Qkv+(start+cols[None,:])*3*H*D+H*D+head*D+d[:,None],(cols[None,:]<length)&(d[:,None]<D),0)
-            score=tl.dot(q,k)*(D**-0.5)
+            score=tl.dot(q,k,input_precision="tf32x3" if FP32 else "ieee")*(D**-0.5)
             score=tl.where(cols[None,:]<length,score,-float('inf'))
             new_max=tl.maximum(maximum,tl.max(score,1))
             prob=tl.exp(score-new_max[:,None]);scale=tl.exp(maximum-new_max)
             denominator=denominator*scale+tl.sum(prob,1)
             v=tl.load(Qkv+(start+cols[:,None])*3*H*D+2*H*D+head*D+d[None,:],(cols[:,None]<length)&(d[None,:]<D),0)
-            accum=accum*scale[:,None]+tl.dot(prob.to(tl.bfloat16),v)
+            accum=accum*scale[:,None]+tl.dot(prob.to(tl.float32) if FP32 else prob.to(tl.bfloat16),v,input_precision="tf32x3" if FP32 else "ieee")
             maximum=new_max
         tl.store(Out+(out_start+rows[:,None])*H*D+head*D+d[None,:],accum/denominator[:,None],(rows[:,None]<query_length)&(d[None,:]<D))
 
@@ -160,16 +163,20 @@ def _attention(Qkv,Cu,Out,H:tl.constexpr,D:tl.constexpr,HeadCu=None,HEAD_ONLY:tl
 class PackedEncoder:
     # Model widths/head widths need not be powers of two. Only Triton lanes
     # are padded; masks and LayerNorm denominators retain the real width.
-    def __init__(self, model, env, weights=None):
+    def __init__(self, model, env, weights=None, *, dtype=torch.bfloat16):
         self.model,self.env=model,env
+        self.dtype=dtype
+        self.fp32=dtype==torch.float32
+        if dtype not in (torch.float32,torch.bfloat16):raise ValueError("packed dtype must be fp32 or bf16")
         self.sm=torch.cuda.get_device_properties(env.device).multi_processor_count*2
         self.element_sm=self.sm*8
         self.short_attention=(env.obs_type.shape[1]<=256 and 16<=model.config.d//model.config.heads<=128)
         self.d=model.config.d
         self.fused_residual_norm = True
         self.compact_final = True
+        self.full_output = False
         self.attention_tiles = dict(Q=64,K=32,num_warps=4)
-        self.tma = torch.cuda.get_device_capability(env.device)[0]>=9
+        self.tma = not self.fp32 and torch.cuda.get_device_capability(env.device)[0]>=9
         if self.tma:
             try:
                 from .tma import linear
@@ -193,18 +200,18 @@ class PackedEncoder:
         for module in modules:
             key=id(module)
             if key not in self.linear:
-                self.linear[key]=(module.weight.detach().to(torch.bfloat16).contiguous(),
-                                  module.bias.detach().to(torch.bfloat16).contiguous())
+                self.linear[key]=(module.weight.detach().to(self.dtype).contiguous(),
+                                  module.bias.detach().to(self.dtype).contiguous())
             else:
                 w,b=self.linear[key];w.copy_(module.weight);b.copy_(module.bias)
         for layer in model.encoder.layers:
             key=id(layer.self_attn)
             if key not in self.linear:
-                self.linear[key]=(layer.self_attn.in_proj_weight.detach().to(torch.bfloat16).contiguous(),
-                                  layer.self_attn.in_proj_bias.detach().to(torch.bfloat16).contiguous())
+                self.linear[key]=(layer.self_attn.in_proj_weight.detach().to(self.dtype).contiguous(),
+                                  layer.self_attn.in_proj_bias.detach().to(self.dtype).contiguous())
             else:
                 w,b=self.linear[key];w.copy_(layer.self_attn.in_proj_weight);b.copy_(layer.self_attn.in_proj_bias)
-        with torch.autocast('cuda',dtype=torch.bfloat16):
+        with torch.autocast('cuda',dtype=torch.bfloat16,enabled=not self.fp32):
             cards=model.card_embedding.weight+model.card_projection(model.card_features)
             aux=model.aux_projection(cards)
         cats=torch.cat([e.weight.detach() for e in model.category_embeddings])
@@ -218,12 +225,12 @@ class PackedEncoder:
 
     def _linear(self,x,module,count,mapping,*,gather=False,relu=False,dense_tiles=False):
         w,b=self.linear[id(module)]
-        y=torch.empty((self.capacity,w.shape[0]),dtype=torch.bfloat16,device=x.device)
+        y=torch.empty((self.capacity,w.shape[0]),dtype=self.dtype,device=x.device)
         if self.tma and not gather and 128<=w.shape[1]<=256 and w.shape[0]%8==0:
             from .tma import linear
             return linear(x,w,b,y,count,self.sm//2,relu=relu)
         tiles = dict(BM=128,BN=128,BK=64,num_warps=8) if not gather or dense_tiles else {}
-        _linear[(self.sm,)](x,w,b,y,mapping,count,w.shape[1],w.shape[0],gather,relu,self.sm,**tiles)
+        _linear[(self.sm,)](x,w,b,y,mapping,count,w.shape[1],w.shape[0],gather,relu,self.sm,FP32=self.fp32,**tiles)
         return y
 
     @torch.inference_mode()
@@ -250,7 +257,7 @@ class PackedEncoder:
                            model.type_embedding.weight,model.role_embedding.weight,self.cards,self.aux,self.cats,x,
                            d,t,len(self.offsets),self.offsets,self.element_sm,enable_fp_fusion=False)
         h=model.config.heads
-        norm=torch.empty((cap,d),dtype=torch.bfloat16,device=env.device)
+        norm=torch.empty((cap,d),dtype=self.dtype,device=env.device)
         layers=model.encoder.layers
         for index,layer in enumerate(layers):
             if not self.fused_residual_norm or index == 0:
@@ -259,8 +266,8 @@ class PackedEncoder:
             q,k,v=qkv.unbind(1)
             final_compact=self.compact_final and index+1==len(layers)
             if self.short_attention:
-                attended=torch.empty((n*21 if final_compact else cap,h,d//h),device=env.device,dtype=torch.bfloat16)
-                _attention[(n*h,)](qkv,cu,attended,h,d//h,HeadCu=head_cu if final_compact else None,HEAD_ONLY=final_compact,**self.attention_tiles)
+                attended=torch.empty((n*21 if final_compact else cap,h,d//h),device=env.device,dtype=self.dtype)
+                _attention[(n*h,)](qkv,cu,attended,h,d//h,HeadCu=head_cu if final_compact else None,HEAD_ONLY=final_compact,FP32=self.fp32,**self.attention_tiles)
             else:
                 attended=torch.ops.aten._flash_attention_forward(q,k,v,cu,cu,t,t,0.,False,False)[0]
             if final_compact:
@@ -281,10 +288,11 @@ class PackedEncoder:
                     _norm[(self.element_sm,)](out,summed,next_norm.weight,next_norm.bias,norm,x,count,d,next_norm.eps,True,self.element_sm)
             else:
                 _residual[(self.element_sm,)](out,summed,x,count,d,self.element_sm)
-        head=torch.empty((n,21,d),device=env.device,dtype=torch.float32)
+        output_width=t if self.full_output else 21
+        head=torch.empty((n,output_width,d),device=env.device,dtype=torch.float32)
         final=model.encoder.norm
         late_add=self.fused_residual_norm
-        _unpack[(tr.cdiv(n*21,8),)](out if late_add else x,valid,head_prefix if self.compact_final else prefix,final.weight,final.bias,head,summed,n,t,d,final.eps,ADD=late_add,HEAD_COMPACT=self.compact_final)
+        _unpack[(tr.cdiv(n*output_width,8),)](out if late_add else x,valid,head_prefix if self.compact_final else prefix,final.weight,final.bias,head,summed,n,t,d,final.eps,ADD=late_add,HEAD_COMPACT=self.compact_final,FULL=self.full_output)
         return head
 
 

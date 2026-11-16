@@ -1,4 +1,28 @@
 // CUDA-only storage adapters for the training engine. No CPU rule changes.
+#ifdef GFRL_GPU_HOST_TEST
+#include <array>
+#include <span>
+#include <optional>
+#include <variant>
+#include <tuple>
+#include <limits>
+#include <type_traits>
+#include <utility>
+#include <cstdint>
+#include <cstddef>
+#include <initializer_list>
+#include <string_view>
+#include <cmath>
+#include <memory>
+#include <cstdio>
+#include <cstdlib>
+namespace cuda { namespace std = ::std; }
+#define __device__
+#define __global__
+struct GpuTestIndex {int x=0;};
+inline GpuTestIndex blockIdx,blockDim{1},threadIdx;
+[[noreturn]] inline void __trap() { std::abort(); }
+#else
 #include <cuda/std/array>
 #include <cuda/std/span>
 #include <cuda/std/optional>
@@ -13,6 +37,7 @@
 #include <cuda/std/string_view>
 #include <cuda/std/cmath>
 #include <cuda/std/memory>
+#endif
 
 
 [[noreturn]] __device__ void gpu_fail(int line) {
@@ -150,6 +175,7 @@ public:
         bool operator!=(const const_iterator& o)const{return position!=o.position;}
     };
     size_t size()const{return count_;}
+    T& operator[](size_t i){return storage_[(start_+i)%storage_.size()];}
     const T& operator[](size_t i)const{return storage_[(start_+i)%storage_.size()];}
     void clear(){start_=count_=0;}
     void pop_front(){start_=(start_+1)%storage_.size();--count_;}
@@ -191,5 +217,6 @@ template<class It> void sort(It b,It e){gs::stable_sort(b,e,[](const auto& a,con
 template<class T,class P> size_t erase_if(vector<T>& v,P p){size_t n=0;for(size_t i=0;i<v.size();){if(p(v[i])){v.erase(v.begin()+i);++n;}else ++i;}return n;}
 template<class T> T min(T a,T b){return a<b?a:b;}
 template<class T> T max(T a,T b){return a>b?a:b;}
+template<class T> T max(initializer_list<T> v){auto i=v.begin();T result=*i++;for(;i!=v.end();++i)result=gs::max(result,*i);return result;}
 template<class T> T clamp(T v,T a,T b){return gs::min(gs::max(v,a),b);}
 }

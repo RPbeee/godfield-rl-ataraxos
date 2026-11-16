@@ -149,3 +149,35 @@ Candidate-set agreement/KL/q do not measure policy mass outside retained paths.
 Self-play changes state coverage, and tiny smoke win rates cannot establish an
 improvement. Use the default held-out evaluation deals and adequate pairs for
 an expert-iteration comparison.
+
+## CUDA search data path
+
+`--env-backend cuda --search-dtype bf16` on the generator, or
+`ENV_BACKEND=cuda SEARCH_DTYPE=bf16` on the session, selects device game
+simulation, AR belief sampling, determinized worlds, candidates, rollouts and
+leaf values. Production uses packed encoder/heads, CUDA graphs and cached AR
+attention. `--search-dtype fp32` keeps the CPU-comparison inference mode.
+
+The shard remains format v1. Retained prefixes are gathered in batches and
+compressed in parallel; the existing loader and learner are unchanged.
+`--cuda-record-format legacy` selects the original Python record representation.
+GPU session defaults are `DATA_NUM_ENVS=8192`, `DATA_ROOT_BATCH_SIZE=128` and
+`GAMES_PER_SHARD=8192`. Evaluation keeps the CPU backend and its default
+`NUM_ENVS=512`; `DATA_*` allows independent generation tuning.
+
+```bash
+ENV_BACKEND=cuda SEARCH_DTYPE=bf16 \
+  BELIEF=runs/belief-m2166/train/checkpoint.pt \
+  DATA_DIR=/tmp/$USER-gsearch/data OUT_DIR=/tmp/$USER-gsearch/session \
+  scripts/session_distill.sh
+```
+
+On one TSUBAME H100 MIG 3g.47gb, model M / distill-1 generated 8,192 games and
+336,265 searched positions in 952.48 s, including record transfer, shard packing,
+compression and summary: **353.04 positions/s, 30,963 games/h** (10.09× the old
+~35/s). Large root batches can exhaust memory; use root128 on this slice.
+FP32 complete-game comparison covered 5,555 roots: discrete/public traces match,
+max Δq̂=0 and max Δπ=6.66e-16. The latest CUDA packed-data smoke completed
+37 real learner updates. This does not establish a distilled-policy win-rate gain.
+
+See [GPU search design, exactness evidence, precision differences and full commands](../docs/gpu_search.md).
