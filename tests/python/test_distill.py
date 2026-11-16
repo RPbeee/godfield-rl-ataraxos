@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import asdict
 import json
+import os
 import subprocess
 import sys
 import numpy as np
@@ -10,7 +11,7 @@ import torch
 from gfrl import VecEnv, _core
 from gfrl.belief_metrics import Baseline, gift_probabilities
 from gfrl.distill import (outcome_target, pack_records, save_shard, load_shard,
-                         prepare_batch, forward_paths)
+                         prepare_batch, forward_paths, sharpen_probabilities)
 from gfrl.evaluation import _policy_rng, load_policy_model
 from gfrl.model import Model, ModelConfig, OBS_FIELDS
 from gfrl.search import SearchAgent, SearchConfig
@@ -77,6 +78,73 @@ def test_outcome_view_and_truncation():
     np.testing.assert_array_equal(outcome_target(0, 1, 0), [0, 0, 1])
 
 
+@pytest.mark.parametrize('power', [.5, 1., 2., 1000., 1e308, float('inf')])
+def test_target_power_normalization_zeros_and_ties(power):
+    # Ragged, interleaved roots, a singleton, and probabilities too small for fp32.
+    p = torch.tensor([0., .2, .4, .8, .4, 1., .2, 0., 1e-300, 2e-300], dtype=torch.float64)
+    owners = torch.tensor([0, 1, 0, 1, 0, 2, 0, 1, 3, 3])
+    actual = sharpen_probabilities(p, owners, 4, power)
+    if power == 1:
+        assert actual is p
+    expected = torch.empty_like(p)
+    for root in range(4):
+        group = p[owners == root]
+        if power == 1:
+            expected[owners == root] = group
+            continue
+        elif power == float('inf'):
+            weights = (group == group.max()).double()
+        else:
+            weights = (group/group.max()).pow(power)
+        expected[owners == root] = weights/weights.sum()
+    torch.testing.assert_close(actual, expected)
+    assert torch.isfinite(actual).all()
+    assert (actual[p == 0] == 0).all()
+    if power >= 1000:
+        hard = torch.tensor([0., 0., .5, 1., .5, 1., 0., 0., 0., 1.], dtype=torch.float64)
+        torch.testing.assert_close(actual, hard, atol=1e-100, rtol=0)
+
+
+@pytest.mark.parametrize('power', [2., float('inf')])
+def test_prepared_target_drives_all_losses_and_diagnostics(power):
+    from gfrl.distill import objective
+    model, records = recorded()
+    reference = deepcopy(model).requires_grad_(False)
+    with torch.no_grad():
+        model.kind_head.bias.add_(torch.linspace(-.3, .3, 10))
+    data = pack_records(records, dict(seed=1))
+    # Deliberately distinguish maxima in float64 that would tie in float32.
+    co = data['candidate_offsets']
+    for root in range(len(records)):
+        count = int(co[root+1]-co[root])
+        p = torch.arange(1, count+1, dtype=torch.float64)
+        if count > 1:
+            p[-2:] = torch.tensor([count, count+1e-8], dtype=torch.float64)
+        data['probabilities'][co[root]:co[root+1]] = p/p.sum()
+    rows = np.array([7, 1, 4])  # Rebase and reorder multiple roots.
+    original = data['probabilities'].clone()
+    expected = prepare_batch(data, rows)
+    for root, row in enumerate(rows):
+        p = data['probabilities'][co[row]:co[row+1]]
+        weights = (p == p.max()).double() if power == float('inf') else p.pow(power)
+        expected['probabilities'][expected['candidate_owners'] == root] = (weights/weights.sum()).float()
+    actual = prepare_batch(data, rows, target_power=power)
+    torch.testing.assert_close(actual['probabilities'], expected['probabilities'])
+    torch.testing.assert_close(data['probabilities'], original, atol=0, rtol=0)
+    for batch in (actual, expected):
+        batch['q'].copy_(torch.linspace(-.8, .8, len(batch['q'])))
+    loss, metrics = objective(model, reference, actual, value_target_mix=.5)
+    manual_loss, manual_metrics = objective(model, reference, expected, value_target_mix=.5)
+    torch.testing.assert_close(loss, manual_loss)
+    for key in metrics:
+        assert metrics[key] == pytest.approx(manual_metrics[key])
+    baseline = prepare_batch(data, rows)
+    baseline['q'].copy_(actual['q'])
+    _, original_metrics = objective(model, reference, baseline, value_target_mix=.5)
+    assert metrics['q_search'] != original_metrics['q_search']
+    assert metrics['policy'] != original_metrics['policy']
+
+
 def test_no_hidden_inputs_both_seats():
     torch.manual_seed(5)
     model = Model(ModelConfig(d=16, depth=1, heads=2, ff=32))
@@ -106,7 +174,8 @@ def test_no_hidden_inputs_both_seats():
         assert a['probabilities'] == b['probabilities']
 
 
-def test_training_cli_reduces_policy_and_loads(tmp_path):
+@pytest.mark.parametrize('power', ['1', '3', 'inf'])
+def test_training_cli_reduces_policy_and_loads(tmp_path, power):
     model, records = recorded()
     # Independent synthetic games, same public observations, strong teacher.
     expanded = []
@@ -128,6 +197,8 @@ def test_training_cli_reduces_policy_and_loads(tmp_path):
                '--data-dir', str(data_dir), '--run-dir', str(run), '--epochs', '2',
                '--minibatch', '32', '--microbatch', '8', '--validation-fraction', '.3',
                '--lr', '.002', '--value-coef', '0', '--warmup-steps', '0', '--log-every', '1000']
+    if power != '1':
+        command += ['--target-power', power]
     subprocess.run(command, check=True, capture_output=True, text=True)
     metrics = [json.loads(s) for s in (run/'metrics.jsonl').read_text().splitlines()]
     for report in metrics:
@@ -139,13 +210,21 @@ def test_training_cli_reduces_policy_and_loads(tmp_path):
     for k, v in model.value_head.state_dict().items():
         torch.testing.assert_close(v, trained.value_head.state_dict()[k], rtol=0, atol=0)
     assert (run/'last.pt').exists()
-    first = torch.load(run/'last.pt', weights_only=False)['iteration']
+    state = torch.load(run/'last.pt', weights_only=False)
+    assert state['config']['target_power'] == float(power)
+    first = state['iteration']
+    if power == '1':
+        # Check backward-compatible resume of a pre-target-power checkpoint.
+        del state['config']['target_power']
+        torch.save(state, run/'last.pt')
     subprocess.run(command+['--resume', '--epochs', '3'], check=True, capture_output=True, text=True)
     assert torch.load(run/'last.pt', weights_only=False)['iteration'] > first
     changed = subprocess.run(command+['--resume', '--policy-coef', '0'], capture_output=True, text=True)
     assert changed.returncode != 0 and 'resume setting mismatch: policy_coef' in changed.stderr
     changed = subprocess.run(command+['--resume', '--value-target-mix', '.5'], capture_output=True, text=True)
     assert changed.returncode != 0 and 'resume setting mismatch: value_target_mix' in changed.stderr
+    changed = subprocess.run(command+['--resume', '--target-power', '2'], capture_output=True, text=True)
+    assert changed.returncode != 0 and 'resume setting mismatch: target_power' in changed.stderr
 
 
 def test_belief_conditions_on_current_actor_and_response_paths():
@@ -244,7 +323,8 @@ def assert_gradients_equal(a, b):
             torch.testing.assert_close(pa.grad, pb.grad, atol=0, rtol=0)
 
 
-def test_zero_mix_exact_legacy_loss_and_gradients():
+@pytest.mark.parametrize('power', [None, 1.])
+def test_zero_mix_exact_legacy_loss_and_gradients(power):
     from gfrl.distill import objective
     model, records = recorded()
     reference = deepcopy(model).requires_grad_(False)
@@ -252,7 +332,9 @@ def test_zero_mix_exact_legacy_loss_and_gradients():
         model.value_head.bias.add_(.03)
         model.kind_head.bias.add_(torch.linspace(-.1, .1, 10))
     old = deepcopy(model)
-    batch = prepare_batch(pack_records(records, dict(seed=1)), np.arange(len(records)))
+    data = pack_records(records, dict(seed=1))
+    batch = prepare_batch(data, np.arange(len(records)), **({} if power is None else dict(target_power=power)))
+    torch.testing.assert_close(batch['probabilities'], data['probabilities'].float(), atol=0, rtol=0)
     policy, anchor, value = legacy_terms(old, reference, batch)
     expected = policy+.1*anchor+.5*value
     actual, metrics = objective(model, reference, batch, value_target_mix=0.)
@@ -318,6 +400,82 @@ def train_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize('power', [3., float('inf')])
+def test_training_checkpoint_uses_ema_and_sharpened_validation(tmp_path, power):
+    train = train_module()
+    model, records = recorded()
+    raw_model = deepcopy(model)
+    with torch.no_grad():
+        raw_model.kind_head.bias.add_(torch.linspace(-1., 1., 10))
+        raw_model.value_head.bias.add_(torch.tensor([1., -1., 0.]))
+    expanded = []
+    for game in range(20):
+        for record in records:
+            record = deepcopy(record)
+            record['game'] = game
+            expanded.append(record)
+    data = pack_records(expanded, dict(seed=900000))
+    data_dir = tmp_path/'data'
+    data_dir.mkdir()
+    save_shard(data_dir/'shard-000000.pt.gz', data)
+    checkpoint = tmp_path/'ckpt-4500.pt'
+    torch.save(dict(model=raw_model.state_dict(), ema=model.state_dict(),
+                    model_config=asdict(model.config), iteration=4500, config={}, pool=[]), checkpoint)
+    run = tmp_path/'train'
+    subprocess.run([sys.executable, 'scripts/train_distill.py', '--checkpoint', str(checkpoint),
+                    '--data-dir', str(data_dir), '--run-dir', str(run), '--epochs', '1',
+                    '--max-hours', '0', '--validation-fraction', '.4',
+                    '--target-power', str(power), '--value-target-mix', '.5'],
+                   check=True, capture_output=True, text=True)
+    exported = torch.load(run/'last.pt', weights_only=False)
+    assert exported['optimizer_steps'] == 0
+    loaded = load_policy_model(checkpoint).state_dict()
+    for key, value in model.state_dict().items():
+        for weights in (exported['model'], exported['ema'], loaded):
+            torch.testing.assert_close(weights[key], value, atol=0, rtol=0)
+    subset = train.select_rows(data, np.flatnonzero(train.validation_mask(data, .4, 17)))
+    expected = train.average_metrics(train.validation_parts(
+        model, model, [subset], 8, 'cpu', .1, .5, value_target_mix=.5, target_power=power))
+    reports = [json.loads(line) for line in (run/'metrics.jsonl').read_text().splitlines()]
+    for report in reports:
+        for key in expected:
+            assert report['val'][key] == pytest.approx(expected[key])
+
+
+@pytest.mark.parametrize('overrides', [{}, {'TARGET_POWER': 'inf', 'VALUE_TARGET_MIX': '.5'}])
+def test_session_target_flags_and_evaluation_checkpoint(tmp_path, overrides):
+    # Capture commands without running expensive data generation or evaluations.
+    fake = tmp_path/'python'
+    calls = tmp_path/'calls.jsonl'
+    fake.write_text(f'#!{sys.executable}\nimport json, os, sys\n'
+                    'with open(os.environ["DISTILL_TEST_CALLS"], "a") as f:\n'
+                    '    f.write(json.dumps(sys.argv[1:])+"\\n")\n')
+    fake.chmod(0o755)
+    env = dict(os.environ, PYTHON=str(fake), OUT_DIR=str(tmp_path/'out'),
+               DATA_DIR=str(tmp_path/'data'), CHECKPOINT=str(tmp_path/'ckpt-4500.pt'),
+               BELIEF='unused-ar.pt', SKIP_REFERENCE='0', DISTILL_TEST_CALLS=str(calls))
+    for key in ('TARGET_POWER', 'VALUE_TARGET_MIX'):
+        env.pop(key, None)
+    env.update(overrides)
+    subprocess.run(['bash', 'scripts/session_distill.sh'], env=env, check=True, capture_output=True, text=True)
+    commands = [json.loads(line) for line in calls.read_text().splitlines()]
+    def option(command, flag):
+        return command[command.index(flag)+1]
+    training = next(c for c in commands if c[0] == 'scripts/train_distill.py')
+    assert option(training, '--target-power') == overrides.get('TARGET_POWER', '1')
+    assert option(training, '--value-target-mix') == overrides.get('VALUE_TARGET_MIX', '0')
+    assert option(training, '--checkpoint') == env['CHECKPOINT']
+    distilled = str(tmp_path/'out/train/best.pt')
+    plain = next(c for c in commands if c[0] == 'scripts/eval_policies.py')
+    assert option(plain, '--a') == distilled
+    assert option(plain, '--b') == env['CHECKPOINT']
+    search, reference = [c for c in commands if c[0] == 'scripts/eval_search.py']
+    assert option(search, '--checkpoint') == distilled
+    assert option(search, '--opponent-checkpoint') == env['CHECKPOINT']
+    assert option(reference, '--checkpoint') == env['CHECKPOINT']
+    assert option(reference, '--opponent') == 'policy'
 
 
 def test_validation_cache_metrics_match_uncached(tmp_path, monkeypatch):
@@ -461,7 +619,9 @@ def test_value_focused_training_cli(tmp_path):
     assert state['config']['value_target_mix'] == .5
 
 
-@pytest.mark.parametrize('option,value', [('--value-target-mix', '-.1'), ('--value-target-mix', '1.1'),
+@pytest.mark.parametrize('option,value', [('--target-power', '0'), ('--target-power', '-1'),
+                                         ('--target-power', 'nan'), ('--target-power', '-inf'),
+                                         ('--value-target-mix', '-.1'), ('--value-target-mix', '1.1'),
                                          ('--value-target-mix', 'nan'), ('--policy-coef', '-1'),
                                          ('--policy-coef', 'nan'), ('--policy-coef', 'inf')])
 def test_invalid_loss_options(option, value, monkeypatch, capsys):

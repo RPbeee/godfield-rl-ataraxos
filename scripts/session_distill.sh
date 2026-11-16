@@ -53,11 +53,13 @@ if [[ ! -f "$OUT_DIR/train/complete.json" ]]; then
     --minibatch "${MINIBATCH:-1024}" --microbatch "${MICROBATCH:-8}" \
     --dtype "${DTYPE:-fp32}" --validation-fraction "${VAL_FRACTION:-0.03}" \
     --lr "${LR:-0.00001}" --kl-coef "${KL_COEF:-0.1}" --value-coef "${VALUE_COEF:-0.5}" \
+    --target-power "${TARGET_POWER:-1}" --value-target-mix "${VALUE_TARGET_MIX:-0}" \
     --warmup-steps "${WARMUP_STEPS:-10}" --log-every "${LOG_EVERY:-10}" \
     "$([[ ${TF32:-1} == 1 ]] && echo --tf32 || echo --no-tf32)" \
     2>&1 | tee -a "$OUT_DIR/train.log"
 fi
 DISTILLED="$OUT_DIR/train/best.pt"
+# All three comparisons load CHECKPOINT['ema'], the same weights training starts from.
 if [[ ! -f "$OUT_DIR/policy.json" ]]; then
   "$PYTHON" scripts/eval_policies.py --a "$DISTILLED" --b "$CHECKPOINT" "${runtime[@]}" \
     --pairs "$PAIRS" --eval-seed "${EVAL_SEED:-74100}" --out "$OUT_DIR/policy.json" \

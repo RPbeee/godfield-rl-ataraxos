@@ -36,7 +36,9 @@ an error: generate more games instead of validating on training games.
 Useful overrides: `DATA_HOURS`, `TRAIN_HOURS`, `DATA_GAMES`, `GAMES_PER_SHARD`
 (default 512), `WORLDS`, `DEPTH`, `CANDIDATES`, `CANDIDATE_SAMPLES`,
 `MAX_INFERENCE_BATCH`, `SEARCH_CACHE_DEVICE`, `SEARCH_CACHE_MB`, `DTYPE=bf16`,
-`TF32=0`, `MICROBATCH`, `MINIBATCH`, `EPOCHS`, `LR`, `KL_COEF`, `VALUE_COEF`.
+`TF32=0`, `MICROBATCH`, `MINIBATCH`, `EPOCHS`, `LR`, `KL_COEF`, `VALUE_COEF`,
+`TARGET_POWER` (default 1), `VALUE_TARGET_MIX` (default 0). The last two pass
+through to `--target-power` and `--value-target-mix` below.
 `FIT`, `BELIEF_HYBRID`, `BELIEF_COUNT_TEMPERATURE`, `BELIEF_TEMPERATURE`,
 `BELIEF_MIX` configure generation; evaluations use the untransformed AR `BELIEF`.
 Use an AR checkpoint for the session's evaluation steps. `SKIP_REFERENCE=1`
@@ -89,11 +91,25 @@ Standalone:
   --run-dir measurements/distill-1/train --device cuda --dtype bf16
 ```
 
-Training starts from checkpoint EMA. The frozen reference is that initial
-model. Each microbatch encodes each root once, then indexes its encoding for
+Training accepts training checkpoints such as `runs/hp-lr1e5/ckpt-4500.pt`
+and starts from their `ema` weights, using `model_config`; it does not use the
+raw `model` weights. This is the same `load_policy_model` loader used by
+`eval_search.py` and `eval_policies.py`. The frozen reference is that initial
+EMA model. The session compares distilled `best.pt['ema']` against
+`CHECKPOINT['ema']` in both plain-policy and distilled-search evaluations;
+the reference-search evaluation also uses `CHECKPOINT['ema']` for both players.
+Each microbatch encodes each root once, then indexes its encoding for
 candidate stages. The loss is `policy_coef * policy + kl_coef * anchor_kl + value_coef * value_ce`,
 averaged over roots. `policy` is target-weighted path NLL, and `anchor_kl` is
 the target-weighted sum of masked stage KL(theta || reference).
+`--target-power K` (positive float, default 1) replaces each root's stored
+search distribution with `p_i**K / sum_j(p_j**K)` over its retained candidates.
+Values above 1 sharpen toward the search argmax without changing the stored
+search's alpha/beta balance. `--target-power inf` puts all mass on the maximum
+probability candidate, split evenly for exact ties. Zero probabilities stay
+zero. Computation uses max-shifted log space on the stored CPU float64 values
+before float32/device transfer. K=1 bypasses the transform entirely, preserving
+the original loss and gradients exactly. Shard format and generation are unchanged.
 `--policy-coef` defaults to 1; setting it to 0 removes the policy imitation loss
 while retaining the KL anchor on recorded prefixes and training the shared
 encoder and value head.
@@ -101,10 +117,10 @@ encoder and value head.
 warmup updates, gradient clipping 1, minibatch 1024 roots and two epochs.
 `--value-target-mix w` (default 0, range [0,1]) trains against the soft target
 `(1-w)*outcome + w*[(1+v)/2, (1-v)/2, 0]`, ordered win/loss/draw. Here `v` is
-`sum(probabilities*q)` from the root actor's view, clipped to [-1,1]. If any
+`sum(sharpened_probabilities*q)` from the root actor's view, clipped to [-1,1]. If any
 candidate q is nonfinite (including singleton-skipped roots), that root uses
-its outcome unchanged. At w=0 the loss and gradients match the original
-outcome-only objective exactly.
+its outcome unchanged. At w=0 the value loss and gradients match the original
+outcome-only value objective exactly.
 Microbatches (default eight roots) bound activation memory without changing the
 minibatch loss weighting. CPU, CUDA and MPS use the same code path.
 
@@ -112,6 +128,11 @@ minibatch loss weighting. CPU, CUDA and MPS use the same code path.
 metrics. `policy` is path cross entropy; `candidate_kl` is
 KL(renormalized policy paths || search), and `search_to_policy_kl` is its reverse.
 Search probabilities are floored at 1e-30 for finite KL diagnostics only.
+The sharpened target is used consistently for `policy`, `anchor_kl`, both
+candidate KL diagnostics, `top1` (first index on ties), `q_search`, and the
+search expectation in `search_value_mse` and the mixed value target (`value_ce`).
+`q_theta` and `q_ref` remain expectations under the current/reference policy
+paths. `outcome_ce`, `outcome_brier`, and `value_accuracy` use real outcomes.
 `value_ce` is CE against the **training target**, so its meaning changes with
 `--value-target-mix`. Always-computed `outcome_ce` is CE against the real game
 outcome; `outcome_brier` is scalar MSE of P(win)-P(loss) against win=1/loss=-1/draw=0
@@ -134,6 +155,8 @@ The session evaluates `best.pt`. `--max-hours` stops at a minibatch boundary,
 then performs final validation/checkpoint writes; this overhead is outside the
 training deadline. `--resume` restores last weights/optimizer/RNG and repeats
 an interrupted epoch; it is not an exact mid-epoch cursor resume.
+Repeat the same `--target-power` when resuming; changing it is rejected.
+Older checkpoints without this setting resume as K=1.
 
 The session skips completed stages on rerun. An interrupted generation resumes
 at its last completed shard; interrupted training uses `--resume`. A time-bound

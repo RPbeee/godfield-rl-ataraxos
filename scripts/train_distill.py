@@ -38,7 +38,7 @@ def average_metrics(parts):
 
 
 def validation_parts(model, reference, shards, microbatch, device, kl_coef, value_coef,
-                     value_target_mix=0., policy_coef=1., autocast=nullcontext):
+                     value_target_mix=0., policy_coef=1., autocast=nullcontext, target_power=1.):
     """Evaluate CPU validation subsets without reopening their source shards."""
     parts = []
     with torch.no_grad():
@@ -46,7 +46,7 @@ def validation_parts(model, reference, shards, microbatch, device, kl_coef, valu
             for lo in range(0, len(data['outcome']), microbatch):
                 rows = np.arange(lo, min(lo+microbatch, len(data['outcome'])))
                 with autocast():
-                    _, metrics = objective(model, reference, prepare_batch(data, rows, device),
+                    _, metrics = objective(model, reference, prepare_batch(data, rows, device, target_power),
                                            kl_coef, value_coef, value_target_mix, policy_coef)
                 parts.append((len(rows), metrics))
     return parts
@@ -61,6 +61,8 @@ def main():
     p.add_argument('--device', choices=('cpu', 'cuda', 'mps'), default='cpu')
     p.add_argument('--dtype', choices=('fp32', 'bf16'), default='fp32')
     p.add_argument('--tf32', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--target-power', type=float, default=1.,
+                   help='positive search-target exponent; inf splits mass across argmax ties (default: 1)')
     for name, default in (('epochs', 2), ('minibatch', 1024), ('microbatch', 8), ('threads', 1),
                           ('warmup-steps', 10), ('seed', 17), ('log-every', 10)):
         p.add_argument('--'+name, type=int, default=default)
@@ -68,6 +70,8 @@ def main():
                           ('ema-decay', 0.), ('max-hours', .75), ('validation-fraction', .03)):
         p.add_argument('--'+name, type=float, default=default)
     args = p.parse_args()
+    if not args.target_power > 0:
+        p.error('target-power must be positive (or inf)')
     if min(args.epochs, args.minibatch, args.microbatch, args.threads, args.log_every) <= 0:
         p.error('epochs, batch sizes, threads and log-every must be positive')
     if not 0 <= args.value_target_mix <= 1:
@@ -113,9 +117,9 @@ def main():
     resume_path = args.run_dir/'last.pt'
     if args.resume and resume_path.exists():
         state = torch.load(resume_path, map_location=args.device, weights_only=False)
-        for key in ('checkpoint', 'data_dir', 'lr', 'kl_coef', 'value_coef', 'policy_coef', 'value_target_mix', 'ema_decay', 'seed', 'validation_fraction'):
+        for key in ('checkpoint', 'data_dir', 'lr', 'kl_coef', 'value_coef', 'policy_coef', 'value_target_mix', 'target_power', 'ema_decay', 'seed', 'validation_fraction'):
             value = str(getattr(args, key)) if isinstance(getattr(args, key), Path) else getattr(args, key)
-            if state['config'].get(key, {'policy_coef': 1., 'value_target_mix': 0.}.get(key)) != value:
+            if state['config'].get(key, {'policy_coef': 1., 'value_target_mix': 0., 'target_power': 1.}.get(key)) != value:
                 p.error(f'resume setting mismatch: {key}')
         if state['source_md5'] != source_md5 or state['split_counts'] != split_counts:
             p.error('resume checkpoint or dataset changed')
@@ -148,7 +152,8 @@ def main():
         evaluated = ema if args.ema_decay else model
         return average_metrics(validation_parts(
             evaluated, reference, validation_shards, args.microbatch, args.device,
-            args.kl_coef, args.value_coef, args.value_target_mix, args.policy_coef, autocast))
+            args.kl_coef, args.value_coef, args.value_target_mix, args.policy_coef, autocast,
+            target_power=args.target_power))
     def log(epoch, train, final=False):
         nonlocal best
         val = validate()
@@ -178,7 +183,7 @@ def main():
                 for off in range(0, len(rr), args.microbatch):
                     micro = rr[off:off+args.microbatch]
                     with autocast():
-                        loss, m = objective(model, reference, prepare_batch(d, micro, args.device), args.kl_coef, args.value_coef, args.value_target_mix, args.policy_coef)
+                        loss, m = objective(model, reference, prepare_batch(d, micro, args.device, args.target_power), args.kl_coef, args.value_coef, args.value_target_mix, args.policy_coef)
                     (loss*len(micro)/len(rr)).backward()
                     parts.append((len(micro), m))
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)

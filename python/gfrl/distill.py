@@ -5,6 +5,7 @@ repeated prefixes; integer columns use their smallest exact signed/byte dtype.
 No env objects or privileged fields are serialized.
 """
 import gzip
+import math
 from pathlib import Path
 import numpy as np
 import torch
@@ -112,7 +113,24 @@ def value_targets(outcome, search_value, valid, mix=0.):
     return torch.where(valid[:, None], (1-mix)*outcome+mix*target, outcome)
 
 
-def prepare_batch(data, rows, device='cpu'):
+def sharpen_probabilities(probabilities, owners, n, power=1.):
+    """Normalize p**power per root; preserve zeros and split argmax ties at inf."""
+    if not power > 0:
+        raise ValueError('target-power must be positive (or inf)')
+    if power == 1:
+        return probabilities  # Preserve the original values bit-for-bit.
+    maximum = probabilities.new_full((n,), -torch.inf).scatter_reduce_(
+        0, owners, probabilities, reduce='amax')
+    if math.isinf(power):
+        weights = (probabilities == maximum[owners]).to(probabilities.dtype)
+    else:
+        # Subtract before scaling: even enormous finite powers keep maxima at 0.
+        weights = ((probabilities.log()-maximum[owners].log())*power).exp()
+    total = weights.new_zeros(n).index_add(0, owners, weights)
+    return weights/total[owners]
+
+
+def prepare_batch(data, rows, device='cpu', target_power=1.):
     rows = torch.as_tensor(rows, dtype=torch.long)
     co, so = data['candidate_offsets'], data['stage_offsets']
     cs = [torch.arange(int(co[r]), int(co[r+1])) for r in rows]
@@ -127,7 +145,11 @@ def prepare_batch(data, rows, device='cpu'):
                  candidate_owners=root_of_c.to(device), stage_owners=candidate_of_s.to(device),
                  choice=data['choice'][stages].long().to(device),
                  outcome=data['outcome'][rows].float().to(device))
-    batch.update({k: data[k][candidates].float().to(device) for k in ('probabilities', 'q', 'log_pi')})
+    # Sharpen stored float64 values on CPU before float32/device conversion,
+    # preserving tiny positive probabilities and the stored argmax/ties.
+    probabilities = sharpen_probabilities(data['probabilities'][candidates], root_of_c, len(rows), target_power)
+    batch['probabilities'] = probabilities.float().to(device)
+    batch.update({k: data[k][candidates].float().to(device) for k in ('q', 'log_pi')})
     return batch
 
 
