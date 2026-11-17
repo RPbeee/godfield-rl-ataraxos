@@ -56,6 +56,7 @@ def advise(result, agent, *, search=False):
                 reason = {'hidden_launch_status': 'response_hidden_launch_status',
                           'unsupported_public_launch': 'response_special_launch',
                           'public_launch_decision_mismatch': 'response_public_decision_mismatch',
+                          'public_current_launch_mismatch': 'response_current_launch_mismatch',
                           'restricted_root_slot_mismatch': 'restricted_root_slot_mismatch',
                           'restricted_root_world_mismatch': 'restricted_root_world_mismatch',
                           'search_forced_root': 'search_forced_root'}.get(str(error))

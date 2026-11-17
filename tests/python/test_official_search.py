@@ -1,4 +1,4 @@
-"""Public-wire belief/search isolation, response replay and shared CLI contracts."""
+"""Public-wire belief/search isolation, response roots and shared CLI contracts."""
 import argparse
 from copy import deepcopy
 from dataclasses import asdict
@@ -20,6 +20,26 @@ from gfrl.official_search import add_search_arguments, root_matches, search_conf
 from gfrl.search import SearchAgent, SearchConfig, load_search_belief
 
 DATA = Path(__file__).resolve().parents[2]/'third_party/goodfield/data/official-v2'
+BATCHED = Path(__file__).with_name('fixtures')/'official_response_batched.json'
+
+
+def batched_games(models=(55,), *, atk=None):
+    # Entirely synthetic receipt: our main command, its resolution/refill, GF,
+    # then the enemy launch arrive together. No enemy main boundary is received.
+    sequence = json.loads(BATCHED.read_text())
+    pending = sequence[-1]
+    pending['attacks'][0]['itemModelIds'] = list(models)
+    if atk is not None:
+        pending['attacks'][0]['atk'] = atk
+    pending['events'][-2]['items'] = [dict(id=900+i, modelId=m) for i, m in enumerate(models)]
+    for m in models:
+        if _core.play_catalog()[m]['category'] == 'miracles' and m != 218:
+            pending['players'][1]['items'].append(dict(id=900+m, modelId=m, used=True))
+    cost = _core._official_magic_cost(list(models))
+    pending['players'][1]['mp'] -= cost
+    if models[0] == 58:
+        pending['players'][1]['mp'] = 0
+    return sequence
 
 
 def games(response=False, model=19):
@@ -59,13 +79,14 @@ def models(tmp_path):
     return model, path
 
 
-@pytest.mark.parametrize('response', [False, True, 'recorded'])
+@pytest.mark.parametrize('response', [False, True, 'recorded', 'batched'])
 @pytest.mark.parametrize('belief_kind', ['uniform', 'ar'])
 def test_wire_truth_cannot_reach_belief_or_search(models, response, belief_kind):
     model, ar_path = models
     sequence = (json.loads((DATA/'wire-game-updates-v73.json').read_text())['updates'][:2]
                 if response == 'recorded' else None)
-    sequence = [u['game'] for u in sequence] if sequence else games(response)
+    sequence = ([u['game'] for u in sequence] if sequence else
+                batched_games() if response == 'batched' else games(response))
     altered = deepcopy(sequence)
     for game in altered:
         other = game['players'][1]
@@ -125,15 +146,14 @@ def test_response_public_replay_and_every_prefix(model):
             root.step(choice)
 
 
-@pytest.mark.parametrize('gap', ['missing', 'skipped_update', 'redirect', 'changed_hand', 'special'])
+@pytest.mark.parametrize('gap', ['redirect', 'special', 'missing_launch', 'later_hit'])
 def test_unprovable_response_falls_back(models, gap):
     sequence = games(True)
-    if gap == 'missing': sequence = sequence[1:]
-    elif gap == 'skipped_update': sequence[1]['updateCount'] = 4
-    elif gap == 'redirect': sequence[1]['events'].append(dict(action='reflect'))
-    elif gap == 'changed_hand': sequence[1]['players'][0]['items'].pop()
+    if gap == 'redirect': sequence[1]['events'].append(dict(action='reflect'))
     elif gap == 'special': sequence[1]['events'].append(dict(action='nextAttack',
         attack=dict(playerId=2, itemModelIds=[181])))
+    elif gap == 'missing_launch': sequence = [dict(sequence[1], events=[])]
+    elif gap == 'later_hit': sequence[1]['events'].append(dict(action='useDefenseItems', items=[]))
     result = result_for(sequence)
     agent = SearchAgent(models[0], load_search_belief('uniform'), config=SearchConfig(search_response=True))
     advice = advise(result, agent, search=True)
@@ -142,14 +162,95 @@ def test_unprovable_response_falls_back(models, gap):
     assert advice['search_seconds'] == 0
 
 
-def test_mismatch_never_enters_search(models, monkeypatch):
-    result = result_for(games())
-    real_root = _core._official_search_root(result['public'], [], 64)
+@pytest.mark.parametrize('gap', ['missing', 'skipped_update', 'changed_hand'])
+def test_current_launch_does_not_require_previous_boundary(models, gap):
+    sequence = games(True)
+    if gap == 'missing': sequence = sequence[1:]
+    elif gap == 'skipped_update': sequence[1]['updateCount'] = 4
+    elif gap == 'changed_hand': sequence[1]['players'][0]['items'].pop()
+    result = result_for(sequence)
+    assert '_search_launch' not in result['public']
+    agent = SearchAgent(models[0], load_search_belief('uniform'), config=SearchConfig(
+        worlds=2, depth=1, candidates=3, candidate_samples=8, search_response=True))
+    advice = advise(result, agent, search=True)
+    assert advice['search_status'] == 'response_public_worlds'
+    assert advice['search_worlds'] == 2 and advice['search_candidates'] > 0
+
+
+@pytest.mark.parametrize('cards,atk', [((55,), None), ((107,), None), ((218,), None),
+    ((55, 232), None), ((202,), -10), ((205,), None), ((206,), None), ((58,), 40)])
+def test_batched_partial_history_response_search(models, cards, atk):
+    sequence = batched_games(cards, atk=atk)
+    session = OfficialSession(1)
+    previous = session.ingest(sequence[0])
+    assert previous['status'] == 'decision' and previous['public']['phase'] == 0
+    assert previous['public']['actor'] == previous['public']['viewer']
+    assert not previous['history_complete']
+    result = session.ingest(sequence[1])
+    assert result['status'] == 'decision' and not result['history_complete']
+    assert '_search_launch' not in result['public']
+    # A changed hand, GF, HP and partial ledger must all come from the current
+    # public pane, while the old (partially observed) history remains unchanged.
+    assert result['public']['hand'] != previous['public']['hand']
+    env = result['env']
+    root = _core._official_search_root(result['public'], env.events, env.history_len)
+    assert root_matches(root, env)
+    agent = SearchAgent(models[0], load_search_belief('uniform'), config=SearchConfig(
+        worlds=2, depth=1, candidates=3, candidate_samples=8, search_response=True), seed=17)
+    advice = advise(result, agent, search=True)
+    assert advice['search_status'] == 'response_public_worlds'
+    assert advice['search_worlds'] == 2 and advice['search_candidates'] > 0
+    assert not advice['history_complete']
+    assert 'partial_history_and_decision_count' in advice['warnings']
+
+
+@pytest.mark.parametrize('last', [False, True])
+def test_current_response_observation_and_prefixes(last):
+    result = result_for(batched_games())
+    env = result['env']
+    root = _core._official_search_root(result['public'], env.events, env.history_len)
+    while not env.complete:
+        assert root_matches(root, env)
+        choice = np.array([np.flatnonzero(env.mask[0])[-1 if last else 0]], np.int32)
+        env.step(choice)
+        if not env.complete:
+            root.step(choice)
+
+
+def test_current_response_default_still_uses_policy(models):
+    agent = SearchAgent(models[0], load_search_belief('uniform'))
+    advice = advise(result_for(batched_games()), agent, search=True)
+    assert advice['search_status'] == 'response_search_disabled_policy_fallback'
+    assert not agent.counts['searched']
+
+
+@pytest.mark.parametrize('invalid', ['power', 'mp', 'used', 'multiple_frames'])
+def test_current_response_mismatch_never_searches(models, invalid):
+    sequence = batched_games((218,))
+    if invalid == 'power': sequence[-1]['attacks'][0]['atk'] = 99
+    elif invalid == 'mp': sequence[-1]['players'][1]['mp'] = 99
+    elif invalid == 'used': sequence[-1]['players'][1]['items'] = []
+    elif invalid == 'multiple_frames': sequence[-1]['attacks'] *= 2
+    agent = SearchAgent(models[0], load_search_belief('uniform'), config=SearchConfig(search_response=True))
+    advice = advise(result_for(sequence), agent, search=True)
+    assert advice['search_status'] in (
+        'response_current_launch_mismatch_policy_fallback', 'public_root_mismatch_policy_fallback',
+        'response_public_journal_unavailable_policy_fallback')
+    assert not agent.counts['searched']
+    assert advice['search_seconds'] == 0
+
+
+@pytest.mark.parametrize('response', [False, True])
+def test_mismatch_never_enters_search(models, monkeypatch, response):
+    result = result_for(batched_games() if response else games())
+    real_root = _core._official_search_root(result['public'], result['env'].events, 64)
     # A pruned public cursor must not be searched with the original root mask.
-    changed = OfficialDecision(result['public'], excluded_kinds=['discard'])
+    changed = OfficialDecision(result['public'], result['env'].events,
+        excluded_ids=[result['public']['hand'][0]['id']] if response else [],
+        excluded_kinds=[] if response else ['discard'])
     result['env'] = changed
     monkeypatch.setattr(_core, '_official_search_root', lambda *args: real_root)
-    agent = SearchAgent(models[0], load_search_belief('uniform'))
+    agent = SearchAgent(models[0], load_search_belief('uniform'), config=SearchConfig(search_response=True))
     advice = advise(result, agent, search=True)
     assert advice['search_status'] == 'public_root_mismatch_policy_fallback'
     assert not agent.counts['searched']
@@ -201,14 +302,15 @@ def test_reflection_only_public_journal(models):
 
 
 @pytest.mark.parametrize('kind', ['uniform', 'ar'])
-def test_recorded_response_without_launch_uses_policy(models, kind):
+def test_recorded_response_without_previous_launch_boundary_searches(models, kind):
     data = json.loads((DATA/'wire-game-updates-v64.json').read_text())
     result = OfficialSession(1).ingest(data['updates'][0]['game'])
     agent = SearchAgent(models[0], load_search_belief(str(models[1]) if kind == 'ar' else 'uniform'),
                         config=SearchConfig(search_response=True))
     advice = advise(result, agent, search=True)
-    assert advice['search_status'] == 'response_public_journal_unavailable_policy_fallback'
-    assert advice['action'] and advice['search_seconds'] == 0
+    assert not result['history_complete'] and '_search_launch' not in result['public']
+    assert advice['search_status'] == 'response_public_worlds'
+    assert advice['action'] and advice['search_worlds'] > 0
 
 
 def test_prefix_mismatch_reencodes_policy_without_executing_root(models, monkeypatch):

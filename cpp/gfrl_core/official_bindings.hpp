@@ -154,10 +154,61 @@ struct OfficialAccess {
         if(v.phase==gf::MatchPhase::main) {
             e.match.load_scene(std::move(state),v.owner,0);
         } else {
-            if(v.phase!=gf::MatchPhase::response || !public_view.contains("_search_launch"))
+            if(v.phase!=gf::MatchPhase::response)
                 throw std::invalid_argument("search_requires_public_launch_journal");
-            const auto proof=nb::cast<nb::dict>(public_view["_search_launch"]);
-            const auto before=official_view(nb::cast<nb::dict>(proof["before"]));
+            const bool current=!public_view.contains("_search_launch");
+            nb::dict proof;
+            auto before=v;
+            if(current) {
+                // This is a synthetic executable anchor, NOT a reconstruction
+                // of the missing game history. Ordinary launch only pays MP
+                // and consumes the public selected copies before this response.
+                // Everything else comes from the CURRENT public board.
+                if(!v.pending || !v.decisions || v.owner==*v.board.viewer
+                        || v.pending->origin!=v.owner || v.pending->source!=v.owner
+                        || v.pending->reflections || v.pending->bounces
+                        || v.pending->counter || v.pending->death || v.pending->guardian!=gf::Guardian::none)
+                    throw std::invalid_argument("search_requires_public_launch_journal");
+                for(auto obj:field<nb::list>(public_view,"detail",nb::list()))
+                    if(field<std::string>(nb::cast<nb::dict>(obj),"code","")=="multiple_pending_frames")
+                        throw std::invalid_argument("search_requires_public_launch_journal");
+                // A fresh launch tail proves this is the first response, not a
+                // later hit of attackTwice or a body/counter/guardian frame.
+                // Earlier events and history completeness are irrelevant here.
+                bool fresh=false;
+                for(auto obj:nb::cast<nb::list>(public_view["events"])) {
+                    const auto event=nb::cast<nb::dict>(obj);
+                    const auto action=nb::cast<std::string>(event["action"]);
+                    if(action=="useAttackItems") {
+                        fresh=nb::cast<std::vector<gf::CardId>>(event["faces"])==v.pending->models
+                            && nb::cast<nb::list>(event["reveals"]).empty();
+                    } else if(action!="setTargetPlayer" && action!="hit" && action!="miss")fresh=false;
+                }
+                if(!fresh)throw std::invalid_argument("search_requires_public_launch_journal");
+                before.phase=gf::MatchPhase::main;before.actor=v.owner;before.pending.reset();
+                --before.decisions;
+                auto source=std::find_if(before.board.players.begin(),before.board.players.end(),
+                    [&](const auto& p){return p.id==v.owner;});
+                if(source==before.board.players.end() || !source->status || source->fogged || source->status->confused)
+                    throw std::invalid_argument("hidden_launch_status");
+                const auto cost=gf::magic_cost(v.pending->models);
+                if(v.pending->ability==gf::Ability::atk_by2x_mp) {
+                    // Public dynamic power conditions the synthetic launch MP.
+                    // No event-time resource pane or private inventory is read.
+                    int mp=cost;
+                    while(mp<=99 && gf::attack_power(v.pending->models,2*(mp-cost))!=v.pending->power)++mp;
+                    if(source->status->mp!=0 || mp>99)
+                        throw std::invalid_argument("public_current_launch_mismatch");
+                    source->status->mp=mp;
+                } else {
+                    source->status->mp+=cost;
+                    if(source->status->mp>99)throw std::invalid_argument("public_current_launch_mismatch");
+                }
+                proof["models"]=nb::cast(v.pending->models);proof["target"]=v.pending->target;
+            } else {
+                proof=nb::cast<nb::dict>(public_view["_search_launch"]);
+                before=official_view(nb::cast<nb::dict>(proof["before"]));
+            }
             const auto models=nb::cast<std::vector<gf::CardId>>(proof["models"]);
             if(before.phase!=gf::MatchPhase::main || before.owner!=v.owner || before.owner==*v.board.viewer
                     || before.actor!=before.owner || models.empty() || !v.pending
@@ -233,8 +284,9 @@ struct OfficialAccess {
                 found=replay.phase==gf::MatchPhase::response && replay.actor==v.actor && replay.pending
                     && replay.pending->models==v.pending->models && replay.pending->target==v.pending->target
                     && replay.pending->power==v.pending->power && replay.pending->amount==v.pending->amount;
+                if(current)found=found && replay.pending==v.pending;
             }
-            if(!found)throw std::invalid_argument("public_launch_replay_mismatch");
+            if(!found)throw std::invalid_argument(current?"public_current_launch_mismatch":"public_launch_replay_mismatch");
         }
         auto snap=e.match.snapshot();snap.decisions=v.decisions;
         // The response journal's counter must agree with its launch anchor.

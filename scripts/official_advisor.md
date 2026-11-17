@@ -70,17 +70,27 @@ useDefenseItems を公開決定にまとめる。通常補充は学習時の既�
 主手番は公開情報だけの Match を作り、既存の SearchAgent と belief を使う。
 相手の未使用品が空の構築元から belief の世界を作るので、受信した真在庫は使わない。
 霧・偽装など既存 determinize が拒否する root は方策へフォールバックする。
-`--search-response` を指定すると、次の公開の証拠が残る通常応答も探索する。
+`--search-response` を指定すると、次の通常応答も探索する。既定無効と主手番の経路は変更しない。
 
-- 連続する受信で攻撃前の main 境界と、公開の launch カード・対象がある。
-- 同じ受信内で自分の行動解決→GF進行→相手の launch が続く場合は、完全に解釈できた
-  公開イベントの ledger の最後の攻撃前状態を使う。終点の MP から逆算しない。
-- 証拠を保持したまま、公開の防御カード＋反射だけが続く場合は response journal を再生する。
+- 従来の公開 launch journal があれば、攻撃前 main 境界から再生する。
+  完全に解釈できた同一受信内 ledger と、公開の防御カード＋反射だけが続く journal も従来通り使う。
+- journal がなければ、**現在の公開盤面・手札・used 品・pending** から通常 launch の根を構築する。
+  自分の main 行動解決→補充→GF進行→相手 launch が1受信にまとまり、
+  `history_complete=false` になっていてもよい。途中参加・欠番・前段の不完全な履歴も、それ自体では拒否しない。
+- 現在受信の最後の `useAttackItems` が pending の公開カードと一致し、偽装 reveal を伴わず、
+  その後は `setTargetPlayer` / `hit` / `miss` だけであることを要求する。
+  これにより連続攻撃の後半・防御済みの frame・特殊 launch を初回応答と誤認しない。
+  複数 pending frame がある更新も新経路では扱わない。
 
 C++ は公開 used 品と既に出されたカードだけを相手の anchor に置き、通常の
-`Match::step` で launch/journal を再生する。確率攻撃では pending の存在が命中を、
+`Match::step` で launch/journal を再生する。新経路の anchor は過去を復元したものではなく、
+現在の公開状態と同じ根を得るための合成状態である。通常 launch の MP 支払い分だけを
+現在の公開 MP に加え、選択済み公開カードだけを消費前に置く。58 は公開 power に合う MP を
+0〜99 の範囲で選び、支払い後 MP=0 も確認する。過去の HP/MP/手札や未解釈の効果を埋めない。
+新経路では pending の全フィールドも照合する。確率攻撃では pending の存在が命中を、
 202 では公開 amount が符号を示すので、その条件に合う新しい合成乱数列を使う。
 サーバーの乱数や未使用の真在庫は受け取らない。goodfield 本体は変更していない。
+観測用の部分履歴・決定数・`partial_history_and_decision_count` 警告もそのまま保持する。
 
 根の全 `OBS_FIELDS`・mask・prefix・substep が `OfficialDecision` と完全一致する場合だけ
 探索し、各 substep の選択前にも再照合する。根の構築で強制コマンドは実行しない。
@@ -101,11 +111,23 @@ AR `runs/play/belief-ar-m.pt`、worlds=16、depth=3、candidates=8、candidate-s
 探索部分の累積最大は0.411秒（macOS arm64、PyTorch 2.15.0）。一般局面の上限を保証する値ではない。
 再現: `.venv/bin/python scripts/bench_official_search.py --position ui-research --worlds 16 --depth 3 --candidates 8 --repeats 5 --out /tmp/ui-search.json`。
 
-途中参加・欠番・不完全な前段イベントには anchor の証拠がなく、
-`response_public_journal_unavailable_policy_fallback`。
+一括更新・不完全履歴の合成 fixture（`response-batched`）での応答1決定の計測：
+CPU 1 thread、M `runs/play/m-xit1.pt`、AR `runs/play/belief-ar-m.pt`、worlds=16、depth=3、
+candidates=16、candidate-samples=64、ウォームアップ1回＋計測5回。
+全て `response_public_worlds` / 16 worlds、実際に得られた候補は2個。
+中央値 **0.405秒**、最大 **0.472秒**（探索部分の中央値0.397秒、最大0.464秒）。
+macOS 27.0.1 arm64 / PyTorch 2.15.0。この fixture の値であり、16個の異なる候補や一般局面の上限を保証しない。
+MPS はこの実行環境で built=true / available=false のため未計測。ベンチは理由を JSON に保存して終了する。
+再現: `.venv/bin/python scripts/bench_official_search.py --checkpoint runs/play/m-xit1.pt --position response-batched --worlds 16 --depth 3 --candidates 16 --repeats 5 --out /tmp/response-search-cpu.json`。
+MPS は同じコマンドに `--device mps` を指定する。
+
+公開 launch journal も現在の初回 launch の証拠もなければ、従来通り
+`response_public_journal_unavailable_policy_fallback`。後続 hit や複数 frame もこの理由になる。
+新経路で MP/pending を再現できない場合は `response_current_launch_mismatch_policy_fallback`、
+全観測が一致しない場合は `public_root_mismatch_policy_fallback`。
 追跡できない反射/跳ね返しは `response_redirect_journal_unavailable_policy_fallback`、
 counter/death/guardian は `response_special_launch_policy_fallback`。
-購入、Danger、霧/混乱、再生不一致、観測/prefix 不一致も方策へ戻す。
+売買/購入、Danger、霧/混乱、偽装 launch の証拠不足、再生不一致、観測/prefix 不一致も方策へ戻す。
 202 の符号が仮定値で警告される場合も、その警告を保持し、一致しない根は使わない。
 強制手には `forced_no_inference`、応答探索の未指定には
 `response_search_disabled_policy_fallback` を返す。
@@ -113,8 +135,15 @@ counter/death/guardian は `response_special_launch_policy_fallback`。
 実 fixture は v73/update2、v68/update2・4、v78/update2 で根が一致した。
 v59/update2・v89/update2 は選択が全て強制なので探索不要。
 v73/update3 の counter/反射は通常 launch の証拠とは別の特殊 frame なので探索しない。
-v64 の初回応答は攻撃前の受信がなく、方策を使う。
-通常武器・確率攻撃・202・反射2回の合成局面も検査する。
+v64 の初回応答も攻撃前の受信なしで新経路から探索できる。
+不完全履歴の一括更新 fixture は通常武器・確率攻撃・奇跡・全体化の追加・202・205/206・58 を検査する。
+現在の手札/公開 MP/used/pending の不一致、後続 hit、非公開在庫を変更しても belief 入力・世界・助言が
+不変であること、全観測と prefix の一致、既定の応答探索無効、従来の反射2回も検査する。
+既存ローカル wire fixture のうち `OfficialSession` が decision として受理した非強制応答14件では、
+12件（85.7%）で全観測/prefix 一致と determinize support=ok を確認した。
+うち新経路は8件で、すべて `history_complete=false`。残り2件は公開 launch の証拠不足で根を作らない。
+これは探索候補評価を実行する前の根の検査であり、実戦全体の応答を母数にした値ではない。
+実戦の探索率8割以上はオフライン fixture の成功数からは確定できないため、接続側の再計測で確認する。
 
 `status=unsupported` は接続側が人へ知らせて停止すべき結果。
 未知 schema/event、2 人以外/チーム、18 枠超過、不明な pending の行為者、

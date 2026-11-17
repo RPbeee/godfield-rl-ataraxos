@@ -1,0 +1,198 @@
+[
+  {
+    "updateCount": 1,
+    "gf": 1,
+    "attackTurnPlayerId": 1,
+    "attacks": [],
+    "players": [
+      {
+        "id": 1,
+        "hp": 70,
+        "mp": 60,
+        "cp": 30,
+        "items": [
+          {
+            "id": 1,
+            "modelId": 19
+          },
+          {
+            "id": 2,
+            "modelId": 130
+          },
+          {
+            "id": 3,
+            "modelId": 149
+          },
+          {
+            "id": 4,
+            "modelId": 176
+          },
+          {
+            "id": 5,
+            "modelId": 189
+          },
+          {
+            "id": 6,
+            "modelId": 190
+          },
+          {
+            "id": 7,
+            "modelId": 191
+          },
+          {
+            "id": 8,
+            "modelId": 6
+          }
+        ],
+        "curses": [],
+        "guardian": null
+      },
+      {
+        "id": 2,
+        "hp": 70,
+        "mp": 60,
+        "cp": 30,
+        "items": [
+          {
+            "id": 800,
+            "modelId": 218,
+            "used": true
+          }
+        ],
+        "curses": [],
+        "guardian": "mars"
+      }
+    ],
+    "events": [
+      {
+        "action": "startGame"
+      },
+      {
+        "action": "advanceGF",
+        "playerId": 1
+      },
+      {
+        "action": "setGuardian",
+        "playerId": 2,
+        "guardian": "mars"
+      }
+    ]
+  },
+  {
+    "updateCount": 2,
+    "gf": 2,
+    "attackTurnPlayerId": 2,
+    "attacks": [
+      {
+        "playerId": 2,
+        "targetPlayerId": 1,
+        "itemModelIds": [
+          55
+        ]
+      }
+    ],
+    "players": [
+      {
+        "id": 1,
+        "hp": 70,
+        "mp": 60,
+        "cp": 30,
+        "items": [
+          {
+            "id": 2,
+            "modelId": 130
+          },
+          {
+            "id": 3,
+            "modelId": 149
+          },
+          {
+            "id": 4,
+            "modelId": 176
+          },
+          {
+            "id": 5,
+            "modelId": 189
+          },
+          {
+            "id": 6,
+            "modelId": 190
+          },
+          {
+            "id": 7,
+            "modelId": 191
+          },
+          {
+            "id": 8,
+            "modelId": 6
+          },
+          {
+            "id": 9,
+            "modelId": 6
+          }
+        ],
+        "curses": [],
+        "guardian": null
+      },
+      {
+        "id": 2,
+        "hp": 65,
+        "mp": 60,
+        "cp": 30,
+        "items": [
+          {
+            "id": 800,
+            "modelId": 218,
+            "used": true
+          }
+        ],
+        "curses": [],
+        "guardian": "mars"
+      }
+    ],
+    "events": [
+      {
+        "action": "useAttackItems",
+        "items": [
+          {
+            "id": 1,
+            "modelId": 19
+          }
+        ]
+      },
+      {
+        "action": "setTargetPlayer",
+        "playerId": 2
+      },
+      {
+        "action": "dealDamage",
+        "damage": 5
+      },
+      {
+        "action": "gift",
+        "playerId": 1,
+        "item": {
+          "id": 9,
+          "modelId": 6
+        }
+      },
+      {
+        "action": "advanceGF",
+        "playerId": 2
+      },
+      {
+        "action": "useAttackItems",
+        "items": [
+          {
+            "id": 900,
+            "modelId": 55
+          }
+        ]
+      },
+      {
+        "action": "setTargetPlayer",
+        "playerId": 1
+      }
+    ]
+  }
+]

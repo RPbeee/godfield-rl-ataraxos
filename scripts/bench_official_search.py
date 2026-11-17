@@ -28,7 +28,7 @@ def main():
     p.add_argument('--candidates', type=int, default=16)
     p.add_argument('--candidate-samples', type=int, default=64)
     p.add_argument('--threads', type=int, default=1)
-    p.add_argument('--position', choices=('fixture', 'wide', 'response', 'ui-research'), default='fixture')
+    p.add_argument('--position', choices=('fixture', 'wide', 'response', 'response-batched', 'ui-research'), default='fixture')
     p.add_argument('--seed', type=int, default=421)
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--out', type=Path, required=True)
@@ -64,6 +64,9 @@ def main():
             events=[dict(action='useAttackItems', items=[dict(id=900, modelId=55)]),
                     dict(action='setTargetPlayer', playerId=1)])
         sequence.append(pending)
+    if args.position == 'response-batched':
+        sequence = json.loads((Path(__file__).resolve().parents[1] /
+            'tests/python/fixtures/official_response_batched.json').read_text())
     model = load_policy_model(args.checkpoint, args.device)
     belief = load_search_belief(args.belief, None, args.device)
     for worlds in args.worlds:
@@ -76,13 +79,17 @@ def main():
                 session = OfficialSession(1)
                 for received in sequence:
                     result = session.ingest(deepcopy(received))
+                if args.position == 'response-batched':
+                    if result['history_complete'] or '_search_launch' in result['public']:
+                        raise RuntimeError('benchmark must use the current public response root')
                 agent = SearchAgent(model, belief, args.device, config=config, seed=args.seed, num_threads=args.threads)
                 agent.actor.sample = False
                 synchronize(agent.device); started = perf_counter()
                 with _policy_rng(args.seed, (agent,)):
                     advice = (advise_supported if args.position == 'ui-research' else advise)(result, agent, search=True)
                 synchronize(agent.device); seconds = perf_counter()-started
-                expected = 'response_public_worlds' if args.position == 'response' else 'main_public_worlds'
+                expected = ('response_public_worlds' if args.position in ('response', 'response-batched')
+                            else 'main_public_worlds')
                 if args.position == 'ui-research':
                     expected = 'ui_mask_search'
                     if agent.counts['searched'] != 2:
