@@ -662,6 +662,14 @@ def summarize(rows, games, bootstrap, seed):
     return result
 
 
+def _json_default(o):
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f'Object of type {o.__class__.__name__} is not JSON serializable')
+
+
 def save_report(args, records, games, targets, start, ready, final=False):
     completed = [r for r in records if 'world_counts' in r]
     seconds = perf_counter()-start
@@ -684,7 +692,7 @@ def save_report(args, records, games, targets, start, ready, final=False):
                   summary=summarize(completed, games, args.bootstrap, args.seed+9) if final else None)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     temp = args.out.with_suffix(args.out.suffix+'.tmp')
-    temp.write_text(json.dumps(report, indent=2, allow_nan=False)+'\n')
+    temp.write_text(json.dumps(report, indent=2, allow_nan=False, default=_json_default)+'\n')
     temp.replace(args.out)
     return report
 
