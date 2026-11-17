@@ -439,6 +439,42 @@ void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
         drive(i);
     }});
 }
+void VecEnv::diagnostic_copy_exact(const VecEnv& src, std::span<const std::int32_t> rows,
+                                   std::span<const std::int32_t> destinations,
+                                   std::span<const std::uint64_t> seeds, bool reseed) {
+    if(!search_ || this==&src)throw std::invalid_argument("diagnostic copy needs separate SearchEnv destination");
+    std::scoped_lock lock(api_mutex_,src.api_mutex_);
+    if(rows.size()!=destinations.size() || rows.size()!=seeds.size() || history_len!=src.history_len || canonical_!=src.canonical_)
+        throw std::invalid_argument("diagnostic copy shapes/history/canonical mismatch");
+    std::vector<bool> seen(num_envs,false);
+    for(std::size_t j=0;j<rows.size();++j) {
+        if(rows[j]<0 || std::size_t(rows[j])>=src.num_envs || destinations[j]<0 || std::size_t(destinations[j])>=num_envs)
+            throw std::out_of_range("diagnostic copy row");
+        const auto& root=src.envs_[rows[j]];
+        if(seen[destinations[j]] || root.waiting || !root.selection || src.stage[rows[j]]<0)
+            throw std::invalid_argument("diagnostic copy requires unique destinations and live cursors");
+        seen[destinations[j]]=true;
+    }
+    workers_.run([&](std::size_t worker){for(std::size_t j=worker;j<rows.size();j+=num_threads) {
+        const auto i=destinations[j];const auto& root=src.envs_[rows[j]];auto& e=envs_[i];
+        e.match=root.match; // Includes response anchors, private models and pending effects.
+        // A response's historical replay proof includes its old RNG. Replaying
+        // that launch would change the conditioning state. This diagnostic
+        // intervention replaces ONLY the future stream, on a non-const object;
+        // it must not go through restore()'s historical proof validation.
+        // No journal, redirect anchor, model, queue or already-drawn event moves.
+        if(reseed)const_cast<gf::MatchSnapshot&>(e.match.snapshot()).rng=seeds[j];
+        e.history=root.history;e.selection=root.selection;
+        e.chance_rng=reseed?mix(seeds[j]^0xa4093822299f31d0ULL):root.chance_rng;
+        e.policy_rng=root.policy_rng;e.encoded=false;e.waiting=false;
+        e.play_seat.reset();e.play_events.clear();e.results.clear();e.stats={};
+        e.projected_before.reset();
+        decisions[i]=0;decision_done[i]=false;episode_done[i]=false;truncated[i]=false;
+        result[i]=0;outcome[2*i]=outcome[2*i+1]=0;episode_id[i]=src.episode_id[rows[j]];
+        searcher_seat[i]=root.selection->actor_seat;world_status[i]=int(WorldStatus::ok);
+        publish(i);
+    }});
+}
 // stop() clears selection and actor_seat; the engine still retains the actor
 // of the next policy boundary. Read it without publishing/mutating the row.
 std::vector<int> VecEnv::next_actor_seats(std::span<const std::int32_t> rows) const {

@@ -293,6 +293,11 @@ NB_MODULE(_core, m) {
         {nb::gil_scoped_release release;e.load_worlds(src,r,a,sd);}
         return view(e,e.world_status.data(),{e.num_envs});
     },"src_env"_a,"src_rows"_a.noconvert(),"assignments"_a.noconvert(),"seeds"_a.noconvert());
+    cls.def("diagnostic_copy_exact",[](VecEnv& e,const VecEnv& src,Rows rows,Rows destinations,Seeds seeds,bool reseed) {
+        nb::gil_scoped_release release;
+        e.diagnostic_copy_exact(src,{rows.data(),rows.shape(0)},{destinations.data(),destinations.shape(0)},
+                                {seeds.data(),seeds.shape(0)},reseed);
+    },"src_env"_a,"src_rows"_a.noconvert(),"dst_rows"_a.noconvert(),"seeds"_a.noconvert(),"reseed"_a=true);
     cls.def("next_actor_seats",[](const VecEnv& e,Rows rows) {
         return int_array(e.next_actor_seats({rows.data(),rows.shape(0)}));
     },"rows"_a.noconvert());
