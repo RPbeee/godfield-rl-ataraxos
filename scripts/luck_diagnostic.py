@@ -729,7 +729,7 @@ def main():
         report['summary'] = summarize(report['roots'], report['games'], args.bootstrap, args.seed+9)
         report['summary_config'] = dict(bootstrap=args.bootstrap, seed=args.seed+9, cluster='deal_pair')
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(report, indent=2, allow_nan=False)+'\n')
+        args.out.write_text(json.dumps(report, indent=2, allow_nan=False, default=_json_default)+'\n')
         print(json.dumps(report['summary']['overall'], indent=2)); return
     positive = ('games', 'roots_per_game', 'target_range', 'num_envs', 'chance_repeats', 'policy_repeats',
                 'max_candidates', 'min_candidates', 'candidate_nodes', 'prefix_batch', 'world_batch', 'inference_batch',
@@ -791,9 +791,9 @@ def main():
     finally:
         report = save_report(args, records, games, targets, start, ready, final=True)
         report['final'] = final
-        args.out.write_text(json.dumps(report, indent=2, allow_nan=False)+'\n')
+        args.out.write_text(json.dumps(report, indent=2, allow_nan=False, default=_json_default)+'\n')
     print(json.dumps(dict(counts=report['counts'], timing=report['timing'],
-                         overall=report['summary']['overall']['estimate']), indent=2))
+                         overall=report['summary']['overall']['estimate']), indent=2, default=_json_default))
     print(f'Saved {args.out}; raw crossed panels: {rawdir}')
 
 
