@@ -36,7 +36,9 @@ def advise(result, agent, *, search=False):
     diagnostics = empty_diagnostics()
     if search and not env.complete:
         response_enabled = getattr(getattr(agent, 'config', None), 'search_response', False)
-        if p['phase'] != 0 and not response_enabled:
+        if p.get('_policy_only'):
+            search_status = p['_search_fallback'] + '_policy_fallback'
+        elif p['phase'] != 0 and not response_enabled:
             search_status = 'response_search_disabled_policy_fallback'
         else:
             try:

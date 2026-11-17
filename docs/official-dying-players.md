@@ -29,8 +29,14 @@ auto44 / roomA13 との差が手札や死亡処理順によるものかは、こ
 投影では非空配列を公開の `dying_players` として保持する。dead や HP は変更しない。
 native の PendingView には death / hit_rate があり、現在の投影は death=False、
 台帳の通常 hit_rate を使う。ID 配列だけでは死亡時攻撃の値や未解決 queue を復元できず、
-同じ観測・mask になることを保証できない。自分の決定がある場合だけ
-`dying_players_decision_unavailable`、理由 `native_death_state_not_reconstructible`
-で停止する。自分の決定が無い場合は既存の decision-only 判定に従って待機・次更新を取り込む。
+同じ実行状態の復元は保証しない。ただし通常の防御の合法性は、現在の攻撃の
+category / element / power、自分の手札・MP・Flash だけで決まり、死亡 queue を使わない。
+自分が dying 集合に含まれず、公開 HP が正、dead=False、他の未対応理由が無ければ
+公開選択カーソルで続行する。未知の発動来歴だけが欠けている確率攻撃の反射も同様。
+この場合は `_policy_only` と警告を残し、Python の助言と C++ の根生成の両方で探索を遮断する。
+主動作、自分自身の死亡処理中、HP0、動的 rate・死亡時112・攻撃値不足などは
+`dying_players_decision_unavailable` 等で停止する。
+自分の決定が無い場合は既存の decision-only 判定に従って待機・次更新を取り込む。
 終局は finished。空配列は省略時と同じ投影・観測・mask とし、合成テストで比較する。
 未知イベントなど別の未対応理由の判定はそのまま維持する。
+詳細は [途中停止対策](official-bot-stop-recovery.md) を参照。

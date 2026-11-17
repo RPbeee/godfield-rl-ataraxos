@@ -302,6 +302,7 @@ def ready(state, public, name):
                                 dict(phase='response', own_name_bands=0)) from None
         raise
     require(not selected(state, x), 'pane_already_selected')
+    verify_command_control(state, x, public['phase'])
     expected = Counter(PATHS.get(h['face']) for h in public['hand'])
     actual = Counter(r['path'] for r in hand_images(state))
     require(actual == expected, 'visible_hand_mismatch', card_detail(expected, actual))
@@ -328,24 +329,52 @@ def wait_visible(probe, state, check, *, timeout=30, refresh=None):
 
 
 def allocation_steps(start, end):
-    require(set(end) == {'hp', 'mp', 'cp'} and all(type(v) is int and 0 <= v <= 99 for v in end.values())
+    require(set(start) == set(end) == {'hp', 'mp', 'cp'}
+            and all(type(v) is int and 0 <= v <= 99 for v in (*start.values(), *end.values()))
             and sum(start.values()) == sum(end.values()), 'invalid_allocation')
-    # Free HP first so no intermediate click exceeds the available total.
+    # HP is the transfer buffer. Interleave withdrawals and deposits when it
+    # reaches either bound; draining both resources first can overflow HP99.
     current = dict(start); steps = []
-    for sign in (-1, 1):
-        for key, x in [('mp', 620), ('cp', 760)]:
-            delta = end[key] - current[key]
-            if delta * sign <= 0:
-                continue
-            tens, ones = divmod(abs(delta), 10)
-            for magnitude, count in ((10, tens), (1, ones)):
-                for _ in range(count):
-                    current[key] += sign * magnitude; current['hp'] -= sign * magnitude
-                    require(all(0 <= v <= 99 for v in current.values()), 'allocation_intermediate_out_of_range')
-                    y = {10: 123, 1: 183, -1: 303, -10: 363}[sign*magnitude]
-                    steps.append((point(x, y), dict(current)))
+    while current != end:
+        progressed = False
+        for sign in (-1, 1):
+            for key, x in [('mp', 620), ('cp', 760)]:
+                delta = (end[key] - current[key]) * sign
+                capacity = current['hp'] if sign > 0 else 99-current['hp']
+                if delta <= 0 or capacity <= 0:
+                    continue
+                magnitude = 10 if min(delta, capacity) >= 10 else 1
+                current[key] += sign * magnitude; current['hp'] -= sign * magnitude
+                y = {10: 123, 1: 183, -1: 303, -10: 363}[sign*magnitude]
+                steps.append((point(x, y), dict(current)))
+                progressed = True
+        require(progressed, 'allocation_intermediate_out_of_range')
     require(current == end, 'allocation_mismatch', dict(expected=end, actual=current))
     return steps
+
+
+def verify_command_control(state, x, phase):
+    # New live probes report the visible, hit-testable command overlay. Old
+    # offline snapshots lack this capability and keep their original checks.
+    if phase != 3 and 'commandPanes' in state:
+        require(state['commandPanes'] == [x], 'command_control_unavailable')
+
+
+def used_positions(state, public):
+    """Validate the complete used suffix before distinguishing mixed copies.
+
+    Pinned client fH.hr sorts used faces by model, then fH.fD right-aligns them
+    in the 18-slot grid. Repeated used faces still lack an item-ID witness.
+    """
+    used = sorted(h['face'] for h in public['hand'] if h['used'])
+    images = hand_images(state); result = []
+    for slot, face in zip(range(18-len(used), 18), used):
+        matches = [r for r in images if (r['x'], r['y']) ==
+                   (190+82*(slot % 9), 493 if slot < 9 else 595)]
+        require(len(matches) == 1 and matches[0]['path'] == PATHS.get(face),
+                'ambiguous_used_card_position')
+        result.append(matches[0])
+    return result
 
 
 def prepare(state, public, action, name, *, dream_last_resort=False):
@@ -389,6 +418,7 @@ def prepare(state, public, action, name, *, dream_last_resort=False):
     require(action['operations'] == expected_ops, 'unknown_operations')
     x = pane_x(state, name)
     require(not selected(state, x), 'pane_already_selected')
+    verify_command_control(state, x, public['phase'])
     if kind in ('accept', 'decline'):
         require(not action['cards'] and action['target'] is None and action['allocation'] is None,
                 'invalid_purchase_action')
@@ -414,12 +444,7 @@ def prepare(state, public, action, name, *, dream_last_resort=False):
         require(len(all_matches) == len(copies), 'visible_hand_mismatch',
                 card_detail(Counter({path: len(copies)}), Counter({path: len(all_matches)})))
         if {i['used'] for i in copies} == {False, True}:
-            # auto6 and live1 after reuse: the single used miracle occupies
-            # the bottom-right slot; unused overflow starts at bottom-left.
-            # Do not extrapolate this to multiple used miracles or a layout
-            # with missing copies. The glow is not a separate probe image.
-            require(sum(i['used'] for i in public['hand']) == 1, 'ambiguous_used_card_position')
-            used = [r for r in all_matches if (r['x'], r['y']) == (846, 595)]
+            used = [r for r in used_positions(state, public) if r['path'] == path]
             require(len(used) == 1, 'ambiguous_used_card_position')
             matches = [r for r in matches if (r == used[0]) == h['used']]
             require(matches, 'ambiguous_used_card_position')
@@ -441,6 +466,7 @@ def prepare(state, public, action, name, *, dream_last_resort=False):
 
 
 def verify(state, public, name, plan, expected):
+    verify_command_control(state, plan['pane'], public['phase'])
     if own_fog(public) and public['phase'] == 1:
         verify_attack(state, public, plan['pane'])
     if plan.get('target_switched'):
@@ -468,7 +494,7 @@ def execute(probe, state, public, action, name, *, commands=None, settle_timeout
     pending = public.get('pending') or {}
     redirected = public['phase'] == 1 and (previous_reflect or bool(pending.get('counter')) or any(
         pending.get(k, 0) > 0 for k in ('reflections', 'bounces')))
-    if redirected:
+    if redirected or (public['phase'] == 1 and 'commandPanes' in state):
         state = wait_response_stable(probe, state, public, name, plan, {},
                                      timeout=settle_timeout, refresh=refresh)
         # Geometry may have settled into a different hand arrangement.
@@ -590,6 +616,22 @@ def same_confirmation(state, public, action, name, plan):
         before = plan['confirmation_state']
         return (hand_images(state) == hand_images(before)
                 and selected(state, 1040-plan['pane']) == selected(before, 1040-plan['pane']))
+    except UIUnsupported:
+        return False
+
+
+def submission_pending(state, public, name, plan):
+    """Visible submit acknowledgement permits only more read-only waiting.
+
+    The client removes its command overlay and clears selected cards before
+    awaiting the server. This is never evidence of authoritative acceptance.
+    """
+    before = plan['confirmation_state']
+    if before.get('commandPanes') != [plan['pane']] or state.get('commandPanes') != []:
+        return False
+    try:
+        verify_scene(state, public)
+        return pane_x(state, name) == plan['pane'] and not selected(state, plan['pane'])
     except UIUnsupported:
         return False
 

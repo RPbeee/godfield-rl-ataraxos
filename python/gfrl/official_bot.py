@@ -425,11 +425,20 @@ def capture(probe):
     return result['capture']['captures']
 
 
-def accepted(probe, streams, update, timeout=20, *, retry=None, retry_after=6):
+def accepted(probe, streams, update, timeout=20, *, retry=None, retry_after=6, pending=None):
     started = time.monotonic()
     deadline = started+timeout
     retried = False
-    while time.monotonic() < deadline:
+    extended = False
+    while True:
+        if time.monotonic() >= deadline:
+            if not extended and pending is not None and pending():
+                # The UI has submitted and discarded its command. Do not
+                # recreate it: allow one bounded receive-only grace interval.
+                extended = True
+                deadline = time.monotonic() + max(timeout, 30)
+            else:
+                raise UIUnsupported('acceptance_timeout')
         result = streams.poll(capture(probe))
         require(result['status'] != 'unsupported', 'unsupported_receive', result.get('detail', {}))
         if result.get('public', {}).get('update', update) > update:
@@ -438,7 +447,6 @@ def accepted(probe, streams, update, timeout=20, *, retry=None, retry_after=6):
             retried = True
             retry()
         time.sleep(min(.2, max(0, deadline-time.monotonic())))
-    raise UIUnsupported('acceptance_timeout')
 
 
 def summary(public):
@@ -557,8 +565,20 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                     state = probe.send(dict(kind='state'))['state']
                     state = wait_visible(probe, state, lambda s: ready(s, public, name),
                                          timeout=settle_timeout, refresh=refresh)
-                    plan = prepare(state, public, advice['action'], name,
-                                   dream_last_resort=advice.get('dream_last_resort') is True)
+                    def preflight(s):
+                        ready(s, public, name)
+                        return prepare(s, public, advice['action'], name,
+                                       dream_last_resort=advice.get('dream_last_resort') is True)
+                    try:
+                        plan = preflight(state)
+                    except UIUnsupported as error:
+                        if str(error) != 'ambiguous_used_card_position':
+                            raise
+                        # No mutation has happened. Let a moving used suffix
+                        # settle; never restart a partially applied plan.
+                        state = wait_visible(probe, state, preflight,
+                                             timeout=settle_timeout, refresh=refresh)
+                        plan = preflight(state)
                     if not dry_run:
                         plan = execute(probe, state, public, advice['action'], name,
                                 commands=current_record['clicks'], settle_timeout=settle_timeout,
@@ -592,7 +612,15 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                         current_record['clicks'].append(plan['confirm'])
                         probe.send(plan['confirm'])
                 try:
-                    result = accepted(probe, streams, public['update'], timeout, retry=retry_confirmation)
+                    def pending_submission():
+                        from .official_ui import submission_pending
+                        s = probe.send(dict(kind='state'))['state']
+                        waiting = submission_pending(s, public, name, plan)
+                        if waiting:
+                            current_record['acceptance_wait_extended'] = True
+                        return waiting
+                    result = accepted(probe, streams, public['update'], timeout,
+                                      retry=retry_confirmation, pending=pending_submission)
                 except UIUnsupported as error:
                     if (str(error) != 'acceptance_timeout' or public['phase'] != 1
                             or advice['action']['kind'] != 'defend' or advice['action']['cards']):
@@ -672,6 +700,8 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                     and e.get('reason') == f"ui_kind_unobserved:{e['kind']}")
             if current_record.get('confirmation_retries'):
                 stopped['confirmation_retries'] = current_record['confirmation_retries']
+            if current_record.get('acceptance_wait_extended'):
+                stopped['acceptance_wait_extended'] = True
         journal.write(stopped)
         print(json.dumps(dict(reason=code, detail=detail), ensure_ascii=False, allow_nan=False), file=sys.stderr)
         # Keep observation failures independent so one broken probe command

@@ -15,7 +15,7 @@
 
 異なる正の値は、この adapter のままでは native と同じ観測を作れない。台帳値で判断を続けず、`dynamic_hit_rate_unavailable` と受信・台帳の公開命中率を記録する。自分の決定時は停止し、それ以外では待機する。active head だけを判断し、後続 queue の動的値を現在の決定へ適用しない。
 
-[native 死亡処理](../third_party/goodfield/src/official_match.cpp) の昇天弓は power30/rate75 と `is_death=true` を持つ。受信 atk30 または rate75 だけでは死亡処理の由来やスケジュールを確定できないため、112 の該当形には `death_attack_decision_unavailable` も記録する。通常の atk1/rate25 は従来どおり扱う。既存の `dyingPlayerIds` による停止理由は維持する。
+[native 死亡処理](../third_party/goodfield/src/official_match.cpp) の昇天弓は power30/rate75 と `is_death=true` を持つ。受信 atk30 または rate75 だけでは死亡処理の由来やスケジュールを確定できないため、112 の該当形には `death_attack_decision_unavailable` も記録する。通常の atk1/rate25 は従来どおり扱う。`dyingPlayerIds` 単独による通常応答の停止は、条件付きで方策へ戻す。[死亡処理メタデータの判断](official-dying-players.md) を参照。動的 rate / 死亡時112 の停止は維持する。
 
 ## auto54 の再現範囲
 

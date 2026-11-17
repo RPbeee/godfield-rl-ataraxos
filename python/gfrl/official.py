@@ -137,7 +137,9 @@ def unsupported_detail(public):
     facts = public.get('detail', [])
     pending = public.get('pending') or {}
     result = [deepcopy(d) for d in facts if d['code'] == 'multiple_pending_frames']
-    for code in public['unsupported']:
+    for code in dict.fromkeys(public['unsupported'] + public.get('_policy_only', [])):
+        if code == 'multiple_pending_frames':
+            continue
         matches = [d for d in facts if d['code'] == code]
         if matches:
             result.extend(matches)
@@ -437,6 +439,7 @@ class OfficialSession:
         # update, even if a caller builds a synthetic update from prior output.
         p.pop('_search_launch', None)
         p.pop('_search_fallback', None)
+        p.pop('_policy_only', None)
         public_source = deepcopy(p)
         if self.previous and p['update'] <= self.previous['update']:
             if p == self.previous.get('_source'):
@@ -714,7 +717,10 @@ class OfficialSession:
             if pending['reflections'] or pending['bounces']:
                 if _core.play_catalog()[pending['models'][0]]['hit_rate']:
                     p['unsupported'].append('redirect_chance_activation_unavailable')
-                pending['forced_hit'] = False  # supported deterministic payloads only
+                # Activation provenance is unknown after a redirect. It affects
+                # simulation, but not response legality (category/element/power,
+                # own MP/Flash and visible hand). Keep that uncertainty explicit.
+                pending['forced_hit'] = None if _core.play_catalog()[pending['models'][0]]['hit_rate'] else False
             else:
                 pending['forced_hit'] = None if s is None else bool(_core.play_catalog()[pending['models'][0]]['hit_rate'] and 'darkcloud' in s['curses'])
         # Status delta failures expose missing event semantics, not private data.
@@ -808,6 +814,29 @@ class OfficialSession:
                 p['_search_launch'] = dict(before=anchor, models=decision['faces'],
                                           target=p['pending']['target'])
                 p['_search_fallback'] = 'response_public_launch_replay_mismatch'
+        # A public active head is enough for pure response selection, even when
+        # the execution queue/death or chance activation state is unavailable.
+        # Never synthesize a playable Match from these partial execution facts.
+        if p['phase'] == 1 and p['pending']:
+            relaxable = []
+            if 'redirect_chance_activation_unavailable' in p['unsupported']:
+                relaxable.append('redirect_chance_activation_unavailable')
+            own = next(x for x in p['players'] if x['id'] == self.viewer)
+            if (p.get('dying_players') and self.viewer not in p['dying_players']
+                    and not own['dead'] and own['status'] and own['status']['hp'] > 0
+                    and not (set(p['unsupported']) - {'dying_players_decision_unavailable',
+                                                     'redirect_chance_activation_unavailable'})
+                    and 'dying_players_decision_unavailable' in p['unsupported']):
+                relaxable.append('dying_players_decision_unavailable')
+            for code in relaxable:
+                p['unsupported'].remove(code)
+            if relaxable or any(d['code'] == 'multiple_pending_frames' for d in p['detail']):
+                p['_policy_only'] = relaxable + (['multiple_pending_frames'] if any(
+                    d['code'] == 'multiple_pending_frames' for d in p['detail']) else [])
+                p.pop('_search_launch', None)
+                p['_search_fallback'] = ('response_execution_state_unavailable' if relaxable
+                                         else 'response_public_journal_unavailable')
+                p.setdefault('warnings', []).extend('policy_only:' + code for code in p['_policy_only'])
         self.previous = deepcopy(p)
         self.previous['_source'] = public_source
         fatal = [code for code in p['unsupported']

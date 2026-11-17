@@ -144,6 +144,8 @@ struct OfficialCursor {
 namespace gfrl {
 struct OfficialAccess {
     static std::unique_ptr<VecEnv> root(nb::dict public_view,nb::list events,std::size_t k,nb::dict restrictions) {
+        if(public_view.contains("_policy_only"))
+            throw std::invalid_argument("search_requires_public_launch_journal");
         auto v=official_view(public_view);
         if(!v.board.viewer || v.actor!=v.board.viewer)
             throw std::invalid_argument("search_requires_viewer_root");
