@@ -13,6 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+from statistics import NormalDist
 import sys
 from time import perf_counter
 
@@ -219,6 +220,75 @@ def candidates(args, model, archive, rec):
     return selected
 
 
+@torch.inference_mode()
+def wide_candidates(args, model, archive, rec):
+    """Independent, bounded proposals of complete legal paths, without replacement.
+
+    Uniform means uniform *prefix branches*, not uniform complete actions. The
+    tempered law also acts at each prefix. Neither depends on rollout outcomes.
+    Rejection excludes retained paths, duplicates and paths above the pi cap.
+    """
+    if not getattr(args, 'wide_candidates', 0):
+        return
+    rng = np.random.default_rng(np.random.SeedSequence(
+        [args.seed, rec['game'], rec['decision_index'], 31]))
+    root = rec['archive_row']
+    encoded = model.encode(tensor_batch({k: getattr(archive, k)[[root]] for k in OBS_FIELDS}, args.device))
+    cache = {tuple(p['path']): np.asarray(p['probabilities'], np.float64)
+             for p in rec['root_policy_prefixes']}
+    # Cache log probabilities as well: a legal but extremely unlikely path must
+    # remain reachable by the uniform proposal even when exp(log_pi) underflows.
+    logs = {}
+    excluded = {tuple(p) for p in rec['candidate_paths']}
+    accepted, rejected = [], Counter()
+    env = world(args, 1, 1)
+    for attempt in range(args.wide_draws):
+        copy_exact(env, archive, [root])
+        path, log_pi = (), 0.
+        while env.decisions[0] == 0:
+            if path not in logs:
+                lp, _ = model.heads(encoded, **tensor_batch(
+                    {k: getattr(env, k) for k in PREFIX_FIELDS}, args.device))
+                legal = np.flatnonzero(env.mask[0])
+                raw = lp.float().cpu().numpy()[0].astype(np.float64)
+                if path in cache:
+                    prob = cache[path]
+                    # Retained-prefix probabilities must agree with the tail
+                    # subtraction, including CUDA batch-dependent rounding.
+                    log = np.full_like(raw, -np.inf)
+                    np.log(prob, out=log, where=prob > 0)
+                    log[(prob == 0) & env.mask[0].astype(bool)] = raw[(prob == 0) & env.mask[0].astype(bool)]
+                else:
+                    log = raw.copy()
+                    log -= np.logaddexp.reduce(log[legal])
+                logs[path] = (log, legal)
+            log, legal = logs[path]
+            if args.wide_method == 'prefix-uniform':
+                choice = int(rng.choice(legal))
+            else:
+                # Shift before dividing, including extremely small positive T.
+                with np.errstate(over='ignore'):
+                    scores = (log[legal]-log[legal].max())/args.wide_temperature
+                prob = np.exp(scores-scores.max()); prob /= prob.sum()
+                choice = int(rng.choice(legal, p=prob))
+            log_pi += float(log[choice])
+            path += (choice,)
+            env.step(np.array([choice], np.int32))
+        if path in excluded:
+            rejected['retained_or_duplicate'] += 1
+        elif log_pi > np.log(args.wide_max_pi):
+            rejected['above_pi_cap'] += 1
+        else:
+            excluded.add(path)
+            accepted.append(dict(path=list(path), pi=float(np.exp(log_pi)), log_pi=log_pi,
+                                 proposal_index=attempt+1))
+            if len(accepted) == args.wide_candidates:
+                break
+    rec['wide'] = dict(actions=accepted, requested=args.wide_candidates, draws=attempt+1,
+                       rejected=dict(rejected), shortfall=args.wide_candidates-len(accepted),
+                       method=args.wide_method, max_pi=args.wide_max_pi)
+
+
 class TailSampler:
     """Sample pi conditional on paths outside the retained set, without rejection.
 
@@ -295,7 +365,10 @@ class DiagnosticActor(_SearchActor):
 @torch.inference_mode()
 def panel(args, model, archive, rec):
     paths = rec['candidate_paths']
-    A, C, P = len(paths)+1, args.chance_repeats, args.policy_repeats
+    K = len(paths)
+    extra = [a['path'] for a in rec.get('wide', {}).get('actions', [])]
+    arms = paths+[None]+extra  # original tail keeps its original index K
+    A, C, P = len(arms), args.chance_repeats, args.policy_repeats
     rng = np.random.default_rng(np.random.SeedSequence([args.seed, rec['game'], rec['decision_index'], 17]))
     chance_seeds = rng.integers(0, 2**64-1, C, dtype=np.uint64)
     policy_seeds = rng.integers(0, 2**64-1, P, dtype=np.uint64)
@@ -305,8 +378,12 @@ def panel(args, model, archive, rec):
     status = np.zeros(shape, np.int8)  # 0 completed, 1 load failure, 2 truncated
     decisions = 0
     last = perf_counter()
-    for lo in range(0, A*C*P, args.world_batch):
-        flat = np.arange(lo, min(lo+args.world_batch, A*C*P))
+    # Keep the original arm batches unchanged, even when adding wide arms.
+    boundary = (K+1)*C*P
+    batches = [(lo, min(lo+args.world_batch, end)) for begin, end in
+               ((0, boundary), (boundary, A*C*P)) for lo in range(begin, end, args.world_batch)]
+    for lo, hi in batches:
+        flat = np.arange(lo, hi)
         aa, cc, pp = np.unravel_index(flat, shape)
         env = world(args, len(flat))
         try:
@@ -342,8 +419,8 @@ def panel(args, model, archive, rec):
             weight[own] *= args.gamma*args.lambda_a
             choices = result.choices
             for i in active[env.decisions[active] == 0]:
-                if aa[i] < len(paths):
-                    choices[i] = paths[aa[i]][env.substep[i]]
+                if aa[i] != K:
+                    choices[i] = arms[aa[i]][env.substep[i]]
                 else:
                     choices[i] = tail_sampler.choose(i, result.log_probs[i], actor.last_uniforms[i])
             # Failed rows remain inactive from construction; all live valid rows
@@ -381,12 +458,13 @@ def policy_baseline(rec, data):
     """Exact pi-weighted retained arms + independently sampled conditional tail."""
     x = data['outcome']
     pi = np.asarray(rec['candidate_pi'])
-    known = np.einsum('a,acp->cp', pi, x[:-1])
+    K = len(pi)
+    known = np.einsum('a,acp->cp', pi, x[:K])
     if rec['tail_mass'] > 1e-7:
-        return known+rec['tail_mass']*x[-1]
+        return known+rec['tail_mass']*x[K]
     # E[1{a in S} Y_a] = sum_S pi(a) Q_a. Per-cell CRN makes this
     # control variate cancel exactly whenever the sampled path is retained.
-    residual = x[-1].copy()
+    residual = x[K].copy()
     for c, p in np.ndindex(residual.shape):
         j = data['tail_retained_index'][c, p]
         if j >= 0:
@@ -424,8 +502,126 @@ def required(gap_squared, variance):
     return float(4*variance/gap_squared) if gap_squared > 0 and variance >= 0 else None
 
 
+def pi_bucket(log_pi):
+    for edge, label in [(1e-6, 'lt_1e-6'), (1e-4, '1e-6_to_1e-4'),
+                        (1e-3, '1e-4_to_1e-3'), (1e-2, '1e-3_to_1e-2')]:
+        if log_pi < np.log(edge):
+            return label
+    return 'ge_1e-2'
+
+
+def wide_budgets(n):
+    return sorted({n} | {2**i for i in range(n.bit_length()) if 2**i <= n})
+
+
+def analyze_wide_root(rec, data):
+    """Outcome-independent proposals; disjoint C AND P folds for selection.
+
+    A held-out sign is a noisy validation rate, not an unbiased estimate of the
+    prevalence of true oracle improvements. Simultaneous lower bounds supply a
+    separate conservative evidence rate against ALL original retained actions.
+    """
+    wide = rec['wide']
+    wide.pop('summary', None)
+    if np.any(data['status']):
+        wide['metrics_excluded'] = 'incomplete_crossed_grid'
+        return
+    wide.pop('metrics_excluded', None)
+    K, N = len(rec['candidate_paths']), len(wide['actions'])
+    summary = dict(available_actions=N, requested_actions=wide['requested'],
+                   shortfall=wide['shortfall'], proposal_draws=wide['draws'], has_extra=float(N > 0))
+    wide['summary'] = summary
+    if not N:
+        # Shortfall roots remain in discovery denominators; no fabricated gap.
+        for budget in wide_budgets(wide['requested']):
+            for key in ('examined', 'train_positive_fraction', 'heldout_win_fraction',
+                        'evidence_fraction', 'evidence_unresolved_fraction', 'promoted_gap'):
+                summary[f'discovery/{budget}/{key}'] = 0.
+        return
+    raw = data['outcome']
+    x = np.concatenate([raw[:K], raw[K+1:], policy_baseline(rec, data)[None]])
+    est = crossed_cov(x)
+    q, mc = est['mean'], est['mc']
+    advantage = q[K:K+N]-q[-1]
+    avar = np.diag(mc)[K:K+N]+mc[-1, -1]-2*mc[K:K+N, -1]
+    post = data['post_v'][K+1:]
+    joint = crossed_cov(np.concatenate([x[K:K+N], post]))
+    for i, action in enumerate(wide['actions']):
+        se = float(np.sqrt(avar[i])) if avar[i] >= 0 else None
+        action.update(bucket=pi_bucket(action['log_pi']), q=float(q[K+i]),
+                      advantage=float(advantage[i]), advantage_mc_variance=float(avar[i]),
+                      advantage_normal_95=[float(advantage[i]-1.96*se), float(advantage[i]+1.96*se)] if se is not None else None,
+                      post_v=float(joint['mean'][N+i]))
+    for bucket in ['all', 'lt_1e-6', '1e-6_to_1e-4', '1e-4_to_1e-3', '1e-3_to_1e-2', 'ge_1e-2']:
+        take = np.array([i for i, a in enumerate(wide['actions']) if bucket == 'all' or a['bucket'] == bucket], int)
+        if not len(take):
+            continue
+        a, v = advantage[take], avar[take]
+        prefix = f'distribution/{bucket}/'
+        summary[prefix+'actions'] = len(take)
+        summary[prefix+'mean_advantage'] = float(a.mean())
+        summary[prefix+'second_moment_mc_corrected'] = float(np.mean(a*a-v))
+        summary[prefix+'mean_mc_variance'] = float(v.mean())
+        # Root-balanced empirical CDF of noisy estimates; never call this a
+        # deconvolved true-Q distribution or use its signs as proof of gain.
+        for edge in (-.5, -.1, 0., .1, .5):
+            summary[prefix+f'observed_cdf_at_{edge:g}'] = float(np.mean(a <= edge))
+    M = np.eye(N)/N-np.ones((N, N))/N**2
+    qm, vm = joint['mean'][:N], joint['mean'][N:]
+    summary.update({
+        'value/q_variance_corrected': float(qm@M@qm-np.trace(M@joint['mc'][:N, :N])),
+        'value/v_variance_corrected': float(vm@M@vm-np.trace(M@joint['mc'][N:, N:])),
+        'value/q_v_covariance_corrected': float(qm@M@vm-np.trace(M@joint['mc'][N:, :N]))})
+    C, P = x.shape[1:]
+    folds = [(slice(0, C//2), slice(0, P//2), slice(C//2, None), slice(P//2, None)),
+             (slice(C//2, None), slice(P//2, None), slice(0, C//2), slice(0, P//2))]
+    wide['discovery'] = {}
+    for budget in wide_budgets(wide['requested']):
+        n, results = min(budget, N), []
+        for tc, tp, ec, ep in folds:
+            train = x[:, tc, tp].mean((1, 2))
+            test = crossed_cov(x[:, ec, ep])
+            top = int(train[:K].argmax())
+            chosen = K+int(train[K:K+n].argmax())
+            h = np.zeros(len(x)); h[chosen] = 1; h[top] = -1
+            gap = float(h@test['mean'])
+            variance = contrast(test['mc'], h)
+            train_gap = float(train[chosen]-train[top])
+            # Two folds and K comparisons: one-sided Bonferroni normal bounds.
+            z = NormalDist().inv_cdf(1-.05/(2*K))
+            deltas = test['mean'][chosen]-test['mean'][:K]
+            variances = test['mc'][chosen, chosen]+np.diag(test['mc'])[:K]-2*test['mc'][chosen, :K]
+            identified = bool(np.all(variances >= 0))
+            lower = deltas-z*np.sqrt(np.maximum(variances, 0))
+            value_choice = K+int(post[:n, tc, tp].mean((1, 2)).argmax())
+            value_gap = float(test['mean'][value_choice]-test['mean'][K:K+n].mean())
+            results.append(dict(top_candidate=top, wide_candidate=chosen-K, train_gap=train_gap,
+                                heldout_gap=gap, heldout_mc_variance=variance,
+                                heldout_normal_95=[gap-1.96*np.sqrt(variance), gap+1.96*np.sqrt(variance)] if variance >= 0 else None,
+                                beats_all_original_lower_bound=float(lower.min()) if identified else None,
+                                evidence=bool(identified and np.all(lower > 0)),
+                                value_candidate=value_choice-K, value_gain_vs_wide_mean=value_gap,
+                                value_selected_advantage=float(test['mean'][value_choice]-test['mean'][-1])))
+        wide['discovery'][str(budget)] = results
+        prefix = f'discovery/{budget}/'
+        summary.update({prefix+'examined': n,
+                        prefix+'train_positive_fraction': float(np.mean([r['train_gap'] > 0 for r in results])),
+                        prefix+'heldout_gap': float(np.mean([r['heldout_gap'] for r in results])),
+                        prefix+'heldout_win_fraction': float(np.mean([r['heldout_gap'] > 0 for r in results])),
+                        prefix+'evidence_fraction': float(any(r['evidence'] for r in results)),
+                        prefix+'evidence_unresolved_fraction': float(any(r['beats_all_original_lower_bound'] is None for r in results)),
+                        prefix+'promoted_gap': float(np.mean([r['heldout_gap'] if r['train_gap'] > 0 else 0. for r in results])),
+                        prefix+'value_gain_vs_wide_mean': float(np.mean([r['value_gain_vs_wide_mean'] for r in results])),
+                        prefix+'value_selected_advantage': float(np.mean([r['value_selected_advantage'] for r in results]))})
+
+
 def analyze_root(rec, data):
     """Complete-case grids only: never treat truncation or failure as a draw."""
+    if 'wide' in rec:
+        analyze_wide_root(rec, data)
+        K = len(rec['candidate_paths'])
+        data = {k: v[:K+1] if k in ('outcome', 'gae', 'post_v', 'next_own_v', 'status') else v
+                for k, v in data.items()}
     if np.any(data['status']):
         rec.pop('metrics', None)
         rec['metrics_excluded'] = 'incomplete_crossed_grid'
@@ -662,6 +858,69 @@ def summarize(rows, games, bootstrap, seed):
     return result
 
 
+def summarize_wide(rows, games, bootstrap, seed):
+    """Root-balanced statistics, with root and paired-deal cluster intervals.
+
+    A bucket conditions on roots having at least one sampled action in it, then
+    weights actions equally within each root. Discovery includes shortfall roots.
+    Missing/invalid statistics remain missing in bootstrap replicates.
+    """
+    valid = [r for r in rows if not r['real_truncated'] and 'summary' in r.get('wide', {})]
+    groups = {'overall': valid}
+    for phase in ('main', 'response'):
+        groups[phase] = [r for r in valid if r['phase'] == phase]
+    for i, stage in enumerate(('early', 'middle', 'late')):
+        groups[stage] = [r for r in valid if min(int(r['progress']*3), 2) == i]
+        for phase in ('main', 'response'):
+            groups[phase+'_'+stage] = [r for r in groups[stage] if r['phase'] == phase]
+    clusters = sorted({g['g']//2 for g in games})
+    rng = np.random.default_rng(seed)
+    cluster_weights = rng.multinomial(len(clusters), np.full(len(clusters), 1/max(len(clusters), 1)), size=bootstrap) if clusters else np.zeros((bootstrap, 0))
+    result = {}
+    for label, selected in groups.items():
+        n = len(selected)
+        if not n:
+            result[label] = dict(roots=0)
+            continue
+        keys = sorted({k for r in selected for k in r['wide']['summary']})
+        matrix = np.array([[r['wide']['summary'].get(k, np.nan) for k in keys] for r in selected], np.float64)
+        available = np.isfinite(matrix)
+        filled = np.where(available, matrix, 0.)
+        def means(weights):
+            den = weights@available.astype(float)
+            return np.divide(weights@filled, den, out=np.full_like(den, np.nan), where=den > 0)
+        point = means(np.ones((1, n)))
+        root_weights = rng.multinomial(n, np.full(n, 1/n), size=bootstrap)
+        deal_weights = cluster_weights[:, [clusters.index(r['game']//2) for r in selected]]
+        samples = {'root': means(root_weights), 'deal_pair': means(deal_weights)}
+        # Corrected within-root moments quantify discrimination of low-pi hands.
+        derived = ['value/within_root_correlation', 'value/within_root_r2']
+        def derived_values(values):
+            qv, vv, cv = (values[:, keys.index('value/'+k)] for k in
+                          ('q_variance_corrected', 'v_variance_corrected', 'q_v_covariance_corrected'))
+            den = qv*vv
+            ok = (qv > 0) & (vv > 0)
+            correlation = np.divide(cv, np.sqrt(np.maximum(den, 0)), out=np.full_like(cv, np.nan), where=ok)
+            return np.column_stack([values, correlation, correlation**2])
+        if 'value/q_variance_corrected' in keys:
+            point = derived_values(point)
+            samples = {k: derived_values(v) for k, v in samples.items()}
+            keys += derived
+        estimates = {k: float(v) if np.isfinite(v) else None for k, v in zip(keys, point[0])}
+        output = dict(roots=n, games=len({r['game'] for r in selected}), estimate=estimates,
+                      metric_roots={k: int(available[:, i].sum()) for i, k in enumerate(keys[:matrix.shape[1]])})
+        for kind, values in samples.items():
+            intervals, fractions = {}, {}
+            for i, k in enumerate(keys):
+                good = values[:, i][np.isfinite(values[:, i])]
+                fractions[k] = len(good)/bootstrap
+                intervals[k] = np.quantile(good, [.025, .975]).tolist() if estimates[k] is not None and len(good) >= .975*bootstrap else None
+            output['bootstrap_'+kind+'_95'] = intervals
+            output['bootstrap_'+kind+'_valid_fraction'] = fractions
+        result[label] = output
+    return result
+
+
 def _json_default(o):
     if isinstance(o, np.generic):
         return o.item()
@@ -675,7 +934,8 @@ def save_report(args, records, games, targets, start, ready, final=False):
     seconds = perf_counter()-start
     totals = {k: sum(r['world_counts'][k] for r in completed) for k in ('requested', 'completed', 'load_failed', 'truncated')}
     decision_count = sum(r['continuation_decisions'] for r in completed)
-    report = dict(schema_version=1, config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+    report = dict(schema_version=1, config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+                                          if not k.startswith('wide_') or getattr(args, 'wide_candidates', 0)},
                   runtime=dict(python=sys.version, torch=str(torch.__version__), platform=platform.platform(),
                                cuda=torch.version.cuda, device_name=torch.cuda.get_device_name() if args.device == 'cuda' else platform.machine()),
                   summary_config=dict(bootstrap=args.bootstrap, seed=args.seed+9, cluster='deal_pair'),
@@ -690,6 +950,10 @@ def save_report(args, records, games, targets, start, ready, final=False):
                               continuation_decisions=decision_count, diagnostic_seconds=perf_counter()-ready,
                               continuation_decisions_per_second=decision_count/max(perf_counter()-ready, 1e-12)),
                   summary=summarize(completed, games, args.bootstrap, args.seed+9) if final else None)
+    if getattr(args, 'wide_candidates', 0):
+        report['schema_version'] = 2
+        report['wide_summary'] = summarize_wide(completed, games, args.bootstrap, args.seed+10) if final else None
+        report['summary_config']['wide_seed'] = args.seed+10
     args.out.parent.mkdir(parents=True, exist_ok=True)
     temp = args.out.with_suffix(args.out.suffix+'.tmp')
     temp.write_text(json.dumps(report, indent=2, allow_nan=False, default=_json_default)+'\n')
@@ -709,6 +973,15 @@ def parser():
                    help='auto: checkpoint training dtype on CUDA; fp32 on CPU')
     p.add_argument('--out', type=Path, default=Path('measurements/luck-diagnostic.json'))
     p.add_argument('--summarize', type=Path, help='recompute summaries/intervals from an existing report; no model needed')
+    p.add_argument('--wide-candidates', type=int, default=0,
+                   help='extra distinct low-pi actions per root; 0 preserves the original diagnostic')
+    p.add_argument('--wide-method', choices=('prefix-uniform', 'tempered'), default='prefix-uniform')
+    p.add_argument('--wide-temperature', type=float, default=2.,
+                   help='tempered proposal uses pi(choice|prefix) ** (1/temperature)')
+    p.add_argument('--wide-max-pi', type=float, default=.01,
+                   help='maximum unconditional joint policy probability of an extra action')
+    p.add_argument('--wide-draws', type=int, default=1024,
+                   help='bounded proposal attempts per root; report shortfalls without replacement')
     for name, default in [('games', 128), ('roots-per-game', 2), ('target-range', 100), ('num-envs', 32),
                           ('chance-repeats', 16), ('policy-repeats', 16), ('max-candidates', 32), ('min-candidates', 2),
                           ('candidate-nodes', 2048), ('prefix-batch', 32), ('world-batch', 2048),
@@ -728,9 +1001,12 @@ def main():
         report = json.loads(args.summarize.read_text())
         report['summary'] = summarize(report['roots'], report['games'], args.bootstrap, args.seed+9)
         report['summary_config'] = dict(bootstrap=args.bootstrap, seed=args.seed+9, cluster='deal_pair')
+        if 'wide_summary' in report or any('wide' in r for r in report['roots']):
+            report['wide_summary'] = summarize_wide(report['roots'], report['games'], args.bootstrap, args.seed+10)
+            report['summary_config']['wide_seed'] = args.seed+10
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2, allow_nan=False, default=_json_default)+'\n')
-        print(json.dumps(report['summary']['overall'], indent=2)); return
+        print(json.dumps(report['summary']['overall'], indent=2, allow_nan=False, default=_json_default)); return
     positive = ('games', 'roots_per_game', 'target_range', 'num_envs', 'chance_repeats', 'policy_repeats',
                 'max_candidates', 'min_candidates', 'candidate_nodes', 'prefix_batch', 'world_batch', 'inference_batch',
                 'threads', 'max_decisions', 'bootstrap')
@@ -741,6 +1017,9 @@ def main():
         p.error('invalid mass, lambda, gamma or window roots-per-game > target-range')
     if args.min_candidates > args.max_candidates:
         p.error('min-candidates must be <= max-candidates')
+    if (args.wide_candidates < 0 or args.wide_draws <= 0 or
+            not 0 < args.wide_max_pi <= 1 or not np.isfinite(args.wide_temperature) or args.wide_temperature <= 0):
+        p.error('wide-candidates >=0, wide-draws >0, 0 < wide-max-pi <=1 and finite wide-temperature >0 required')
     if args.device == 'cuda' and not torch.cuda.is_available():
         p.error('CUDA unavailable')
     torch.set_num_threads(args.threads)
@@ -778,6 +1057,7 @@ def main():
             since = perf_counter()
             with precision():
                 candidates(args, model, archive, rec)
+                wide_candidates(args, model, archive, rec)
                 data = panel(args, model, archive, rec)
             rawpath = rawdir/f'root-{rec["archive_row"]:05d}.npz'
             np.savez_compressed(rawpath, **data)
@@ -793,7 +1073,7 @@ def main():
         report['final'] = final
         args.out.write_text(json.dumps(report, indent=2, allow_nan=False, default=_json_default)+'\n')
     print(json.dumps(dict(counts=report['counts'], timing=report['timing'],
-                         overall=report['summary']['overall']['estimate']), indent=2, default=_json_default))
+                         overall=report['summary']['overall']['estimate']), indent=2, allow_nan=False, default=_json_default))
     print(f'Saved {args.out}; raw crossed panels: {rawdir}')
 
 

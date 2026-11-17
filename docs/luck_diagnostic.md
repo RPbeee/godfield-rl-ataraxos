@@ -29,43 +29,53 @@ Mac の小規模検証（本番の結論には使わない）:
   --out measurements/luck-reservoir-cpu.json
 ```
 
-TSUBAME では CUDA が見える既存環境で、最初に pilot:
+TSUBAME では CUDA が見える既存環境で、最初に wide pilot:
 
 ```sh
 python scripts/luck_diagnostic.py \
-  --checkpoint runs/hp-lr1e5/ckpt-4500.pt --device cuda --threads 8 \
-  --games 32 --num-envs 32 --roots-per-game 1 \
-  --chance-repeats 8 --policy-repeats 8 \
+  --checkpoint runs/hp-lr1e5/ckpt-4500.pt --device cuda --threads 32 \
+  --games 16 --num-envs 16 --roots-per-game 2 --root-selection reservoir \
+  --mass .99 --min-candidates 2 --max-candidates 32 --candidate-nodes 2048 \
+  --wide-candidates 8 --wide-method prefix-uniform --wide-max-pi .01 --wide-draws 256 \
+  --chance-repeats 16 --policy-repeats 16 \
   --world-batch 2048 --inference-batch 512 --cache-mb 1024 \
-  --out measurements/luck-pilot.json
+  --bootstrap 200 --out measurements/luck-wide-pilot.json
 ```
 
-本番の推奨開始点（以下以外は既定値）:
+本番の推奨開始点（最大 256 根、追加最大 8 手、16×16。以下以外は既定値）:
 
 ```sh
 python scripts/luck_diagnostic.py \
-  --checkpoint runs/hp-lr1e5/ckpt-4500.pt --device cuda --threads 8 \
+  --checkpoint runs/hp-lr1e5/ckpt-4500.pt --device cuda --threads 32 \
   --games 128 --num-envs 32 --roots-per-game 2 --root-selection reservoir \
-  --mass .95 --min-candidates 2 --max-candidates 32 --candidate-nodes 2048 \
+  --mass .99 --min-candidates 2 --max-candidates 32 --candidate-nodes 2048 \
+  --wide-candidates 8 --wide-method prefix-uniform --wide-max-pi .01 --wide-draws 256 \
   --chance-repeats 16 --policy-repeats 16 \
   --world-batch 2048 --inference-batch 512 --cache-mb 1024 --bootstrap 2000 \
-  --out measurements/luck-production.json
+  --out measurements/luck-wide-production.json
 ```
 
-最大 256 roots、各 `(候補数+1)×16×16` 継続。external decision が 2 回未満の
-ゲームでは根が減る。平均候補数 4–16、残り 50 decisions、256 roots なら約
-1,640万–5,570万 continuation decisions（最大候補数には実着手の追加で +1 がある）。
+各根 `(従来候補数 K + tail 1 + 実際の追加数 N)×16×16` 継続。
+external decision が 2 回未満のゲームでは根が減る。K は実着手を含み、
+最大候補数には実着手追加で +1 があり得る。低 π の合法手が少なければ N は減る。
 **CUDA は推論だけ、ゲーム進行は C++ CPU workers**。GPU engine の oracle importer
 を新設する代わりに、CPU の完全状態をそのまま利用する。40GB MIG 向けに推論を
 512 行、world を 2048 行に分割し、encoding cache は 1GB 上限かつ空き GPU
 メモリの 1/4 以下。収まらない cache は host に置く。共有 GPU で不足する場合は
 `--inference-batch 256 --world-batch 1024 --cache-mb 512`。
 
-本構成の CUDA 速度は未実測。5千–2万 decisions/s を仮定すると上記継続は約
-14分–3.1時間、列挙・抽出等を含め **約 0.5–4 時間を仮置き**する。保証値ではない。
-pilot の `timing.continuation_decisions_per_second`、候補数、root 数、残り長から
-補正する（同じ分布なら pilot の継続時間の約 32 倍が本番の目安）。他プロセス共有や
-長局では超過し得る。CI が未解決なら根数か種数を増やし、精度不足をゼロと解釈しない。
+時間見積りは前回の **493 根（要求 512）、16×16、約 85 分、16 threads で
+約 1700 continuation decisions/s** という実測を基準にする。32 threads が比例して
+速くなるとは仮定しない。同じ残り長・速度で K が 2 / 3 / 5 なら、追加 8 手・256 根は
+`85分 × (256/493) × (K+9)/(K+1)` = **約 162 / 132 / 103 分**。
+したがって **約 2–3 時間を狙う設定**。これは K の単純例であり、厳密な見積りには
+根の残り長で重み付けした arm 数が必要。追加手がゲーム長を変えること、候補生成と
+bootstrap の時間、共有 GPU の混雑で超過し得る。新機能の CUDA 計時は手元では未実測。
+pilot は同じ 16×16 と 32 threads なので、本番はその継続時間の約 8 倍が目安。
+pilot の diagnostic_seconds が 20 分超なら 160 分超となるため、
+本番を `--games 96`（最大 192 根）に下げて約 6 倍にする。比較時は
+`timing.continuation_decisions`、速度、N の不足、根の phase/progress 分布も確認する。
+CI が未解決なら根数か種数を増やし、精度不足をゼロと解釈しない。
 特に chance main が大きいなら chance 種、policy main が大きいなら policy 種を
 増やす。交互作用優勢なら両方を増やす。GPU・TSUBAME にはここから接続していない。
 
@@ -101,8 +111,94 @@ coverage 達成/未達、多候補の集計も別に出す。最大 Q はこの�
 候補外の π に条件付けた追加 1 arm を、各 prefix の残存確率から rejection なしで
 サンプリングする。よって候補集合に再正規化した平均ではない。
 tail ≤ 1e-7 では桁落ち回避のため通常 π サンプルと既知候補の CRN control variate を使う。
-raw NPZ の最後の outcome arm は tail（微小 tail では通常 π）であり、JSON の `q[-1]`
+raw NPZ の arm `K` は tail（微小 tail では通常 π）であり、JSON の `q[-1]`
 と covariance の最後の arm は上式の **層化された全方策平均推定量**。両者を混同しない。
+wide 無効時は raw の最後が tail。wide 有効時はその後に追加手を並べる。
+
+## 低 π の追加手（wide、明示的に有効化）
+
+`--wide-candidates 0` が既定。新オプション無指定時は従来の候補、tail、乱数、
+評価バッチ、統計を維持する。有効時も `candidate_paths/pi/mass`、`tail_mass`、
+`actual_index`、`q`、`summary` は従来集合だけを表す。追加手を全方策平均の層化に
+組み込まない。追加手自身が tail サンプルで選ばれることは正しい挙動。
+追加は `roots[i].wide` と `wide_summary` に保存し、schema_version は 2（無効時は 1）。
+raw NPZ は `[従来 K 手, tail, 追加 N 手]`。C/P seed はすべての arm で同じ。
+
+| オプション | 既定 | 意味 |
+|---|---:|---|
+| `--wide-candidates` | 0 | 根あたりの追加手数上限。推奨 8 |
+| `--wide-method` | prefix-uniform | prefix-uniform / tempered |
+| `--wide-temperature` | 2 | tempered の温度。1 より大きいと平坦化 |
+| `--wide-max-pi` | .01 | 採用する完全パスの joint π 上限（以下を採用） |
+| `--wide-draws` | 1024 | 根あたりの proposal 試行上限。推奨開始値 256 |
+
+`prefix-uniform` は各 prefix の**合法分岐**を一様に選んで external decision が
+完了するまで進む。**完全な合法手集合からの一様分布ではない**。分岐数・深さの
+違いが proposal 確率に影響する。`tempered` も prefix ごとに
+`π(choice|prefix)^(1/temperature)` を合法分岐内で正規化する方式で、完全パスの
+`π(a)^(1/T)` 分布とは限らない。いずれも元の joint π は温度をかけずに計算し、
+retained prefix の確率は元の列挙と共有する。π が underflow する合法手も uniform
+proposal から到達でき、`log_pi` で bucket と上限を判定する。
+
+従来候補との重複、追加手同士の重複、π 上限超過を棄却し、採用順を保存する。
+候補生成専用の根別 RNG を使うので collection、chance、continuation RNG を消費しない。
+試行予算内で手数を満たせないと `shortfall`、`draws`、`rejected` を報告する。
+shortfall は合法手を尽くしたという証明ではない。各根の最初の m 手を使うため、
+1・2・4・8…手の結果は独立した実験ではなく入れ子の曲線になる。
+
+### wide 統計の定義
+
+`wide_summary` は `overall/main/response/early/middle/late` と phase×stage の
+各 group に `estimate`、`metric_roots`、`bootstrap_root_95`、
+`bootstrap_deal_pair_95` とそれぞれの valid_fraction を保存する。
+root bootstrap は group 内の根を独立に再抽出する参考区間、deal-pair bootstrap は
+同一 deal の両ゲーム・全根をまとめて再抽出する主区間。どちらも root 加重。
+bootstrap 数は `--bootstrap`、wide の種は `seed+10`。有効 replicate <97.5% は null。
+根ごとの各手・各 fold には crossed MC 分散による normal 95% 区間も保存する。
+
+* `distribution/{bucket}/mean_advantage`: 追加手の `Q(a)-Q(full π)`。
+  各根内で追加手を等重みにし、根間でも等重みにする。π bucket は
+  `<1e-6`、`[1e-6,1e-4)`、`[1e-4,1e-3)`、`[1e-3,.01)`、`≥.01` と all。
+  該当手がある根だけで集計し、`metric_roots` が分母。
+  `actions` は該当根あたり平均手数。`second_moment_mc_corrected` は
+  `mean(Â²-Ω_A)`、`mean_mc_variance` は平均 Ω_A。Ω_A は方策平均との
+  **共分散を含む差の MC 分散**。
+  `observed_cdf_at_{-.5,-.1,0,.1,.5}` は noisy な Â の経験分布。
+  これは真の Q 分布の deconvolution ではなく、0 超の比率も真の改善率ではない。
+  全合法手分布の推定でもない。指定 proposal で得た追加手集合の診断であり、
+  importance weighting による他分布への補正は行わない。
+* `discovery/{m}/heldout_gap`: 元の全候補（実着手を含む）で train Q 最大の手と、
+  最初の `min(m,N)` 追加手で train Q 最大の手を選び、独立 test 象限で
+  `Q(wide選択)-Q(従来選択)` を評価。C/P を両方二分して対角象限を入れ替える
+  2-fold cross-fit の平均。各 fold は `wide.discovery[m]` に保存する。
+  これは**選択手どうし**の比較で、oracle max 同士の gap の不偏推定ではない。
+* `train_positive_fraction` は train gap >0 の fold 比率を根平均した値。
+  `promoted_gap` は train gap >0 の時だけ wide を採用した場合の held-out 改善量
+  （不採用は 0）。集計の `promoted_gap / train_positive_fraction` は、
+  train で採用された root/fold における平均 held-out gap。test の勝敗で条件付けない。
+  `heldout_win_fraction` は test gap >0 の fold 比率の根平均。選択の楽観は避けるが、
+  有限 test 雑音による符号判定の誤りは残る。**真に良い手がある根の割合とは異なる**。
+* `evidence_fraction` は train で選んだ追加手が、test で**元の K 手すべて**を
+  上回る片側 lower bound を持つ fold が一つ以上ある根の割合。
+  各比較は `Δ_j - Φ⁻¹(1-.05/(2K)) sqrt(Ω_Δj) > 0` を要求する。
+  K 比較と 2 folds に Bonferroni 補正した、根・m ごとの近似 5% 検定。
+  分散が負ならその fold は証拠に数えず `evidence_unresolved_fraction` に計上。
+  複数 m・group 間は補正していない。normal 近似依存であり、特に 4×4 の CPU
+  検証では精度の主張に使わない。この割合と区間は「証拠を得た率」の統計であって、
+  真の存在率の信頼区間ではない。未検出を「存在しない」と解釈しない。
+* N=0 の根も `examined`、train/win/evidence 率、promoted gap の分母に残し、0 とする。
+  heldout gap と分布・V 統計は追加手がある根だけ。`has_extra`、`shortfall`、
+  `available_actions` と `metric_roots` を併読する。m 別の `examined` は実際の平均手数。
+* `value/*` は追加手内の Q と、手の直後の V（根 actor 視点、chance 平均）の
+  等重み・根内中心化分散／共分散を、joint crossed MC 共分散で補正した値。
+  根間平均の比から `within_root_correlation/r2` を出す。相関の符号も確認する。
+  m 別 `value_gain_vs_wide_mean` は train の post V 最大で選び、test の Q を
+  同じ m 手の等重み Q 平均と比較する。`value_selected_advantage` はその選択手と
+  full π の比較。V の順位によって改善を選べるかを held-out で直接測る。
+
+wide panel のどこかに失敗・打ち切りがあれば根の wide 統計を除外する。
+従来 panel が完全なら従来統計は維持する。実ゲーム打ち切りは双方の集計から除外。
+失敗・shortfall を黙って置換せず、観測できた条件付き集団であることを明示する。
 
 ## 統計の定義と出力
 
@@ -165,7 +261,7 @@ JSON は根ごとに atomic 更新し、例外・中断時も終了済み根の�
 分母非正・未識別の比は null。bootstrap でも識別不能な replicate を都合よく捨てず、
 `bootstrap_valid_fraction` を併記する。必要局数の上限 null は無限/未解決、
 その他の統計で有効率 <97.5% の区間は null。打ち切りやロード失敗は world 別に
-別計上し、一つでも失敗のある crossed grid の**根全体を統計から除外**する。
+別計上し、一つでも失敗のある従来 crossed grid の**根全体を従来統計から除外**する。
 実ゲーム打ち切りも除外。打ち切りを draw としない。失敗がある測定は条件付き集団の
 診断となり、censoring bias がある。ゼロ失敗または失敗要因の追加調査なしに一般化しない。
 
@@ -175,6 +271,9 @@ JSON は根ごとに atomic 更新し、例外・中断時も終了済み根の�
 python scripts/luck_diagnostic.py --summarize measurements/luck-production.json \
   --bootstrap 5000 --out measurements/luck-production-ci.json
 ```
+
+wide report も同じ `--summarize` で両 summary を再計算する（新たな候補抽出や
+cross-fit 選択は行わず、保存済みの根統計から bootstrap を作り直す）。
 
 運補正への判断材料は chance main と「policy 固定時の残り分散」、CRN 学習への判断材料は
 候補対の分散比・信号・GAE との相関。交互作用が大きいだけでは AIVAT の実現可能な
@@ -208,3 +307,54 @@ early7 / middle4 / late5）、平均候補質量 **.998958**。
 比較用 window モードも確認済み（`luck-cpu-smoke.json`、864 中863終局、打ち切り1を
 別計上し、その根を除外）。CPU 計時は他のテストと並走した参考値。
 コミット・ネットワーク利用・TSUBAME 接続・メインへの書き込みは行わない。
+
+## wide 拡張の検証記録（2026-11-17）
+
+同じ worktree 内でビルド成功、CTest **19/19**、指定 MPS case を除く全 pytest
+**1555 passed, 122 skipped, 1 deselected**（204.23 秒）。既存の read-only
+NumPy→Torch warning 1 件。診断テストは 20 case。
+追加あり／なしで従来 arm の outcome/GAE/post V/next-own V/status/tail index を
+array 完全一致、全従来 metrics と q を辞書／list 完全一致で確認した。
+合法パス replay、重複除外、π 上限、shortfall、両 proposal、確率 underflow でも
+合法手に到達すること、選択・評価象限の分離、MC 共分散、bootstrap の cluster 単位、
+追加手だけ失敗した場合の従来統計維持、CLI の不正値をテストしている。
+HEAD 版との直接比較でも、wide 無効の 4 根について collection・候補・全 raw 配列・
+全根指標・summary が完全一致した（`measurements/luck-wide-legacy-equivalence.log`）。
+wide 無効時の config にも新フィールドを加えず、schema_version=1 を保つ。
+実 checkpoint の CPU report を `--summarize` し直し、両 summary の完全一致も確認した。
+
+JSON は `_json_default` を全 `json.dumps` に適用し、NumPy bool/int/float/ndarray を
+含む初期保存・途中保存・最終保存・`--summarize` とその stdout を確認。
+CUDA device_name 分岐を mock して CPU から保存経路を通した。
+CUDA 推論と bf16 の実機検証はこの macOS では実施していない。
+
+checkpoint を使った小規模 CPU 確認:
+
+```sh
+.venv/bin/python scripts/luck_diagnostic.py \
+  --checkpoint runs/play/m-xit1.pt --device cpu --threads 1 \
+  --games 4 --num-envs 4 --roots-per-game 2 --root-selection reservoir \
+  --chance-repeats 4 --policy-repeats 4 \
+  --max-candidates 8 --candidate-nodes 256 --prefix-batch 8 \
+  --wide-candidates 4 --wide-draws 256 \
+  --world-batch 128 --inference-batch 64 --bootstrap 100 \
+  --out measurements/luck-wide-validation.json
+```
+
+8 根、追加 30 手（根平均 3.75、平均 shortfall .25）、880/880 継続が終局、
+load failure・打ち切り 0。約 72.5 秒、19,033 continuation decisions、約 265 decisions/s。
+以下は deal-pair bootstrap 95% 区間（わずか 2 deal-pairs）:
+
+| 指標 | 点推定 | 区間 |
+|---|---:|---:|
+| 追加手の根平均 `Q−Qπ` | −0.2561 | [−0.5064, −0.0058] |
+| 最大 4 手の cross-fit 選択 gap | −0.2813 | [−0.6875, 0.1250] |
+| held-out gap >0 の fold 率 | 0.125 | [0, 0.25] |
+| 元候補すべてを上回る evidence 率 | 0 | [0, 0] |
+| post V 選択 Q − 追加手平均 Q | 0.0573 | [−0.0365, 0.1510] |
+
+補正した根内 V/Q 相関は 0.6415、区間は識別不足で null。
+**これは m-xit1 の動作確認だけで、ckpt-4500 や低 π 探索の有効性の結論には使わない。**
+特に 0 の evidence 区間は「存在しない」証明ではない。全例ゼロの通常 bootstrap は
+未検出の母集団率を推定できず、小さな crossed grid の検出力も低い。
+JSON、stdout log、raw NPZ は `measurements/luck-wide-validation*` に保存した。
