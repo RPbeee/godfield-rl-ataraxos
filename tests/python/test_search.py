@@ -50,14 +50,16 @@ def test_formula_and_distribution():
     rng = np.random.default_rng(9)
     freq = np.bincount(rng.choice(2, 20000, p=p), minlength=2)/20000
     np.testing.assert_allclose(freq, np.sqrt(rho*pi)/np.sqrt(rho*pi).sum(), atol=.015)
-    for kwargs in (dict(depth=-1), dict(worlds=0), dict(alpha=0, beta=0), dict(beta=float('nan')),
+    for kwargs in (dict(depth=-1), dict(worlds=0), dict(rollouts_per_world=0), dict(rollouts_per_world=-1),
+                   dict(alpha=0, beta=0), dict(beta=float('nan')),
                    dict(leaf_view='invalid'), dict(max_inference_batch=-1), dict(search_cache_device='bad'),
                    dict(search_cache_mb=-1), dict(root_batch_size=-1)):
         with pytest.raises(ValueError):
             SearchConfig(**kwargs)
 
 
-def test_true_hidden_hand_leak():
+@pytest.mark.parametrize('rollouts,crn', [(1, False), (1, True), (4, False)])
+def test_true_hidden_hand_leak(rollouts, crn):
     a = VecEnv(8, 1, 741, track_projection=True)
     b = VecEnv(8, 1, 741, track_projection=True)
     old_labels = b.label_opp_hand.copy()
@@ -66,7 +68,8 @@ def test_true_hidden_hand_leak():
     assert not np.array_equal(old_labels, b.label_opp_hand)
     for key in OBS_FIELDS:
         np.testing.assert_array_equal(getattr(a, key), getattr(b, key))
-    config = SearchConfig(worlds=3, candidates=4, candidate_samples=12, depth=3)
+    config = SearchConfig(worlds=3, candidates=4, candidate_samples=12, depth=3,
+                          rollouts_per_world=rollouts, rollout_crn=crn)
     agents = [SearchAgent(model(), baseline(), config=config, seed=421) for _ in range(2)]
     choices = []
     for agent, env in zip(agents, (a, b)):
@@ -862,3 +865,174 @@ def test_pre_dream_supported_roots_exact_fixture(enabled, kind):
                   search=agent.last_search, counts=dict(agent.counts))
     expected = json.loads((Path(__file__).parent/'fixtures/search_supported_before.json').read_text())
     assert actual == expected[f'{enabled}:{kind}']
+
+
+@pytest.mark.parametrize('crn', [False, True])
+def test_rollout_random_streams_and_batching(monkeypatch, crn):
+    from dataclasses import replace
+    from gfrl.search import _RolloutRandom
+    config = SearchConfig(worlds=3, candidates=4, candidate_samples=12, depth=3,
+                          rollouts_per_world=4 if not crn else 1, rollout_crn=crn)
+    env = VecEnv(2, 1, 741, track_projection=True)
+    reports, candidate_sets = [], []
+    original_uniforms = _RolloutRandom.uniforms
+    for cap, skip in ((0, False), (5, False), (5, True)):
+        agent = SearchAgent(model(), baseline(), config=replace(config, max_inference_batch=cap,
+                                                               skip_forced_inference=skip), seed=421)
+        loaded, streams = [], {}
+        original_load = agent._world_env
+        def load(src, rows, assignments, seeds, depth, role=None):
+            if role == 'rollout':
+                loaded.append((rows.copy(), assignments.copy(), seeds.copy()))
+            return original_load(src, rows, assignments, seeds, depth, role)
+        agent._world_env = load
+        def uniforms(random, rows):
+            draws = original_uniforms(random, rows)
+            for row, draw in zip(rows, draws):
+                streams.setdefault(int(row), []).append(float(draw))
+            return draws
+        monkeypatch.setattr(_RolloutRandom, 'uniforms', uniforms)
+        with _policy_rng(42, (agent,)):
+            agent.search(env, np.arange(2, dtype=np.int32), report_values=True)
+        assert len(loaded) == 1  # All candidates/worlds/rollouts share a workspace.
+        rows, assignments, seeds = loaded[0]
+        assert agent.counts['invalid_candidate_worlds'] == 0
+        assert len(rows) == sum(map(len, agent.last_candidates.values()))*3*config.rollouts_per_world
+        paired = {}
+        for i, seed in enumerate(seeds):
+            paired.setdefault(int(seed), []).append(i)
+        assert len(paired) == 2*3*config.rollouts_per_world
+        comparisons = 0
+        for indices in paired.values():
+            # The engine gets identical chance streams and belief hands for
+            # every candidate copy of (k,r).
+            assert len(indices) > 1
+            for i in indices[1:]:
+                np.testing.assert_array_equal(assignments[i], assignments[indices[0]])
+                assert rows[i] == rows[indices[0]]
+                a, b = streams.get(i, []), streams.get(indices[0], [])
+                n = min(len(a), len(b))
+                assert a[:n] == b[:n]  # Includes diverging path lengths.
+                comparisons += n
+        assert comparisons > 0
+        reports.append(agent.last_search)
+        candidate_sets.append(agent.last_candidates)
+        for report in agent.last_search:
+            for candidate in report['candidates']:
+                assert candidate['valid_worlds'] == 3
+                if config.rollouts_per_world > 1:
+                    assert candidate['valid_rollouts'] == 12
+                    assert len(candidate['world_values']) == 3
+                    values = np.asarray(candidate['rollout_values'])
+                    worlds = np.asarray(candidate['rollout_world_indices'])
+                    assert candidate['q'] == float(values.mean())
+                    np.testing.assert_array_equal(candidate['world_values'],
+                        [values[worlds == w].mean() for w in np.unique(worlds)])
+                    assert candidate['q_se'] == pytest.approx(np.std(candidate['world_values'], ddof=1)/np.sqrt(3))
+        # Every world's r copies share the same belief hand but distinct seeds.
+        for start in range(0, len(rows), config.rollouts_per_world):
+            chunk = assignments[start:start+config.rollouts_per_world]
+            np.testing.assert_array_equal(chunk, np.repeat(chunk[:1], len(chunk), axis=0))
+    for actual in candidate_sets[1:]:
+        for r, items in actual.items():
+            assert [p for p, _ in items] == [p for p, _ in candidate_sets[0][r]]
+            np.testing.assert_allclose([v for _, v in items], [v for _, v in candidate_sets[0][r]],
+                                       atol=2e-6, rtol=2e-6)
+    for actual in reports[1:]:
+        for a, b in zip(actual, reports[0], strict=True):
+            assert a['selected'] == b['selected']
+            for ca, cb in zip(a['candidates'], b['candidates'], strict=True):
+                key = 'rollout_values' if config.rollouts_per_world > 1 else 'world_values'
+                np.testing.assert_allclose(ca[key], cb[key], atol=2e-6, rtol=2e-6)
+
+
+def test_rollout_random_independent_of_row_scheduling():
+    from gfrl.search import _RolloutRandom
+    seeds = np.array([101, 202, 101], np.uint64)
+    batched, staggered = _RolloutRandom(seeds), _RolloutRandom(seeds)
+    reference = np.array([batched.uniforms(np.arange(3)) for _ in range(100)])
+    np.testing.assert_array_equal(reference[:, 0], reference[:, 2])
+    assert not np.array_equal(reference[:, 0], reference[:, 1])
+    for row in (2, 0, 1):
+        actual = [staggered.uniforms(np.array([row]))[0] for _ in range(100)]
+        np.testing.assert_array_equal(actual, reference[:, row])
+    assert ((reference > 0) & (reference < 1)).all()
+
+
+@pytest.mark.parametrize('cap', [0, 2])
+def test_crn_inverse_cdf_respects_policy_and_mask(cap):
+    from types import SimpleNamespace
+    from gfrl.actor import PREFIX_FIELDS
+    from gfrl.search import _SearchActor
+
+    class Policy(torch.nn.Module):
+        def encode(self, obs):
+            return torch.zeros(len(obs['obs_type']), 1, 1)
+
+        def heads(self, tokens, **prefix):
+            probs = torch.zeros(len(tokens), 21)
+            probs[:, 1], probs[:, 3] = .25, .75
+            return probs.log(), torch.zeros(len(tokens), 3)
+
+    class Random:
+        def uniforms(self, rows):
+            # Forced root row 0 must not consume a rollout draw.
+            np.testing.assert_array_equal(rows, [1, 2, 3])
+            return np.array([.1, .3, .9], np.float32)
+
+    buffers = {k: np.zeros((4, 1), np.int32) for k in (*OBS_FIELDS, *PREFIX_FIELDS)}
+    buffers.update(stage=np.zeros(4, np.int32), substep=np.zeros(4, np.int32),
+                   decisions=np.array([0, 1, 1, 1]), num_envs=4)
+    actor = _SearchActor(Policy(), SimpleNamespace(**buffers), 'cpu', max_batch=cap)
+    actor._rollout_random = Random()
+    result = actor.act(np.arange(4))
+    np.testing.assert_array_equal(result.choices, [3, 1, 3, 3])
+    np.testing.assert_allclose(result.log_prob, np.log([.75, .25, .75, .75]), atol=1e-7)
+
+
+def test_rollout_count_preserves_candidate_generation():
+    from dataclasses import replace
+    env = VecEnv(2, 1, 741, track_projection=True)
+    config = SearchConfig(worlds=3, candidates=4, candidate_samples=12, depth=1)
+    candidates = []
+    for rollouts in (1, 4, 8):
+        agent = SearchAgent(model(), baseline(), config=replace(config, rollouts_per_world=rollouts), seed=421)
+        with _policy_rng(42, (agent,)):
+            agent.search(env, np.arange(2, dtype=np.int32))
+        candidates.append((agent.last_candidates, agent.last_policy_paths))
+    assert candidates[0] == candidates[1] == candidates[2]
+
+
+def test_eval_rollout_arguments():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'scripts'))
+    from eval_search import build_parser, validate_args
+    parser = build_parser()
+    args = parser.parse_args(['--checkpoint', 'play.pt', '--belief', 'uniform',
+                              '--rollouts-per-world', '8', '--rollout-crn', '--depth', '1'])
+    config = validate_args(parser, args)
+    assert config.rollouts_per_world == 8 and config.rollout_crn and config.depth == 1
+    args.rollouts_per_world = 0
+    with pytest.raises(SystemExit):
+        validate_args(parser, args)
+
+
+def test_eval_argmax_opponent(monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'scripts'))
+    import eval_search
+    parser = eval_search.build_parser()
+    args = parser.parse_args(['--checkpoint', 'play.pt', '--belief', 'uniform',
+                              '--opponent-select', 'argmax'])
+    eval_search.validate_args(parser, args)
+    monkeypatch.setattr(eval_search, 'load_policy_model', lambda *a: model())
+    seen = []
+    def match(agent, opponent, *a, **kw):
+        seen.append(opponent.sample)
+        return {}
+    monkeypatch.setattr(eval_search, 'evaluate_policies', match)
+    eval_search.run_match(args, object())
+    args.opponent_select = 'sample'
+    eval_search.run_match(args, object())
+    assert seen == [False, True]
+    args.opponent_select, args.opponent_belief = 'argmax', 'b1'
+    with pytest.raises(SystemExit):
+        eval_search.validate_args(parser, args)

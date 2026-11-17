@@ -131,6 +131,8 @@ class GpuSearchAgent(SearchAgent):
                  profile=False, record=False, env_factory=GpuSearchEnv, dtype='fp32', packed_record=False):
         if isinstance(belief, OracleBelief):
             raise ValueError('oracle belief is forbidden in GPU search')
+        if config.rollouts_per_world != 1 or config.rollout_crn:
+            raise ValueError('rollout CRN requires SearchAgent/SearchEnv (eval_search.py supports --device cuda)')
         from ..search_belief import HybridBelief, MixedBelief
         if isinstance(belief, (HybridBelief, MixedBelief)):
             raise ValueError('GPU search currently supports AR, independent and baseline beliefs without mixture/hybrid')

@@ -5,7 +5,8 @@
 `runs/belief-m2166/train/checkpoint.pt` を使用した。
 **8,192局・336,265 searched positionsを952.48秒、353.04 positions/sで生成した。**
 旧約35/s比10.09倍。保存・集計込みの実測であり、異なるseedや長期運転での下限保証ではない。
-CPU SearchAgent/SearchEnv、`third_party/goodfield`、`official_*`は変更していない。
+この2026-11-16のGPU実装ではCPU SearchAgent/SearchEnv、`third_party/goodfield`、`official_*`は変更していない。
+2026-11-17のSearchAgent向け複数rollout/CRNは末尾を参照。
 
 ## 設計
 
@@ -199,4 +200,116 @@ CUDA学習を1 epoch、**37 optimizer updates**まで完了した。`best.pt`・
 - GPU探索・推論・記録: `python/gfrl/gpu/{search.py,search_inference.py,belief_attention.py,packed.py,search_records.py,shard.py}`。
 - 生成・実行・計測: `scripts/{make_distill_data.py,session_distill.sh,bench_gpu_search.sh,summarize_gpu_search.py,compare_search_precision.py,compare_search_shards.py}`。
 - 検証: `tests/python/{test_gpu_search.py,test_gpu_shard.py,helpers/gpu_search_native.py}`、`tests/cpp/gpu_search_fixture.cuh`。
-- 文書: 本書と`scripts/distill.md`。`python/gfrl/{search.py,search_belief.py,distill.py}`、既存learnerは変更なし。
+- 文書: 本書と`scripts/distill.md`。2026-11-16のGPU実装では`python/gfrl/{search.py,search_belief.py,distill.py}`、既存learnerは変更なし。
+
+## 2026-11-17: SearchAgentの世界あたり複数rolloutと共通乱数
+
+`scripts/eval_search.py`と公式bot/advisorの共通`SearchAgent`に
+`--rollouts-per-world R`（正整数、既定1）を追加した。
+beliefは従来どおりK世界をサンプルし、候補生成後に各世界をR本へ展開する。
+候補生成の64サンプル、重複除去、上位16候補はRで変わらない。
+各候補のqは有効な全(k,r)の葉value/終局結果の平均。
+`--depth`は従来どおりroot後の外部決定数なので、浅いdepthと大きいRを組み合わせられる。
+
+- R>1ではchanceとrollout方策の両方を候補間で同期する。
+  chanceは同じ(k,r)の全候補に同じエンジンseedを渡す。
+  r=0は従来の世界seed、残りのrは別seedを使い、相手手札assignmentは同じ世界内で共有する。
+- 方策はseedを別の定数でdomain分離し、SplitMix64のcounterから一様乱数を作る。
+  候補ごとのrollout方策サブステップで1個ずつ消費し、その候補の分布の逆CDFでサンプルする。
+  強制するroot手は消費しない。別候補の経路長、終了、推論chunkによって乱数列はずれない。
+  分岐後の分布やchance事象が違えば、同じ乱数列から異なる結果になる。
+- R=1既定では従来のTorch multinomialと乱数消費順を維持する。
+  `--rollout-crn`を付けるとR=1でも方策CRNを有効にできる。R>1ではこのフラグなしでも有効。
+  最終選択の`--select`、正則化alpha/beta、葉view、未対応rootのfallbackは従来どおり。
+- 全候補×世界×rolloutを1つのSearchEnvに載せ、推論もまとめる。
+  `--max-inference-batch`でNNのchunk、`--root-batch-size`で同時root数を制限できる。
+  メモリとrollout計算量はおおむねRに比例する。beliefと候補生成をR回繰り返さない。
+- `valid_worlds`は有効な異なる世界数のまま。R>1のreportには`rollouts_per_world`と
+  候補ごとの`valid_rollouts`を追加する。既存counterの`rollout_worlds`は候補×世界×Rのjob数。
+  `report_values=True`では`rollout_values`/`rollout_world_indices`も返し、
+  `world_values`は世界ごとのrollout平均、`q_se`は世界平均の標準誤差にする。
+  同じ世界のR本を独立したbelief世界とみなして標準誤差を過小評価しない。
+
+公開OBS_FIELDS以外を推論に追加していない。相手の真の非公開手札は探索根・公式botに渡さない。
+oracleは従来どおりoffline診断だけで、公式bot/advisorは拒否する。
+`third_party/goodfield`は無変更。
+
+この機能はCPUエンジンの`SearchAgent/SearchEnv`用。
+`eval_search.py --device cuda`はこのエンジンとCUDA推論の組合せなので利用できる。
+別実装の`GpuSearchAgent`（`--env-backend cuda`の蒸留生成）は未対応で、
+R>1/方策CRNを明示的に拒否する。設定を無視してR=1で動くことを防ぐ。
+
+公式botは既存の起動引数に、例えば以下を追加する（CPUで実行可能）。
+
+```bash
+--search --worlds 16 --depth 1 --rollouts-per-world 4 --greedy
+```
+
+### CPU計測
+
+macOS arm64、Torch 2.15.0、CPU 1 thread、policy
+`runs/play/m-lr1e5-4500.pt`（幅256・6層）、AR belief
+`runs/belief-m2166/train/checkpoint.pt`、fit `runs/belief-m2166/fit.pt`。
+単一の対応main rootの`search()`を計時し、belief・候補生成・rollout・葉value・最終選択を含む。
+モデルロードと実対局rootの方策推論は除外。各設定1回warmup後、同じ3初期局面
+（seed 741–743）で測り、中央値を取った。上限16候補、64候補サンプル、NN chunk=128。
+実際の重複除去後の候補数は各設定とも[1,2,2]。
+
+| 予算 | R=1（従来） | R=4（CRN） | R=8（CRN） |
+|---|---:|---:|---:|
+| w16d3 | 99.663 ms | 288.551 ms（2.90倍） | 549.018 ms（5.51倍） |
+| w16d1 | 57.160 ms | 154.514 ms（2.70倍） | 282.286 ms（4.94倍） |
+
+この小規模な初期局面計測ではR倍未満の遅延だった。16候補が残る中盤やCUDAの速度は未測定。
+生データは[search_rollouts_cpu_20261117.json](../measurements/search_rollouts_cpu_20261117.json)。
+再現コマンド:
+
+```bash
+.venv/bin/python scripts/bench_rollout_crn.py \
+  --out measurements/search_rollouts_cpu_20261117.json
+```
+
+検証結果: Release build成功、`ctest --test-dir build`は18/18 passed。
+指定のpytestコマンド（storage training equivalenceのMPS 1件をdeselect）は
+**1434 passed / 122 skipped / 1 deselected**。既存の凍結fixtureは変更せず通過した。
+追加検証は候補間chance seed/方策乱数列の一致、非同期row実行と推論chunkによる不変性、
+逆CDFとmask、Rによらない候補集合、(k,r)平均、公式main/responseの実手札非依存性。
+R=4・探索/相手argmaxのCPU CLIスモークも2局完走し、world load・候補適用・
+実対局行動の不一致は0だった。GPUハードウェアの検証は行っていない。
+
+### TSUBAMEでの勝率比較（未実行）
+
+compute shellで以下を実行する。各設定2000 pairs（4000局）、同じseed・checkpoint・対戦相手。
+`--select argmax`は探索の最終選択、追加の`--opponent-select argmax`は探索なしの対戦相手の
+各方策サブステップをargmaxにする。相手選択の既定は従来どおりsample。
+rollout中の方策は引き続きsamplingする。
+
+```bash
+run_case() {
+  local search_depth=$1 search_rollouts=$2 search_tag=$3
+  shift 3
+  .venv/bin/python scripts/eval_search.py \
+    --checkpoint runs/hp-lr1e5/ckpt-4500.pt \
+    --belief runs/belief-m2166/train/checkpoint.pt \
+    --fit runs/belief-m2166/fit.pt \
+    --opponent policy --opponent-select argmax --select argmax --device cuda \
+    --pairs 2000 --seed 741 --num-envs 32 --threads 4 \
+    --worlds 16 --depth "$search_depth" --rollouts-per-world "$search_rollouts" \
+    --candidates 16 --candidate-samples 64 --alpha .002 --beta .02 \
+    --root-batch-size 1 --max-inference-batch 512 "$@" \
+    --out "measurements/search-rollouts/w16d${search_depth}r${search_rollouts}-${search_tag}.json"
+}
+run_case 3 1 legacy
+run_case 3 1 crn --rollout-crn
+run_case 3 4 crn
+run_case 3 8 crn
+run_case 2 4 crn
+run_case 1 2 crn
+run_case 1 4 crn
+run_case 1 8 crn
+```
+
+まずd3R1の従来/CRNで同期だけの影響を分離する。
+d3R1対d1R2、d3R4対d1R8はrootを含む外部決定予算K×R×(depth+1)が等しい。
+葉推論・root候補生成・経路長も時間に影響するため、実際の秒/searchも併記して比較する。
+CUDA推論の精度・勝率・時間はClaudeの実機計測で確認する。

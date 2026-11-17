@@ -81,7 +81,8 @@ def models(tmp_path):
 
 @pytest.mark.parametrize('response', [False, True, 'recorded', 'batched'])
 @pytest.mark.parametrize('belief_kind', ['uniform', 'ar'])
-def test_wire_truth_cannot_reach_belief_or_search(models, response, belief_kind):
+@pytest.mark.parametrize('rollouts', [1, 4])
+def test_wire_truth_cannot_reach_belief_or_search(models, response, belief_kind, rollouts):
     model, ar_path = models
     sequence = (json.loads((DATA/'wire-game-updates-v73.json').read_text())['updates'][:2]
                 if response == 'recorded' else None)
@@ -113,7 +114,8 @@ def test_wire_truth_cannot_reach_belief_or_search(models, response, belief_kind)
                 return sample
             belief.sample = spy
         agent = SearchAgent(model, belief, config=SearchConfig(worlds=2, depth=1,
-            candidates=3, candidate_samples=8, search_response=True, select='argmax'), seed=17)
+            candidates=3, candidate_samples=8, search_response=True, select='argmax',
+            rollouts_per_world=rollouts), seed=17)
         agent.actor.sample = False
         with _policy_rng(31, (agent,)):
             advice = advise(result, agent, search=True)
@@ -264,13 +266,15 @@ def test_cli_defaults_and_validation():
         assert args.belief == 'uniform' and args.device == 'cpu' and args.threads == 1
         assert config == (SearchConfig(depth=3, candidates=8) if advisor else SearchConfig())
         configured = parser.parse_args(['--belief', 'path.pt', '--fit', 'fit.pt', '--worlds', '8',
-            '--depth', '1', '--candidates', '4', '--candidate-samples', '12', '--alpha', '.01',
+            '--depth', '1', '--rollouts-per-world', '4', '--rollout-crn',
+            '--candidates', '4', '--candidate-samples', '12', '--alpha', '.01',
             '--beta', '.03', '--leaf-view', 'searcher', '--search-response', '--device', 'mps', '--threads', '2'])
         configured.greedy = True
         c = search_config(configured)
         assert (c.worlds, c.depth, c.candidates, c.candidate_samples, c.select) == (8,1,4,12,'argmax')
         assert c.search_response and c.leaf_view == 'searcher'
-        for key, invalid in [('belief','oracle'), ('threads',0), ('alpha',float('nan')), ('worlds',0)]:
+        assert c.rollouts_per_world == 4 and c.rollout_crn
+        for key, invalid in [('belief','oracle'), ('threads',0), ('alpha',float('nan')), ('worlds',0), ('rollouts_per_world',0)]:
             bad = deepcopy(args); setattr(bad, key, invalid)
             with pytest.raises(ValueError): search_config(bad)
 

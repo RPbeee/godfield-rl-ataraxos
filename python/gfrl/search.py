@@ -40,9 +40,11 @@ class SearchConfig:
     search_cache_mb: int = 256
     root_batch_size: int = 0  # distribution preserving; changes RNG ordering
     search_response: bool = False
+    rollouts_per_world: int = 1
+    rollout_crn: bool = False  # R > 1 always enables policy CRN; opt in for R=1
 
     def __post_init__(self):
-        if min(self.worlds, self.candidates, self.candidate_samples, self.max_attempts) <= 0 or self.depth < 0:
+        if min(self.worlds, self.candidates, self.candidate_samples, self.max_attempts, self.rollouts_per_world) <= 0 or self.depth < 0:
             raise ValueError('positive search budgets and nonnegative depth required')
         if not np.isfinite([self.alpha, self.beta]).all() or min(self.alpha, self.beta) < 0 or self.alpha+self.beta <= 0:
             raise ValueError('finite nonnegative alpha/beta with positive sum required')
@@ -122,6 +124,30 @@ def search_support(env, rows, search_response=False):
     return support
 
 
+class _RolloutRandom:
+    """Per-(world, rollout) uniform streams, shared across candidate copies.
+
+    SplitMix64 counter hashing avoids a Python RNG per job. Only actual policy
+    substeps consume draws, so forced roots, inactive rows, inference chunks and
+    other candidates' path lengths cannot shift a candidate's random sequence.
+    Chance uses the engine's separate RNG with the same per-pair seeds.
+    """
+    def __init__(self, seeds):
+        self.seeds = np.asarray(seeds, np.uint64)
+        self.cursor = np.zeros(len(seeds), np.uint64)
+
+    def uniforms(self, rows):
+        with np.errstate(over='ignore'):
+            x = (self.seeds[rows] ^ np.uint64(0xD1B54A32D192ED03)) + (
+                self.cursor[rows]+np.uint64(1))*np.uint64(0x9E3779B97F4A7C15)
+            x = (x ^ (x >> 30))*np.uint64(0xBF58476D1CE4E5B9)
+            x = (x ^ (x >> 27))*np.uint64(0x94D049BB133111EB)
+            x ^= x >> 31
+        self.cursor[rows] += np.uint64(1)
+        # 24 bits, strictly inside (0, 1), exactly representable as float32.
+        return ((x >> 41).astype(np.float32)+np.float32(.5))*np.float32(2**-23)
+
+
 class _SearchActor(Actor):
     """Bound search inference workspace with a budgeted decision encoding cache.
 
@@ -145,10 +171,12 @@ class _SearchActor(Actor):
 
     @torch.inference_mode()
     def act(self, rows=None, *, observation_groups=None, **kwargs):
-        if not self.max_batch:
+        random = getattr(self, '_rollout_random', None)
+        if not self.max_batch and random is None:
             return super().act(rows, observation_groups=observation_groups, **kwargs)
         env = self.env
         active = np.flatnonzero(env.stage >= 0) if rows is None else np.asarray(rows)
+        batch = self.max_batch or max(len(active), 1)
         fresh = active[env.substep[active] == 0]
         if np.any(~self._cached[active] & (env.substep[active] != 0)):
             raise RuntimeError('attach Actor at the start of a decision (substep == 0)')
@@ -162,8 +190,8 @@ class _SearchActor(Actor):
             _, first, inverse = np.unique(np.asarray(observation_groups)[fresh], return_index=True, return_inverse=True)
             encode_rows = fresh[first]
         # Expand duplicate encodings a chunk at a time into the bounded cache.
-        for lo in range(0, len(encode_rows), self.max_batch):
-            rr = encode_rows[lo:lo+self.max_batch]
+        for lo in range(0, len(encode_rows), batch):
+            rr = encode_rows[lo:lo+batch]
             since = clock()
             obs = tensor_batch({k: getattr(env, k)[rr] for k in OBS_FIELDS}, self.device)
             timings['transfer'] += clock()-since
@@ -187,8 +215,8 @@ class _SearchActor(Actor):
             del obs, encoded
         self._cached[fresh] = True
         lp_parts, value_parts = [], []
-        for lo in range(0, len(active), self.max_batch):
-            rr = active[lo:lo+self.max_batch]
+        for lo in range(0, len(active), batch):
+            rr = active[lo:lo+batch]
             since = clock()
             tokens = self.token_cache.index_select(
                 0, torch.as_tensor(rr, device=self.token_cache.device)).to(self.device)
@@ -206,7 +234,15 @@ class _SearchActor(Actor):
         all_lp = np.zeros((env.num_envs, 21), np.float32)
         if len(active):
             lp, vl = torch.cat(lp_parts), torch.cat(value_parts)
-            action = torch.multinomial(lp.exp(), 1).squeeze(1) if self.sample else lp.argmax(-1)
+            if self.sample and random is not None:
+                uniforms = np.full(len(active), .5, np.float32)
+                take = env.decisions[active] != 0
+                uniforms[take] = random.uniforms(active[take])
+                cdf = lp.exp().cumsum(-1)
+                threshold = torch.as_tensor(uniforms, device=self.device)*cdf[:, -1]
+                action = (cdf <= threshold[:, None]).sum(-1).clamp_max(lp.shape[-1]-1)
+            else:
+                action = torch.multinomial(lp.exp(), 1).squeeze(1) if self.sample else lp.argmax(-1)
             choices[active] = action.cpu().numpy()
             log_prob[active] = lp.gather(1, action[:, None]).squeeze(1).cpu().numpy()
             values[active], all_lp[active] = vl.cpu().numpy(), lp.cpu().numpy()
@@ -449,7 +485,8 @@ class SearchAgent:
         For repeated q measurements, pass last_candidates as fixed_candidates
         and last_policy_paths as policy_paths. Paths, order and log priors stay
         fixed; hidden worlds, chance seeds and rollout actions are resampled.
-        report_values adds per-world leaves and their sample standard error.
+        report_values adds per-world mean leaves and their sample standard error
+        (worlds are clusters when R > 1), plus individual rollout leaves for R > 1.
         The caller isolates Torch RNG (as __call__ does with _policy_rng).
         """
         c = self.config
@@ -539,6 +576,19 @@ class SearchAgent:
         # Diagnostics requesting q/world values always execute full rollouts.
         singleton = {r for r, items in candidates.items() if len(items) == 1
                      and c.skip_single_candidate and not report_values}
+        # Expand only after candidate generation: the K belief assignments and
+        # candidate paths/priors do not depend on R. World-major, rollout-minor
+        # order makes all K*R jobs one inference batch, with shared pair seeds
+        # across candidates. Preserve the original chance seed for r=0.
+        if c.rollouts_per_world > 1:
+            pair_seeds = np.empty((len(rr), c.rollouts_per_world), np.uint64)
+            pair_seeds[:, 0] = seeds
+            pair_seeds[:, 1:] = self.rng.integers(0, np.iinfo(np.uint64).max,
+                                                (len(rr), c.rollouts_per_world-1), dtype=np.uint64)
+            rr = np.repeat(rr, c.rollouts_per_world)
+            assignments = np.repeat(assignments, c.rollouts_per_world, axis=0)
+            seeds = pair_seeds.ravel()
+            groups = {int(r): np.flatnonzero(rr == r) for r in roots}
         jobs = [(r, path, priors, int(w)) for r, items in candidates.items()
                 for path, priors in items for w in groups[r]]
         self.seconds['candidate'] += self._time()-start
@@ -549,6 +599,7 @@ class SearchAgent:
         self.counts['singleton_roots'] += len(singleton)
         self.counts['rollout_roots'] += sum(bool(items) and r not in singleton for r, items in candidates.items())
         aggregated = {}
+        self._valid_rollout_worlds = {}
         for fast in (True, False):
             subset = [j for j in jobs if (j[0] in singleton) == fast]
             if subset:
@@ -560,9 +611,11 @@ class SearchAgent:
             kept = []
             for path, priors in items:
                 samples = aggregated.get((r, path), [])
-                self.last_candidate_diagnostics[r]["valid_worlds"].append(len(samples))
+                nw = (len(set(self._valid_rollout_worlds.get((r, path), [])))
+                      if c.rollouts_per_world > 1 else len(samples))
+                self.last_candidate_diagnostics[r]["valid_worlds"].append(nw)
                 if samples:
-                    kept.append((path, priors, float(np.mean(samples)), len(samples)))
+                    kept.append((path, priors, float(np.mean(samples)), nw))
             if not kept:
                 continue
             probs = search_distribution([x[2] for x in kept], [x[1][1] for x in kept], [x[1][0] for x in kept], c.alpha, c.beta)
@@ -571,6 +624,10 @@ class SearchAgent:
             self.counts['policy_disagreements'] += kept[pick][0] != policy_paths.get(r)
             selected_paths[r] = kept[pick][0]
             reports.append(dict(row=r, candidates=[dict(path=list(x[0]), log_pi=x[1][0], log_rho=x[1][1], q=None if r in singleton else x[2], valid_worlds=x[3]) for x in kept], probabilities=probs.tolist(), selected=list(kept[pick][0])))
+            if c.rollouts_per_world > 1:
+                reports[-1]['rollouts_per_world'] = c.rollouts_per_world
+                for candidate in reports[-1]['candidates']:
+                    candidate['valid_rollouts'] = len(aggregated[(r, tuple(candidate['path']))])
         if self.record:
             for report in reports:
                 r = report['row']
@@ -585,7 +642,13 @@ class SearchAgent:
             for report in reports:
                 report['policy_path'] = list(policy_paths.get(report['row'], ()))
                 for candidate in report['candidates']:
-                    samples = aggregated[(report['row'], tuple(candidate['path']))]
+                    key = (report['row'], tuple(candidate['path']))
+                    samples = aggregated[key]
+                    if c.rollouts_per_world > 1:
+                        worlds = np.asarray(self._valid_rollout_worlds[key])
+                        candidate['rollout_values'] = list(samples)
+                        candidate['rollout_world_indices'] = worlds.tolist()
+                        samples = [float(np.mean(np.asarray(samples)[worlds == w])) for w in np.unique(worlds)]
                     candidate['world_values'] = list(samples)
                     candidate['q_se'] = float(np.std(samples, ddof=1)/np.sqrt(len(samples))) if len(samples) > 1 else None
         for report in reports:
@@ -601,6 +664,8 @@ class SearchAgent:
         env, status = self._world_env(src, rr[wi], assignments[wi], seeds[wi], 1 if singleton else c.depth+1, role="singleton" if singleton else "rollout")
         actor = _SearchActor(self.model, env, self.device, profile=self.profile, max_batch=c.max_inference_batch,
                                  cache_device=c.search_cache_device, cache_mb=c.search_cache_mb)
+        if c.rollout_crn or c.rollouts_per_world > 1:
+            actor._rollout_random = _RolloutRandom(seeds[wi])
         actor._search_root_groups = None if c.skip_forced_inference or singleton else rr[wi]
         valid = status == 0
         cursor = np.zeros(len(jobs), int)
@@ -644,6 +709,8 @@ class SearchAgent:
             for i, (r, path, _, _) in enumerate(jobs):
                 if valid[i]:
                     aggregated.setdefault((r, path), []).append(0.)
+                    if c.rollouts_per_world > 1:
+                        self._valid_rollout_worlds.setdefault((r, path), []).append(jobs[i][3]//c.rollouts_per_world)
             return aggregated
         start = self._time()
         values = env.result.astype(np.float64).copy()
@@ -676,6 +743,8 @@ class SearchAgent:
         for i, (r, path, _, _) in enumerate(jobs):
             if valid[i]:
                 aggregated.setdefault((r, path), []).append(values[i])
+                if c.rollouts_per_world > 1:
+                    self._valid_rollout_worlds.setdefault((r, path), []).append(jobs[i][3]//c.rollouts_per_world)
         return aggregated
 
     @torch.inference_mode()

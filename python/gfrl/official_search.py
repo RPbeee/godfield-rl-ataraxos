@@ -12,7 +12,7 @@ def add_search_arguments(parser, *, advisor=False):
     defaults = SearchConfig()
     parser.add_argument('--belief', default='uniform', help='uniform / b1 / belief checkpoint (oracle forbidden)')
     parser.add_argument('--fit')
-    for name in ('worlds', 'depth', 'candidates', 'candidate_samples'):
+    for name in ('worlds', 'rollouts_per_world', 'depth', 'candidates', 'candidate_samples'):
         default = (dict(depth=3, candidates=8).get(name, getattr(defaults, name))
                    if advisor else getattr(defaults, name))
         parser.add_argument('--'+name.replace('_', '-'), type=int, default=default)
@@ -20,6 +20,8 @@ def add_search_arguments(parser, *, advisor=False):
         parser.add_argument('--'+name, type=float, default=getattr(defaults, name))
     parser.add_argument('--leaf-view', choices=('actor', 'searcher'), default='actor')
     parser.add_argument('--search-response', action='store_true')
+    parser.add_argument('--rollout-crn', action='store_true',
+                        help='synchronize rollout policy draws at R=1; always enabled at R>1')
     parser.add_argument('--device', choices=('cpu', 'mps'), default='cpu')
     parser.add_argument('--threads', type=int, default=1)
 
@@ -32,7 +34,7 @@ def search_config(args):
     if args.threads < 1:
         raise ValueError('threads must be positive')
     return SearchConfig(**{k: getattr(args, k) for k in (
-        'worlds', 'depth', 'candidates', 'candidate_samples', 'alpha', 'beta', 'leaf_view', 'search_response')},
+        'worlds', 'rollouts_per_world', 'rollout_crn', 'depth', 'candidates', 'candidate_samples', 'alpha', 'beta', 'leaf_view', 'search_response')},
         select='argmax' if args.greedy else 'sample')
 
 

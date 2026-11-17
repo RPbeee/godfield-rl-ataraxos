@@ -25,18 +25,22 @@ def build_parser(*, sweep=False):
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--opponent', choices=('policy', 'greedy'), default='policy')
     p.add_argument('--opponent-checkpoint')
+    p.add_argument('--opponent-select', choices=('sample', 'argmax'), default='sample',
+                   help='action selection for the policy opponent without search (default: sample)')
     if not sweep:
         p.add_argument('--opponent-belief', help='enable opponent search with this belief and the same search config')
     p.add_argument('--belief', required=True,
                    help='checkpoint path, b1, uniform, or oracle (evaluation-only diagnostic; cheats using true opponent hands)')
     add_belief_arguments(p, sweep=sweep, offline=True)
     p.add_argument('--fit', help='B1 fitting data (optional count prior for uniform)')
-    for name, default in (('worlds', 16), ('candidates', 16), ('candidate-samples', 64), ('depth', 10),
+    for name, default in (('worlds', 16), ('rollouts-per-world', 1), ('candidates', 16), ('candidate-samples', 64), ('depth', 10),
                           ('pairs', 500), ('num-envs', 32), ('threads', 1), ('seed', 0)):
         multiple = sweep and name in ('worlds', 'depth')
         p.add_argument('--'+name, type=int, default=[default] if multiple else default,
                        **({'nargs': '+'} if multiple else {}))
     p.add_argument('--search-response', action='store_true', help='search supported ordinary response roots')
+    p.add_argument('--rollout-crn', action='store_true',
+                   help='synchronize rollout policy draws also at R=1 (always enabled at R>1)')
     p.add_argument('--leaf-view', choices=('actor', 'searcher'), default=['actor'] if sweep else 'actor',
                    **({'nargs': '+'} if sweep else {}))
     p.add_argument('--max-inference-batch', type=int, default=0,
@@ -71,6 +75,8 @@ def validate_args(p, args):
         p.error('progress-interval must be finite and nonnegative')
     if getattr(args, 'opponent_belief', None) and args.opponent != 'policy':
         p.error('--opponent-belief requires --opponent policy')
+    if args.opponent_select != 'sample' and (args.opponent != 'policy' or getattr(args, 'opponent_belief', None)):
+        p.error('--opponent-select argmax requires --opponent policy without --opponent-belief')
     try:
         validate_variants(**variant_options(args))
         if getattr(args, 'diagnostic_true_hand_nll', False) and (not args.fit or getattr(args, 'diagnostic_belief', args.belief) in ('uniform', 'b1', 'oracle')):
@@ -81,7 +87,7 @@ def validate_args(p, args):
 
 
 def search_config(args):
-    config_fields = ('search_response', 'worlds', 'candidates', 'candidate_samples', 'depth', 'alpha', 'beta',
+    config_fields = ('search_response', 'worlds', 'rollouts_per_world', 'rollout_crn', 'candidates', 'candidate_samples', 'depth', 'alpha', 'beta',
                      'select', 'leaf_view', 'max_inference_batch', 'skip_forced_inference',
                      'skip_single_candidate', 'search_cache_device', 'search_cache_mb', 'root_batch_size')
     return SearchConfig(**{k: getattr(args, k) for k in config_fields})
@@ -127,7 +133,8 @@ def run_match(args, agent, callback=None):
                                    args.device, config=search_config(args), seed=args.seed+1,
                                    num_threads=args.threads, profile=args.profile)
         else:
-            opponent = Actor(opponent_model, VecEnv(1, 1, eval_pairs=0), args.device)
+            opponent = Actor(opponent_model, VecEnv(1, 1, eval_pairs=0), args.device,
+                             sample=args.opponent_select == 'sample')
         return evaluate_policies(agent, opponent, args.pairs, args.num_envs, args.threads,
                                     args.seed, track_projection=True, progress=callback,
                                     progress_interval_s=args.progress_interval)

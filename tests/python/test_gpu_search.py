@@ -26,6 +26,12 @@ from gfrl.search import SearchAgent, SearchConfig, search_distribution
 from helpers.gpu_search_native import NativeEnv
 
 
+@pytest.mark.parametrize('config', [SearchConfig(rollouts_per_world=4), SearchConfig(rollout_crn=True)])
+def test_device_search_rejects_unimplemented_rollout_crn(config):
+    with pytest.raises(ValueError, match='rollout CRN requires SearchAgent/SearchEnv'):
+        GpuSearchAgent(None, None, 'cpu', config=config)
+
+
 @lru_cache(None)
 def cuda_fixture_module(device):
     module = Module(build_source(search=True)+(ROOT/'tests/cpp/gpu_search_fixture.cuh').read_text())
