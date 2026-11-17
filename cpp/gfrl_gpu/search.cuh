@@ -32,6 +32,7 @@ void clear_world(Env& e,Outputs o,int i,int k) {
     for(int j=0;j<t*C;++j)o.obs_cat[i*t*C+j]=0;
     for(int j=0;j<t*F;++j)o.obs_num[i*t*F+j]=0;
     for(int j=0;j<297;++j)o.label_opp_hand[i*297+j]=0;o.label_opp_hand_count[i]=0;
+    for(int j=0;j<297;++j)o.label_opp_unused_hand[i*297+j]=0;o.label_opp_unused_hand_count[i]=0;
 }
 }
 extern "C" __global__ void gpu_search_init(void* storage,void** pointers,int n,int history_len,unsigned long long seed,bool canonical,void* heaps,unsigned arena_bytes,void* pool,bool search,int depth,long long games,unsigned long long eval_seed) {

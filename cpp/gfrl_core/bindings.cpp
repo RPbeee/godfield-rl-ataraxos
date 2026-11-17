@@ -334,6 +334,8 @@ NB_MODULE(_core, m) {
     cls.def_prop_ro("obs_num",[](VecEnv& e){return view(e,e.obs_num.data(),{e.num_envs,e.tokens,F});});
     cls.def_prop_ro("label_opp_hand",[](VecEnv& e){return view(e,e.label_opp_hand.data(),{e.num_envs,297});},"特権情報。方策の入力に使わないこと");
     cls.def_prop_ro("label_opp_hand_count",[](VecEnv& e){return view(e,e.label_opp_hand_count.data(),{e.num_envs});},"特権情報。方策の入力に使わないこと");
+    cls.def_prop_ro("label_opp_unused_hand",[](VecEnv& e){return view(e,e.label_opp_unused_hand.data(),{e.num_envs,297});},"Training-only true unused opponent hand");
+    cls.def_prop_ro("label_opp_unused_hand_count",[](VecEnv& e){return view(e,e.label_opp_unused_hand_count.data(),{e.num_envs});},"Training-only unused opponent count");
     m.def("evaluate_bots",[](const std::string& a,const std::string& b,std::size_t pairs,std::size_t threads,std::uint64_t seed){
         std::vector<EvalResult> results;
         {nb::gil_scoped_release release;results=evaluate_bots(controller(a),controller(b),pairs,threads,seed);}

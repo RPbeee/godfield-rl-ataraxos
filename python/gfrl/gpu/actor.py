@@ -12,11 +12,12 @@ MAX_POLICY_STAGES = 22
 
 
 class GpuActor:
-    def __init__(self, model, env, *, sample=True, dtype='bf16', packed=None):
+    def __init__(self, model, env, *, sample=True, dtype='bf16', packed=None, privileged_labels=False):
         if dtype not in ('fp32', 'fp16', 'bf16'):
             raise ValueError('dtype must be fp32, fp16, or bf16')
         self.model = model.to(device=env.device, dtype=torch.float32).eval()
         self.env, self.sample, self.dtype = env, sample, dtype
+        self.privileged_labels = privileged_labels
         self._graphs = {}
         self._execute = torch.ones((), dtype=torch.bool, device=env.device)
         if packed is None:
@@ -73,6 +74,9 @@ class GpuActor:
             trajectory = {k:getattr(env,k).clone() for k in (*OBS_FIELDS, 'actor_seat', 'episode_id',
                                                            'label_opp_hand', 'label_opp_hand_count')}
             trajectory['stages'] = []
+            if self.privileged_labels:
+                from ..critic import PRIVILEGED_FIELDS
+                trajectory.update({k: getattr(env, k).clone() for k in PRIVILEGED_FIELDS})
         for _ in range(MAX_POLICY_STAGES):
             choices, lp, value = self.act(encoded,active=~finished,value_logits=values)
             if record:
@@ -131,8 +135,11 @@ class GpuActor:
 class RoutedGpuActor(GpuActor):
     """Freeze game/seat routing for all stages of one external decision."""
     def __init__(self, model, env, *, opponents, opponent_seat, opponent_policy,
-                 sample=True, dtype='bf16'):
-        super().__init__(model, env, sample=sample, dtype=dtype)
+                 sample=True, dtype='bf16', privileged_labels=False, pool_epsilon=0.):
+        if not 0 <= pool_epsilon <= 1:
+            raise ValueError('pool_epsilon must be in [0,1]')
+        super().__init__(model, env, sample=sample, dtype=dtype, privileged_labels=privileged_labels)
+        self.pool_epsilon = pool_epsilon
         self.opponent_seat, self.opponent_policy = opponent_seat, opponent_policy
         self.opponents = {key: GpuActor(policy, env, sample=sample, dtype=dtype)
                           for key, policy in opponents.items()}
@@ -163,6 +170,14 @@ class RoutedGpuActor(GpuActor):
                         k: getattr(self.env, k) for k in PREFIX_FIELDS})
             lp = torch.where(rows[:, None], probs, lp)
             value = torch.where(rows[:, None], values, value)
+        if self.pool_epsilon:
+            from ..noise import epsilon_log_probs
+            opponent_rows = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device)
+            for actor, rows, _, _ in encoded:
+                if actor is not self:
+                    opponent_rows |= rows
+            noisy = epsilon_log_probs(lp, self.env.mask, self.pool_epsilon)
+            lp = torch.where(opponent_rows[:, None], noisy, lp)
         choices = torch.multinomial(lp.exp(), 1).squeeze(1) if self.sample else lp.argmax(-1)
         return choices.to(torch.int32), lp, value
 
@@ -177,7 +192,8 @@ class ParallelGpuActor:
     round=GpuActor.round
 
     def __init__(self,model,env,*,streams=2,sample=True,dtype='bf16',
-                 opponents=None,opponent_seat=None,opponent_policy=None):
+                 opponents=None,opponent_seat=None,opponent_policy=None,
+                 privileged_labels=False,pool_epsilon=0.):
         if not 1<=streams<=env.num_envs:
             raise ValueError('streams must be in 1..num_envs')
         self.model,self.env,self.dtype=model,env,dtype
@@ -188,10 +204,11 @@ class ParallelGpuActor:
         for i in range(streams):
             start=env.num_envs*i//streams;stop=env.num_envs*(i+1)//streams
             view=env._slice(start,stop)
-            actor=(GpuActor(model,view,sample=sample,dtype=dtype) if not opponents else
+            actor=(GpuActor(model,view,sample=sample,dtype=dtype,privileged_labels=privileged_labels) if not opponents else
                    RoutedGpuActor(model,view,sample=sample,dtype=dtype,opponents=opponents,
                                   opponent_seat=opponent_seat[start:stop],
-                                  opponent_policy=opponent_policy[start:stop]))
+                                  opponent_policy=opponent_policy[start:stop],
+                                  privileged_labels=privileged_labels,pool_epsilon=pool_epsilon))
             actor._execute=self._execute
             self.actors.append(actor)
             self.streams.append(torch.cuda.Stream(device=env.device))

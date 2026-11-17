@@ -36,6 +36,10 @@ class LearnerConfig:
     minibatch_size: int = 4096
     microbatch_size: int = 0  # automatic: CPU 32, CUDA full minibatch
     learner_backend: str = 'eager'  # CUDA packed-* execution; see docs/gpu_learner.md
+    critic: str = 'shared'
+    critic_lr: float = 1e-4
+    critic_d: int = 0  # 0 inherits policy width/FF
+    critic_depth: int = 0  # 0 inherits policy depth
 
 
 def schedules(config, iteration):
@@ -83,6 +87,11 @@ class Learner:
                 raise ValueError(f'invalid {name}')
         if self.config.reg_update_every <= 0:
             raise ValueError('reg_update_every must be positive')
+        if self.config.critic not in ('shared', 'privileged'):
+            raise ValueError('critic must be shared or privileged')
+        if (not np.isfinite(self.config.critic_lr) or self.config.critic_lr <= 0
+                or self.config.critic_d < 0 or self.config.critic_depth < 0):
+            raise ValueError('invalid critic learning rate or dimensions')
         self.device = torch.device(device)
         self.dtype = dtype
         self.model = model.to(self.device)
@@ -92,9 +101,86 @@ class Learner:
         self.reg_last_update = 0
         self.optimizer = torch.optim.Adam(model.parameters(), lr=self.config.lr)
         self.optimizer_steps = 0
+        self.critic = None
+        if self.config.critic == 'privileged':
+            from .critic import create_critic
+            self.critic = create_critic(self.model, self.config)
+            self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.config.critic_lr)
+            self.critic_optimizer_steps = 0
+            self._critic_forward = self.critic
         if self.config.learner_backend != 'eager':
             from .fast_learner import configure_fast_learner
             configure_fast_learner(self, self.config.learner_backend)
+
+    def restore_critic(self, state, *, resume):
+        if self.critic is None:
+            return
+        if state.get('critic') is not None:
+            from dataclasses import asdict
+            if state['critic_model_config'] != asdict(self.critic.config):
+                if resume:
+                    raise ValueError('critic model configuration differs from checkpoint')
+                self.critic.initialize_from_policy(self.model)
+                return
+            self.critic.load_state_dict(state['critic'])
+            self.critic_optimizer.load_state_dict(state['critic_optimizer'])
+            self.critic_optimizer_steps = state['critic_optimizer_steps']
+        elif resume:
+            raise ValueError('privileged resume requires a saved critic; use --init-from')
+        else:
+            self.critic.initialize_from_policy(self.model)
+
+    def _critic_inputs(self, batch, rows):
+        from .critic import PRIVILEGED_FIELDS
+        arrays = {k: batch.columns[k][rows].to(self.device) for k in (*OBS_FIELDS, *PRIVILEGED_FIELDS)}
+        return ({k: arrays[k] for k in OBS_FIELDS}, *(arrays[k] for k in PRIVILEGED_FIELDS))
+
+    @torch.no_grad()
+    def _critic_baseline(self, batch):
+        from .rollout import RolloutBatch
+        from .runtime import encoder_fastpath_disabled
+        from .critic import PRIVILEGED_FIELDS
+        if not hasattr(batch, 'columns') or any(k not in batch.columns for k in PRIVILEGED_FIELDS):
+            raise ValueError('privileged critic requires training rollout with unused hand labels')
+        self.critic.eval()
+        micro = self.config.microbatch_size or (self.config.minibatch_size if self.device.type == 'cuda' else 32)
+        values = []
+        with self.autocast(), encoder_fastpath_disabled():
+            for start in range(0, len(batch), micro):
+                rows = torch.arange(start, min(start+micro, len(batch)), device=batch.env.device)
+                values.append(self._critic_forward(*self._critic_inputs(batch, rows)).float().softmax(-1))
+        probs = torch.cat(values).to(batch.env.device)
+        return RolloutBatch(dict(batch.columns, old_value=probs), batch.stages,
+                            cpu_storage=batch.cpu_storage)
+
+    def _update_critic(self, batch, targets, order):
+        cfg = self.config
+        for group in self.critic_optimizer.param_groups:
+            group['lr'] = cfg.critic_lr
+            if hasattr(self, '_packed_forward'):
+                group.update(fused=True, foreach=False)
+        if hasattr(self, '_packed_forward'):
+            for state in self.critic_optimizer.state.values():
+                if 'step' in state:
+                    state['step'] = state['step'].to(self.device)
+        loss_sum = torch.zeros((), device=self.device)
+        for start in range(0, len(order), cfg.minibatch_size):
+            rows = order[start:start+cfg.minibatch_size]
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            micro = cfg.microbatch_size or (len(rows) if self.device.type == 'cuda' else 32)
+            for offset in range(0, len(rows), micro):
+                selected = rows[offset:offset+micro]
+                with self.autocast():
+                    logits = self._critic_forward(*self._critic_inputs(batch, selected))
+                    target = targets[selected].to(self.device)
+                    ce = -(target*F.log_softmax(logits.float(), -1)).sum(-1)
+                    loss = ce.sum()/len(rows)
+                loss.backward()
+                loss_sum += ce.detach().sum()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.)
+            self.critic_optimizer.step()
+            self.critic_optimizer_steps += 1
+        return float(loss_sum.cpu())/len(batch)
 
     def reset_reg(self, iteration=0):
         """Initialize from the starting online weights, including on init-from."""
@@ -164,7 +250,8 @@ class Learner:
         with self.autocast():
             encoded = self.model.encode(obs)
             lp, _ = self.model.heads(encoded.index_select(0, owners), **prefix)
-            value = self.model.value_head(encoded[:, self.model.positions['cls']]).float()
+            cls = encoded[:, self.model.positions['cls']]
+            value = self.model.value_head(cls.detach() if self.critic is not None else cls).float()
         reg_lp = None
         if self.reg is not None:
             # Avoid the eval-only fused Transformer path, so equal weights use
@@ -211,11 +298,19 @@ class Learner:
         update_begin = perf_counter()
         self._timing_events = []
         since = self._tick()
+        target_batch = self._critic_baseline(decisions) if self.critic is not None else decisions
         if fast and hasattr(decisions, 'columns') and decisions.env.is_cuda:
             from .gpu.targets import compute_targets as gpu_targets
-            xi, advantages = gpu_targets(decisions, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
+            xi, advantages = gpu_targets(target_batch, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
         else:
-            xi, advantages = compute_targets(decisions, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
+            xi, advantages = compute_targets(target_batch, cfg.lambda_v, cfg.lambda_a, cfg.gamma)
+        critic_metrics = {}
+        if self.critic is not None:
+            from .critic import prediction_metrics
+            critic_metrics = prediction_metrics(target_batch.old_value, decisions.old_value, decisions.outcome,
+                torch.as_tensor(advantages, device=decisions.env.device))
+            critic_metrics = dict(zip(critic_metrics, torch.stack(list(critic_metrics.values())).cpu().tolist()))
+            del target_batch
         self._elapsed(since, 'targets', timings)
         if torch.is_tensor(advantages):
             keep = ((advantages.abs() >= advantages.abs().quantile(.75).clamp_min(.01))
@@ -319,11 +414,20 @@ class Learner:
             for sums in torch.stack(metric_sums).cpu().tolist():
                 for key, value in zip(metrics, sums):
                     metrics[key] += value
+        if self.critic is not None:
+            since = self._tick()
+            timings['critic'] = 0.
+            metrics['critic_loss'] = self._update_critic(decisions, xi, order)*len(decisions)
+            self._elapsed(since, 'critic', timings)
         for key in metrics:
             denom = max(int(keep.sum()), 1) if key in ('policy_loss', 'kl_loss', 'magnet_loss') else len(decisions)
             metrics[key] /= denom
         metrics.update(lr=lr, alpha=alpha, filtering_fraction=float(keep.float().mean())
                        if columnar else float(keep.mean()))
+        if self.critic is not None:
+            metrics.update(critic_metrics, critic_lr=cfg.critic_lr)
+        else:
+            metrics['advantage_std'] = float(torch.as_tensor(advantages).float().std(correction=0))
         if self.reg is not None:
             metrics.update(reg_updated=int(self.update_reg(iteration)),
                            reg_last_update=self.reg_last_update)

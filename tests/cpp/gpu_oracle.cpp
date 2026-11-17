@@ -28,6 +28,7 @@ void frame(std::ostream& out,gfrl::VecEnv& env,std::int32_t choice) {
     FIELD(label_opp_hand);FIELD(label_opp_hand_count);FIELD(stage);FIELD(actor_seat);FIELD(chosen_kind);
     FIELD(chosen_cards);FIELD(chosen_count);FIELD(chosen_target);FIELD(chosen_alloc_hp);FIELD(outcome);
     FIELD(mask);FIELD(substep);FIELD(decision_done);FIELD(episode_done);FIELD(truncated);FIELD(episode_id);FIELD(decisions);
+    FIELD(label_opp_unused_hand);FIELD(label_opp_unused_hand_count);
 #undef FIELD
 }
 int main(int argc,char** argv) {

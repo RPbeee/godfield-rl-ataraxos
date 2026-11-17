@@ -1,5 +1,12 @@
 # GPU PPO learner
 
+独立した training-only privileged critic と noisy pool opponent は
+[privileged_critic.md](privileged_critic.md) を参照。既定の shared 経路は維持する。
+H100 MIG / モデル M の実測は shared 59,215、privileged 27,158 decisions/s。
+自己対戦の反復時間は 3.583 → 4.896 秒（保存込み、compile のない 5 反復）。
+条件・smoke 指標・検証ログは
+[2026-11-17 検証記録](../measurements/pcritic_20261117/README.md) に記載した。
+
 モデル M/L 向けに、CUDA の learner 実行経路を追加した。
 **180,000 decisions/s は未達**。同じ16,384 decisionの比較では、既存bf16が10,538/s、
 `packed-grouped` が53,876/s（10回合算、約5.11倍）だった。

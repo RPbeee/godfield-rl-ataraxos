@@ -118,7 +118,7 @@ def heads(model, encoded, inputs):
                            inputs['choice'], owners, b), value
 
 
-def magnet_heads(model, encoded, inputs, reg_lp=None, policy_only=False):
+def magnet_heads(model, encoded, inputs, reg_lp=None, policy_only=False, detach_value=False):
     # Intentionally separate from heads: even optional inputs can change
     # Inductor's fusion/reduction choices for the legacy uniform graph.
     owners = inputs['owners']
@@ -144,7 +144,7 @@ def magnet_heads(model, encoded, inputs, reg_lp=None, policy_only=False):
     lp = F.log_softmax(logits.float().masked_fill(~inputs['mask'].bool(), -1e9), -1)
     if policy_only:
         return lp
-    value = model.value_head(cls).float()
+    value = model.value_head(cls.detach() if detach_value else cls).float()
     return decision_terms(lp, inputs['old_lp'], inputs['mask'].bool(),
                            inputs['choice'], owners, b, reg_lp), value
 
@@ -176,7 +176,7 @@ class PackedForward:
         head_indices = torch.where((positions % t) < 21)[0]
         with learner.autocast(), sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             obs = {k: inputs[k] for k in ('obs_type', 'obs_cards', 'obs_aux_card', 'obs_cat', 'obs_num', 'obs_valid')}
-            if learner.reg is None:
+            if learner.reg is None and learner.critic is None:
                 # Preserve the original compiled uniform graph and call path.
                 x = self.embed(model, obs, positions)
                 x = self.encode(model, x, cu, head_indices, head_cu, t)
@@ -191,9 +191,12 @@ class PackedForward:
 
             # Reuse all packing indices and the same kernels/precision. Only
             # policy logits are needed: no value head, reductions or backward.
-            with torch.no_grad():
-                reg_lp = self.magnet_heads(learner.reg, run(learner.reg), inputs, policy_only=True)
-            return self.magnet_heads(model, run(model), inputs, reg_lp=reg_lp)
+            reg_lp = None
+            if learner.reg is not None:
+                with torch.no_grad():
+                    reg_lp = self.magnet_heads(learner.reg, run(learner.reg), inputs, policy_only=True)
+            return self.magnet_heads(model, run(model), inputs, reg_lp=reg_lp,
+                                     detach_value=learner.critic is not None)
 
 
 BACKENDS = ('eager', 'packed', 'packed-eager', 'packed-reduce', 'packed-short',
@@ -224,3 +227,15 @@ def configure_fast_learner(learner, backend='packed'):
     for group in learner.optimizer.param_groups:
         group.update(fused=True, foreach=False)
     learner.config.learner_backend = backend
+    if learner.critic is not None:
+        if low_precision and (learner.critic.config.heads % 2 or
+                learner.critic.config.d // learner.critic.config.heads not in (32, 48, 64)):
+            raise ValueError(backend+' critic requires an even head count and head dimension 32, 48 or 64')
+        from .critic import PackedCriticForward
+        learner._critic_forward = PackedCriticForward(learner)
+        state = learner.critic_optimizer.state_dict()
+        learner.critic_optimizer = torch.optim.Adam(learner.critic.parameters(),
+            lr=learner.config.critic_lr, fused=True)
+        learner.critic_optimizer.load_state_dict(state)
+        for group in learner.critic_optimizer.param_groups:
+            group.update(fused=True, foreach=False)

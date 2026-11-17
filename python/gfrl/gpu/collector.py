@@ -38,7 +38,10 @@ class GpuCollector:
     def __init__(self, model, *, num_envs=256, threads=4, seed=0, device='cuda',
                  dtype='bf16', pool_fraction=.2, env=None, decision_capacity=4096,
                  stage_capacity=16384, rollout_storage='device', capture=True,
-                 pooled=False,arena_bytes=None,streams=1):
+                 pooled=False,arena_bytes=None,streams=1,privileged_labels=False,pool_epsilon=0.):
+        if not 0 <= pool_epsilon <= 1:
+            raise ValueError('pool_epsilon must be in [0,1]')
+        self.privileged_labels, self.pool_epsilon = privileged_labels, pool_epsilon
         if not 0 <= pool_fraction <= 1:
             raise ValueError('pool_fraction must be in [0,1]')
         if decision_capacity <= 0 or stage_capacity <= 0:
@@ -79,14 +82,16 @@ class GpuCollector:
             del self.actor
         self._models = models
         routing = dict(opponents=models, opponent_seat=self._opponent_seat,
-                       opponent_policy=self._opponent_policy)
+                       opponent_policy=self._opponent_policy, pool_epsilon=self.pool_epsilon)
         if self.streams != 1:
             self.actor = ParallelGpuActor(self.model, self.env, streams=self.streams,
-                                         dtype=self.dtype, **routing)
+                                         dtype=self.dtype, privileged_labels=self.privileged_labels, **routing)
         elif models:
-            self.actor = RoutedGpuActor(self.model, self.env, dtype=self.dtype, **routing)
+            self.actor = RoutedGpuActor(self.model, self.env, dtype=self.dtype,
+                                        privileged_labels=self.privileged_labels, **routing)
         else:
-            self.actor = GpuActor(self.model, self.env, dtype=self.dtype)
+            self.actor = GpuActor(self.model, self.env, dtype=self.dtype,
+                                  privileged_labels=self.privileged_labels)
         if self.capture:
             self.actor.capture(record=True)
         self._actor_keys = needed
@@ -129,6 +134,9 @@ class GpuCollector:
                            outcome=torch.where(training, 2, 3).to(torch.int8),
                            label_opp_hand=data['label_opp_hand'],
                            label_opp_hand_count=data['label_opp_hand_count'])
+            if self.privileged_labels:
+                from ..critic import PRIVILEGED_FIELDS
+                columns.update({k: data[k] for k in PRIVILEGED_FIELDS})
             self.columns.append(columns)
             dense = {k:torch.stack([s[k] for s in data['stages']], dim=1)
                      for k in (*PREFIX_FIELDS, 'valid', 'choice', 'old_log_probs')}

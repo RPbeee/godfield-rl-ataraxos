@@ -15,6 +15,7 @@ from gfrl.learner import Learner, LearnerConfig
 from gfrl.model import Model, ModelConfig
 from gfrl.rollout import RolloutBatch
 from gfrl.runtime import configure_precision
+from gfrl.training_checkpoint import load_training_checkpoint
 
 
 def main():
@@ -36,6 +37,7 @@ def main():
     p.add_argument('--profile', action='store_true')
     p.add_argument('--backend', default='eager')
     p.add_argument('--magnet-source', choices=['uniform', 'reg'])
+    p.add_argument('--critic', choices=['shared', 'privileged'], default='shared')
     p.add_argument('--alpha-schedule', choices=['decay', 'constant'])
     p.add_argument('--alpha0', type=float)
     p.add_argument('--reg-update-every', type=int)
@@ -45,13 +47,14 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
     configure_precision('cuda', args.tf32)
-    state = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    state = load_training_checkpoint(args.checkpoint, load_critic=args.critic == 'privileged')
     model = Model(ModelConfig(**state['model_config']))
     model.load_state_dict(state['model'])
     cfg = LearnerConfig(**{f.name: state['config'][f.name] for f in fields(LearnerConfig)
                            if f.name in state['config']})
     # The requested benchmark backend overrides the checkpoint's runtime backend.
     cfg.learner_backend = 'eager'
+    cfg.critic = args.critic
     for name in ('magnet_source', 'alpha_schedule', 'alpha0', 'reg_update_every'):
         if getattr(args, name) is not None:
             setattr(cfg, name, getattr(args, name))
@@ -66,7 +69,8 @@ def main():
     if args.collect:
         from gfrl.gpu.collector import GpuCollector
         collector = GpuCollector(model, num_envs=args.num_envs, seed=42, dtype='bf16',
-                                 pool_fraction=args.pool_fraction, pooled=True, arena_bytes=262144)
+                                 pool_fraction=args.pool_fraction, pooled=True, arena_bytes=262144,
+                                 privileged_labels=True)
         for i in range(args.collect_warmup):
             batch = collector.collect(128, state.get('pool',[]))
             print(json.dumps(dict(collect_warmup=i, decisions=len(batch))), flush=True)
@@ -101,6 +105,7 @@ def main():
             group.update(fused=args.backend != 'eager', foreach=False if args.backend != 'eager' else None)
         learner.optimizer_steps = state['optimizer_steps']
         learner.restore_reg(state, resume=True)
+        learner.restore_critic(state, resume=False)
         np.random.seed(42)
         measure(learner, batch, args, iteration)
 

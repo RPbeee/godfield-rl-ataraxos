@@ -10,6 +10,7 @@ struct Outputs {
     float *obs_num;
     bool *obs_valid;
     unsigned char *label_opp_hand,*label_opp_hand_count;
+    unsigned char *label_opp_unused_hand,*label_opp_unused_hand_count;
     signed char *stage,*actor_seat,*chosen_kind,*chosen_cards,*chosen_count,*chosen_target,*chosen_alloc_hp,*outcome;
     bool *mask;
     short *substep;
@@ -104,7 +105,9 @@ Outputs outputs(void** p) {
     o.chosen_cards=(signed char*)p[k++];o.chosen_count=(signed char*)p[k++];o.chosen_target=(signed char*)p[k++];
     o.chosen_alloc_hp=(signed char*)p[k++];o.outcome=(signed char*)p[k++];o.mask=(bool*)p[k++];o.substep=(short*)p[k++];
     o.decision_done=(bool*)p[k++];o.episode_done=(bool*)p[k++];o.truncated=(bool*)p[k++];
-    o.episode_id=(unsigned long long*)p[k++];o.decisions=(unsigned long long*)p[k++];o.stats=(unsigned long long*)p[k++];o.ready=(signed char*)p[k++];return o;
+    o.episode_id=(unsigned long long*)p[k++];o.decisions=(unsigned long long*)p[k++];
+    o.label_opp_unused_hand=(unsigned char*)p[k++];o.label_opp_unused_hand_count=(unsigned char*)p[k++];
+    o.stats=(unsigned long long*)p[k++];o.ready=(signed char*)p[k++];return o;
 }
 }
 extern "C" __global__ void gpu_sizes(unsigned long long* p) {
@@ -219,7 +222,10 @@ extern "C" __global__ void gpu_observe(void* storage,void** pointers,int n,int h
     if(i>=n)return;auto& e=((Env*)storage)[i];if(!e.dirty)return;
     const auto& events=e.history[e.selection->actor_seat].events();
     auto o=outputs(pointers);const int t=history_offset+history_len,have=history_offset+events.size();
-    for(int card=lane;card<297;card+=stride)o.label_opp_hand[i*297+card]=0;
+    for(int card=lane;card<297;card+=stride) {
+        o.label_opp_hand[i*297+card]=0;
+        o.label_opp_unused_hand[i*297+card]=0;
+    }
 #ifdef __CUDACC_RTC__
     __syncthreads();
 #endif
@@ -227,6 +233,11 @@ extern "C" __global__ void gpu_observe(void* storage,void** pointers,int n,int h
         const auto& hand=e.match.snapshot().state.players[1-e.selection->actor_seat].items;
         o.label_opp_hand_count[i]=hand.size();
         for(const auto& item:hand)++o.label_opp_hand[i*297+card_code(item.model)];
+        o.label_opp_unused_hand_count[i]=0;
+        for(const auto& item:hand)if(!item.used) {
+            ++o.label_opp_unused_hand[i*297+card_code(item.model)];
+            ++o.label_opp_unused_hand_count[i];
+        }
     }
     for(int a=lane;a<t;a+=stride) {
         const auto* token=a<have?(a<history_offset?&e.tokens[a]:&events[a-history_offset].token):nullptr;

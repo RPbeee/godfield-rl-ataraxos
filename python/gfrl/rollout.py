@@ -134,7 +134,11 @@ class Collector:
     """Live weights are shared; only heads of unfinished decisions are pinned."""
     def __init__(self, model, *, num_envs=64, threads=4, seed=0, device='cpu',
                  dtype='fp32', pool_fraction=0.2, env=None,
-                 decision_capacity=4096, stage_capacity=16384, rollout_storage='device'):
+                 decision_capacity=4096, stage_capacity=16384, rollout_storage='device',
+                 privileged_labels=False, pool_epsilon=0.):
+        if not 0 <= pool_epsilon <= 1:
+            raise ValueError('pool_epsilon must be in [0,1]')
+        self.privileged_labels, self.pool_epsilon = privileged_labels, pool_epsilon
         if rollout_storage not in ('device', 'cpu'):
             raise ValueError('rollout_storage must be device or cpu')
         self.cpu_storage = rollout_storage == 'cpu'
@@ -243,6 +247,9 @@ class Collector:
         while games < games_per_iter:
             snapshot = {k: getattr(env, k) for k in (*OBS_FIELDS, *PREFIX_FIELDS,
                         'substep', 'actor_seat', 'episode_id')}
+            if self.privileged_labels:
+                from .critic import PRIVILEGED_FIELDS
+                labels = tensor_batch({k: getattr(env, k) for k in PRIVILEGED_FIELDS}, live.device)
             # Native uint64 episode counters use numpy's platform ulonglong
             # spelling on macOS; reinterpret the counter bits without a copy.
             snapshot['episode_id'] = snapshot['episode_id'].view(np.int64)
@@ -259,7 +266,8 @@ class Collector:
                     if key not in self.actors:
                         model = deepcopy(self.model)
                         model.load_state_dict(entry['weights'])
-                        self.actors[key] = Actor(model, env, self.device, dtype=self.dtype)
+                        self.actors[key] = Actor(model, env, self.device, dtype=self.dtype,
+                                                 epsilon=self.pool_epsilon)
             self.routing[fresh] = np.where(snapshot['actor_seat'][fresh] == self.opponent_seat[fresh],
                                             self.opponent_policy[fresh], -1)
             # Transfer each persistent native buffer once, before any row selection.
@@ -296,6 +304,8 @@ class Collector:
                                game=tensors['episode_id'][new_t],
                                old_value=value/value.sum(dim=1, keepdim=True),
                                outcome=torch.full((len(new),), 2, dtype=torch.int8, device=live.device))
+                if self.privileged_labels:
+                    columns.update({k: labels[k].index_select(0, new_t) for k in PRIVILEGED_FIELDS})
                 new_storage = torch.as_tensor(new, device=self.storage_device)
                 training_storage = torch.as_tensor(training, device=self.storage_device)
                 self.current[new_storage] = self.buffer.append(columns)

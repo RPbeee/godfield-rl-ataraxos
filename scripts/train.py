@@ -18,6 +18,7 @@ from gfrl.evaluation import evaluate_policy
 from gfrl.learner import Learner, LearnerConfig
 from gfrl.model import Model, ModelConfig
 from gfrl.rollout import Collector
+from gfrl.training_checkpoint import load_training_checkpoint
 from gfrl.runtime import (add_runtime_args, configure_precision, configure_model,
                           compiler_metrics, metric_delta)
 
@@ -42,11 +43,12 @@ def parse_args(argv=None):
                               stage_capacity=16384).items():
         p.add_argument('--'+name.replace('_', '-'), type=int, default=default)
     p.add_argument('--pool-fraction', type=float, default=.2)
+    p.add_argument('--pool-epsilon', type=float, default=0.)
     p.add_argument('--run-dir', default='runs/train')
     p.add_argument('--max-hours', type=float, default=23.)
     defaults = LearnerConfig()
     choices = dict(magnet_source=('uniform', 'reg'), alpha_schedule=('decay', 'constant'),
-                   reg_source=('online', 'ema'))
+                   reg_source=('online', 'ema'), critic=('shared', 'privileged'))
     for f in fields(defaults):
         value = getattr(defaults, f.name)
         p.add_argument('--'+f.name.replace('_', '-'), default=value,
@@ -73,6 +75,10 @@ def parse_args(argv=None):
         p.error('microbatch-size must be nonnegative (0 = automatic)')
     if not 0 <= args.pool_fraction <= 1 or args.max_hours <= 0:
         p.error('invalid pool_fraction or max_hours')
+    if not 0 <= args.pool_epsilon <= 1:
+        p.error('pool-epsilon must be in [0,1]')
+    if not np.isfinite(args.critic_lr) or args.critic_lr <= 0 or args.critic_d < 0 or args.critic_depth < 0:
+        p.error('invalid critic learning rate or dimensions')
     if args.env_backend == 'cuda' and (args.device != 'cuda' or args.rollout_storage != 'device' or args.compile != 'off'):
         p.error('CUDA env backend requires --device cuda --rollout-storage device --compile off')
     if args.selfplay_streams>args.num_envs or (args.env_backend=='cpu' and args.selfplay_streams!=1):
@@ -131,6 +137,18 @@ def save_checkpoint(path, learner, iteration, pool, positions, config, elapsed, 
     state['init_from'] = config.get('init_from')
     if learner.reg is not None:
         state.update(reg=learner.reg.state_dict(), reg_last_update=learner.reg_last_update)
+    critic_path = None
+    if learner.critic is not None:
+        from uuid import uuid4
+        critic_path = path.with_name(f'{path.stem}.critic-{iteration}-{uuid4().hex[:12]}.pt')
+        critic_state = dict(critic=learner.critic.state_dict(), iteration=iteration,
+                     critic_model_config=asdict(learner.critic.config),
+                     critic_optimizer=learner.critic_optimizer.state_dict(),
+                     critic_optimizer_steps=learner.critic_optimizer_steps)
+        critic_temp = critic_path.with_suffix('.tmp')
+        torch.save(critic_state, critic_temp)
+        critic_temp.replace(critic_path)
+        state['critic_checkpoint'] = dict(file=critic_path.name)
     if learner.device.type == 'cuda':
         state['cuda_rng'] = torch.cuda.get_rng_state_all()
     elif learner.device.type == 'mps':
@@ -138,6 +156,12 @@ def save_checkpoint(path, learner, iteration, pool, positions, config, elapsed, 
     temp = path.with_suffix('.tmp')
     torch.save(state, temp)
     temp.replace(path)
+    previous = getattr(learner, '_saved_critic_path', None)
+    if (previous is not None and previous != critic_path
+            and getattr(learner, '_saved_checkpoint_path', None) == path):
+        previous.unlink(missing_ok=True)
+    learner._saved_critic_path = critic_path
+    learner._saved_checkpoint_path = path
 
 
 def rollout_length_metrics(decisions):
@@ -165,10 +189,9 @@ def run(args):
         source = Path(args.init_from).resolve()
         with source.open('rb') as f:
             provenance = dict(path=str(source), md5=hashlib.file_digest(f, 'md5').hexdigest())
-        state = torch.load(source, map_location='cpu', weights_only=False)
+        state = load_training_checkpoint(source, load_critic=args.critic == 'privileged')
     if args.resume:
-        state = torch.load(checkpoint if args.resume == 'auto' else args.resume,
-                           map_location='cpu', weights_only=False)
+        state = load_training_checkpoint(checkpoint if args.resume == 'auto' else args.resume)
         # Resume the saved experiment settings; execution length/device/path remain caller-controlled.
         runtime = {k: getattr(args, k) for k in ('iterations', 'device', 'threads', 'run_dir',
                                                 'resume', 'max_hours', 'config', 'microbatch_size', 'rollout_storage',
@@ -199,6 +222,7 @@ def run(args):
         learner.optimizer.load_state_dict(state['optimizer'])
         learner.optimizer_steps = state.get('optimizer_steps', 0)
         learner.restore_reg(state, resume=bool(args.resume))
+        learner.restore_critic(state, resume=bool(args.resume))
         pool, iteration = state['pool'], state['iteration']
         positions = state['seed_positions'].copy()
         elapsed_before = state['elapsed_s'] if args.resume else 0.
@@ -223,7 +247,9 @@ def run(args):
     collector = collector_class(learner.model, num_envs=args.num_envs, threads=args.threads,
                           seed=train_seed, device=args.device, dtype=args.dtype,
                           pool_fraction=args.pool_fraction, decision_capacity=args.decision_capacity,
-                          stage_capacity=args.stage_capacity, rollout_storage=args.rollout_storage,**collector_kwargs)
+                          stage_capacity=args.stage_capacity, rollout_storage=args.rollout_storage,
+                          privileged_labels=args.critic == 'privileged', pool_epsilon=args.pool_epsilon,
+                          **collector_kwargs)
     try:
         config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
         config['init_from'] = provenance

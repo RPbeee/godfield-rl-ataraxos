@@ -16,7 +16,8 @@ from .source import build_source
 FIELDS = ('obs_type', 'obs_cat', 'obs_cards', 'obs_aux_card', 'obs_num', 'obs_valid',
           'label_opp_hand', 'label_opp_hand_count', 'stage', 'actor_seat', 'chosen_kind',
           'chosen_cards', 'chosen_count', 'chosen_target', 'chosen_alloc_hp', 'outcome',
-          'mask', 'substep', 'decision_done', 'episode_done', 'truncated', 'episode_id', 'decisions')
+          'mask', 'substep', 'decision_done', 'episode_done', 'truncated', 'episode_id', 'decisions',
+          'label_opp_unused_hand', 'label_opp_unused_hand_count')
 
 
 @lru_cache(maxsize=1)
@@ -72,6 +73,7 @@ class GpuEnv:
                       'obs_cards': ((t,8), torch.int16), 'obs_aux_card': ((t,), torch.int16),
                       'obs_num': ((t,f), torch.float32), 'obs_valid': ((t,), torch.bool),
                       'label_opp_hand': ((297,), torch.uint8), 'label_opp_hand_count': ((), torch.uint8),
+                      'label_opp_unused_hand': ((297,), torch.uint8), 'label_opp_unused_hand_count': ((), torch.uint8),
                       'chosen_cards': ((18,), torch.int8), 'outcome': ((2,), torch.int8),
                       'mask': ((21,), torch.bool), 'substep': ((), torch.int16)}
             shapes.update({k:((), torch.bool) for k in ('decision_done','episode_done','truncated')})

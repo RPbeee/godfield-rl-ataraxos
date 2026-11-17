@@ -29,10 +29,13 @@ def synchronize(device):
 
 class Actor:
     def __init__(self, model, env, device, sample=True, *, dtype="fp32",
-                 cuda_bf16=False, profile=False):
+                 cuda_bf16=False, profile=False, epsilon=0.):
         if dtype not in ("fp32", "fp16", "bf16"):
             raise ValueError("dtype must be fp32, fp16, or bf16")
         self.device = torch.device(device)
+        if not 0 <= epsilon <= 1:
+            raise ValueError('epsilon must be in [0,1]')
+        self.epsilon = epsilon
         self.model = model.to(device=self.device, dtype=torch.float32).eval()
         self.sample = sample
         self.dtype = "bf16" if cuda_bf16 else dtype
@@ -128,6 +131,9 @@ class Actor:
             finish("encoder", since)
             since = start()
             lp, vl = self.model.heads(self.token_cache.index_select(0, active_t), **prefix)
+            if self.epsilon:
+                from .noise import epsilon_log_probs
+                lp = epsilon_log_probs(lp, prefix['mask'], self.epsilon)
             action = (torch.multinomial(lp.exp(), 1).squeeze(1) if self.sample else lp.argmax(-1))
             picked = lp.gather(1, action[:, None]).squeeze(1)
             finish("heads", since)

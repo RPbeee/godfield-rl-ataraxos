@@ -63,6 +63,7 @@ class NativeEnv(GpuSearchEnv):
         shapes={'obs_type':((t,),torch.int8),'obs_cat':((t,c),torch.int8),'obs_cards':((t,8),torch.int16),
                 'obs_aux_card':((t,),torch.int16),'obs_num':((t,f),torch.float32),'obs_valid':((t,),torch.bool),
                 'label_opp_hand':((297,),torch.uint8),'label_opp_hand_count':((),torch.uint8),
+                'label_opp_unused_hand':((297,),torch.uint8),'label_opp_unused_hand_count':((),torch.uint8),
                 'chosen_cards':((18,),torch.int8),'outcome':((2,),torch.int8),'mask':((21,),torch.bool),
                 'substep':((),torch.int16)}
         shapes.update({k:((),torch.bool) for k in ('decision_done','episode_done','truncated')})

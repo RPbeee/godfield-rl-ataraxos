@@ -198,6 +198,7 @@ void equal_env(const VecEnv& a, const VecEnv& b) {
     EQ(decision_done); EQ(episode_done); EQ(outcome); EQ(truncated); EQ(episode_id);
     EQ(obs_type); EQ(obs_cards); EQ(obs_aux_card); EQ(obs_cat); EQ(obs_num); EQ(obs_valid);
     EQ(label_opp_hand); EQ(label_opp_hand_count);
+    EQ(label_opp_unused_hand); EQ(label_opp_unused_hand_count);
     check(std::memcmp(a.obs_num.data(), b.obs_num.data(), a.obs_num.size*sizeof(float))==0, "obs_num bits differ");
 #undef EQ
     for (std::size_t i = 0; i < a.num_envs; ++i) check(a.match(i).snapshot() == b.match(i).snapshot(), "snapshot differs");
@@ -211,6 +212,11 @@ void equal_env(const VecEnv& a, const VecEnv& b) {
         for (const auto& item : hand) ++expected[card_code(item.model)];
         check(std::equal(expected.begin(), expected.end(), a.label_opp_hand.data()+297*i), "opponent label time/model mismatch");
         check(a.label_opp_hand_count[i] == hand.size(), "opponent label count mismatch");
+        expected.fill(0);
+        std::size_t unused=0;
+        for (const auto& item : hand) if(!item.used) {++expected[card_code(item.model)];++unused;}
+        check(std::equal(expected.begin(), expected.end(), a.label_opp_unused_hand.data()+297*i), "unused opponent label mismatch");
+        check(a.label_opp_unused_hand_count[i] == unused, "unused opponent count mismatch");
         check(a.obs_num[i*a.tokens*F+Decisions]*512 == snap.decisions, "observation time mismatch");
     }
     auto x = a.stats(), y = b.stats();

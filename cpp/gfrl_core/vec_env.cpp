@@ -60,6 +60,7 @@ VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool cano
       history_len(k<=4096 ? k : throw std::invalid_argument("history_len must be <=4096")), tokens(history_offset + history_len), track_projection(track_projection),
       obs_type(n*tokens), obs_cat(n*tokens*C), obs_cards(n*tokens*8), obs_aux_card(n*tokens),
       obs_num(n*tokens*F), obs_valid(n*tokens), label_opp_hand(n*297), label_opp_hand_count(n),
+      label_opp_unused_hand(n*297), label_opp_unused_hand_count(n),
       stage(n), actor_seat(n), chosen_kind(n), chosen_cards(n * 18), chosen_count(n), chosen_target(n), chosen_alloc_hp(n), outcome(n * 2),
       mask(n), substep(n), decision_done(n), episode_done(n), truncated(n), episode_id(n), decisions(n), world_status(n), searcher_seat(n), result(n),
       leaf_obs_type(0), leaf_obs_cat(0), leaf_obs_cards(0),
@@ -137,6 +138,12 @@ void VecEnv::encode_observation(std::size_t i) {
     std::fill_n(label_opp_hand.data()+i*297,297,0);
     label_opp_hand_count[i]=players[1-seat].items.size();
     for(const auto& item:players[1-seat].items) ++label_opp_hand[i*297+card_code(item.model)];
+    std::fill_n(label_opp_unused_hand.data()+i*297,297,0);
+    label_opp_unused_hand_count[i]=0;
+    for(const auto& item:players[1-seat].items) if(!item.used) {
+        ++label_opp_unused_hand[i*297+card_code(item.model)];
+        ++label_opp_unused_hand_count[i];
+    }
 }
 void VecEnv::record_decision(std::size_t i, bool automatic) {
     auto& e = envs_[i];
@@ -380,6 +387,7 @@ void VecEnv::load_worlds(const VecEnv& src, std::span<const std::int32_t> rows,
         std::fill_n(obs_cards.data()+i*tokens*8,tokens*8,0);std::fill_n(obs_aux_card.data()+i*tokens,tokens,0);
         std::fill_n(obs_cat.data()+i*tokens*C,tokens*C,0);std::fill_n(obs_num.data()+i*tokens*F,tokens*F,0);
         std::fill_n(label_opp_hand.data()+i*297,297,0);label_opp_hand_count[i]=0;
+        std::fill_n(label_opp_unused_hand.data()+i*297,297,0);label_opp_unused_hand_count[i]=0;
         world_status[i]=int(WorldStatus::unsupported_root);
         if(root.waiting || !root.selection || src.substep[rows[i]]!=0)continue;
         const auto seat=root.selection->actor_seat;

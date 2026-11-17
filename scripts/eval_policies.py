@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--threads', type=int, default=8)
     parser.add_argument('--device', choices=('cpu', 'cuda', 'mps'), default='cpu')
     parser.add_argument('--eval-seed', type=int, default=0)
+    parser.add_argument('--pool-epsilon', type=float, default=0.,
+                        help='stage-wise epsilon-uniform legal noise for B only (same as training pool)')
     parser.add_argument('--out', type=Path, default=Path('eval-policies.json'))
     parser.add_argument('--list', nargs='*', metavar='CHECKPOINT',
                         help='list pool iterations for these paths, or for --a / --b')
@@ -39,6 +41,8 @@ def main():
         parser.error('--a and --b are required for evaluation')
     if args.pairs <= 0 or args.num_envs <= 0 or args.threads <= 0:
         parser.error('--pairs, --num-envs and --threads must be positive')
+    if not 0 <= args.pool_epsilon <= 1:
+        parser.error('--pool-epsilon must be in [0,1]')
     if args.compile != 'off':
         parser.error('policy evaluation does not use compile; use --compile off')
     torch.set_num_threads(args.threads)
@@ -52,7 +56,7 @@ def main():
     print('|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|', flush=True)
     for opponent in args.b:
         actor_b = Actor(load_policy_model(opponent, args.device), idle_env,
-                        args.device, sample=True)
+                        args.device, sample=True, epsilon=args.pool_epsilon)
         summary = evaluate_policies(actor_a, actor_b, args.pairs, args.num_envs,
                                     args.threads, args.eval_seed)
         results.append(dict(a=args.a, b=opponent, **summary))
@@ -69,6 +73,7 @@ def main():
     args.out.write_text(json.dumps(dict(pairs=args.pairs, eval_seed=args.eval_seed,
                                       num_envs=args.num_envs, threads=args.threads,
                                       device=args.device, tf32=args.tf32,
+                                      pool_epsilon=args.pool_epsilon,
                                       results=results), indent=2) + '\n')
 
 
