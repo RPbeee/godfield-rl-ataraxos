@@ -384,7 +384,8 @@ def prepare(state, public, action, name, *, dream_last_resort=False):
     require(public['actor'] == public['viewer'] and len(public['players']) == 2
             and not public['is_over'], 'not_own_decision')
     require(not public['unsupported'] and all(
-            (p['status'] is not None and not p['status']['confused']) or
+            (p['status'] is not None and not (p['id'] == public['viewer']
+                and public['phase'] == 0 and p['status']['confused'])) or
             (own_fog(public) and p['id'] != public['viewer'] and p.get('fogged', False))
             for p in public['players']),
             'unobserved_screen_effect')

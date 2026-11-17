@@ -50,7 +50,9 @@ gf::MatchView official_view(nb::dict d) {
         if(base.ability==gf::Ability::remove_items)p.amount=3;
         if(base.ability==gf::Ability::remove_used_miracles)p.amount=2;
         p.power=a.contains("power")?nb::cast<std::int64_t>(a["power"]):gf::attack_power(p.models,field<std::int64_t>(a,"base_override",0));
-        p.hit_rate=base.hit_rate;p.counter=field<bool>(a,"counter",false);p.death=field<bool>(a,"death",false);
+        p.hit_rate=field<int>(a,"hit_rate",base.hit_rate);
+        if(p.hit_rate<0 || p.hit_rate>100)throw std::invalid_argument("invalid public hit rate");
+        p.counter=field<bool>(a,"counter",false);p.death=field<bool>(a,"death",false);
         p.reflections=field<std::size_t>(a,"reflections",0);p.bounces=field<std::size_t>(a,"bounces",0);
         p.environmental=!p.source;p.guardian=official_enum<gf::Guardian>(field<std::string>(a,"guardian","none"),11,gf::guardian_name);
         p.forced_hit=nb::cast<std::optional<bool>>(a["forced_hit"]);v.pending=p;
@@ -147,6 +149,8 @@ struct OfficialAccess {
         if(public_view.contains("_policy_only"))
             throw std::invalid_argument("search_requires_public_launch_journal");
         auto v=official_view(public_view);
+        if(v.pending && v.pending->hit_rate!=gf::find_card(v.pending->models.front())->hit_rate)
+            throw std::invalid_argument("search_requires_public_launch_journal");
         if(!v.board.viewer || v.actor!=v.board.viewer)
             throw std::invalid_argument("search_requires_viewer_root");
         gf::PublicSelection selection(v);auto state=selection.snapshot().state;

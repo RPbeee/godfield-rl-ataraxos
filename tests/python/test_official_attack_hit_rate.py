@@ -50,16 +50,18 @@ def test_catalog_or_zero_rate_preserves_observation_and_all_masks(model, guardia
     (6, 75, None), (106, 50, None), (112, 75, None),
     (6, 75, 'earth'), (225, 100, 'moon')])
 @pytest.mark.parametrize('target', [1, 2])
-def test_dynamic_rate_stops_only_at_own_decision_and_then_resumes(model, rate, guardian, target):
+def test_dynamic_rate_uses_policy_response_or_requires_death_power_then_resumes(model, rate, guardian, target):
     game = response(model, rate, target=target, guardian=guardian)
     session = OfficialSession(1)
     result = session.ingest(game)
-    assert result['status'] == ('unsupported' if target == 1 else 'waiting')
-    assert 'env' not in result
+    assert result['status'] == (('unsupported' if model == 112 else 'decision') if target == 1 else 'waiting')
+    assert ('env' in result) == (target == 1 and model != 112)
+    if model != 112:
+        assert 'dynamic_hit_rate_unavailable' in result['public']['_policy_only']
     detail = next(d for d in result['detail'] if d['code'] == 'dynamic_hit_rate_unavailable')
     assert detail == dict(code='dynamic_hit_rate_unavailable', models=[model],
         hit_rate=rate, catalog_hit_rate=_core.play_catalog()[model]['hit_rate'],
-        reason='native_pending_uses_catalog_hit_rate')
+        reason='dynamic_rate_requires_policy_response')
     game.update(updateCount=2, attacks=[], events=[], attackTurnPlayerId=1)
     assert session.ingest(game)['status'] == 'decision'
 
@@ -69,10 +71,10 @@ def test_dynamic_rate_stops_only_at_own_decision_and_then_resumes(model, rate, g
 def test_death_bow_power_does_not_imply_native_death_state(target, rate):
     game = response(112, rate, target=target, atk=30)
     result = OfficialSession(1).ingest(game)
-    assert result['status'] == ('unsupported' if target == 1 else 'waiting')
-    assert 'death_attack_decision_unavailable' in result['unsupported']
+    assert result['status'] == ('decision' if target == 1 else 'waiting')
+    assert 'death_attack_decision_unavailable' in result['public']['_policy_only']
     assert result['public']['pending']['death'] is False
-    assert 'env' not in result
+    assert ('env' in result) == (target == 1)
 
 
 def test_auto54_synthetic_receive_variants():
@@ -91,7 +93,7 @@ def test_auto54_synthetic_receive_variants():
     assert session.ingest(parser_module().sanitize_game(game, 1))['status'] == 'decision'
     for model, atk, rate, expected in [(106, 6, 75, 'decision'),
                                      (112, 1, 25, 'decision'),
-                                     (112, 30, 75, 'unsupported')]:
+                                     (112, 30, 75, 'decision')]:
         for target in (1, 2):
             received = deepcopy(game)
             received.update(updateCount=36, attacks=[dict(playerId=3-target,
@@ -122,6 +124,6 @@ def test_lenient_dying_event_cannot_hide_active_death_bow(target):
     checked = parser_module().sanitize_game(game, 1, lenient_events=True)
     assert checked['events'] == [dict(action='unknownEvent')]
     result = OfficialSession(1).ingest(checked)
-    assert result['status'] == ('unsupported' if target == 1 else 'waiting')
-    assert 'death_attack_decision_unavailable' in result['unsupported']
+    assert result['status'] == ('decision' if target == 1 else 'waiting')
+    assert 'death_attack_decision_unavailable' in result['public']['_policy_only']
     assert not result['history_complete']

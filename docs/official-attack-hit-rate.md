@@ -11,11 +11,19 @@
 
 ## native 投影の判断
 
-[native adapter](../cpp/gfrl_core/official_bindings.hpp) は `PendingView.hit_rate` を基底台帳から復元する。[encoder](../cpp/gfrl_core/encoder.cpp) はそれを 100 で割った公開観測を作る。したがって、正の受信値が台帳と一致する場合、および 0/欠損の場合は従来の観測・mask を維持できる。
+[native adapter](../cpp/gfrl_core/official_bindings.hpp) は `PendingView.hit_rate` に正の受信 override を使い、省略時は基底台帳から復元する。[encoder](../cpp/gfrl_core/encoder.cpp) はそれを 100 で割った公開観測を作る。したがって、正の受信値が台帳と一致する場合、および 0/欠損の場合は従来の観測・mask を維持できる。
 
-異なる正の値は、この adapter のままでは native と同じ観測を作れない。台帳値で判断を続けず、`dynamic_hit_rate_unavailable` と受信・台帳の公開命中率を記録する。自分の決定時は停止し、それ以外では待機する。active head だけを判断し、後続 queue の動的値を現在の決定へ適用しない。
+異なる正の値は public pending の `hit_rate` として native の観測へ反映する。
+実行時の発動来歴は確定しないため `dynamic_hit_rate_unavailable` の診断を残し、
+条件付きで `_policy_only` へ移して現在の防御を続行する。0/欠損/台帳と同じ値は従来どおり。
+active head だけを判断し、後続 queue の動的値を現在の決定へ適用しない。
 
-[native 死亡処理](../third_party/goodfield/src/official_match.cpp) の昇天弓は power30/rate75 と `is_death=true` を持つ。受信 atk30 または rate75 だけでは死亡処理の由来やスケジュールを確定できないため、112 の該当形には `death_attack_decision_unavailable` も記録する。通常の atk1/rate25 は従来どおり扱う。`dyingPlayerIds` 単独による通常応答の停止は、条件付きで方策へ戻す。[死亡処理メタデータの判断](official-dying-players.md) を参照。動的 rate / 死亡時112 の停止は維持する。
+112 の atk30 または rate75 は `death_attack_decision_unavailable` の候補として扱う。
+死亡 queue や `death=True` を推測せず、現在の head に正の atk が明示され、自分が
+live・HP正・dying でなく、他の未対応理由が無い場合は方策で応答する。
+rate75のみで atk が欠損した場合は停止する。直前の致死攻撃の来歴も流用しない。
+探索は Python・C++ の両方で遮断し、発動の強制命中は不明として観測する。
+詳細と停止条件は [途中停止対策・第2弾](official-bot-stop-recovery.md) を参照。
 
 ## auto54 の再現範囲
 

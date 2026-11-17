@@ -160,14 +160,36 @@ class Journal:
         self.file.close()
 
 
-def poll_state(probe, predicate, timeout=20):
+def blank_scene(state):
+    return (not state.get('body', '').strip() and not state.get('texts')
+            and not state.get('images') and not state.get('inputs')
+            and state.get('commandPanes') == [])
+
+
+def training_loading(state):
+    # Header/footer without settings or battle content, as observed while
+    # entering training. This permits waiting only, never another start click.
+    return (blank_scene(state) or (
+        re.match(r'\s*(?:←\s*)?修行(?:\s|$)', state['body']) is not None
+        and not any(t in state['body'] for t in ('G.F.', '戦いを始める', '修行者', '終末の時'))
+        and not state.get('inputs') and state.get('commandPanes') == []
+        and not any(r.get('path', '').startswith('/images/items/') for r in state.get('images', []))))
+
+
+def poll_state(probe, predicate, timeout=20, *, loading=None):
     deadline = time.monotonic()+timeout
-    while time.monotonic() < deadline:
+    extended = False
+    while True:
         state = probe.send(dict(kind='state'))['state']
         if predicate(state):
             return state
-        time.sleep(.2)
-    raise UIUnsupported('visible_state_timeout')
+        if time.monotonic() >= deadline:
+            if not extended and loading is not None and loading(state):
+                extended = True
+                deadline = time.monotonic() + max(timeout, 30)
+            else:
+                raise UIUnsupported('visible_state_timeout', dict(wait_extended=True) if extended else {})
+        time.sleep(min(.2, max(0, deadline-time.monotonic())))
 
 
 def settings(state):
@@ -192,7 +214,7 @@ def wait_login(probe, predicate, timeout):
         raise
 
 
-def enter_training(probe, name, *, login_timeout=20):
+def enter_training(probe, name, *, login_timeout=20, settle_timeout=20):
     state = poll_state(probe, lambda s: '生誕する' in s['body'] or 'コンピュータと対戦' in s['body'] or settings(s))
     if '生誕する' in state['body']:
         probe.send(dict(kind='fillName', text=name))
@@ -200,7 +222,7 @@ def enter_training(probe, name, *, login_timeout=20):
         state = wait_login(probe, lambda s: 'コンピュータと対戦' in s['body'], login_timeout)
     if not settings(state):
         probe.send(dict(kind='clickText', text='修行'))
-    return poll_state(probe, settings)
+    return poll_state(probe, settings, settle_timeout, loading=training_loading)
 
 
 def room_screen(state):
@@ -326,7 +348,7 @@ def enter_room(probe, name, mode='room', password=None, *, timeout=20, room_wait
                login_timeout=None, baseline=None, strict_events=False):
     login_timeout = timeout if login_timeout is None else login_timeout
     if mode == 'training':
-        return enter_training(probe, name, login_timeout=login_timeout)
+        return enter_training(probe, name, login_timeout=login_timeout, settle_timeout=timeout)
     require(mode == 'room' and isinstance(password, str) and bool(password), 'room_password_required')
     def lobby(s):
         return all(t in s['body'] for t in ('修行', '隠れ乱闘', '真剣タイマン'))
@@ -443,7 +465,7 @@ def accepted(probe, streams, update, timeout=20, *, retry=None, retry_after=6, p
         require(result['status'] != 'unsupported', 'unsupported_receive', result.get('detail', {}))
         if result.get('public', {}).get('update', update) > update:
             return result
-        if retry is not None and not retried and time.monotonic()-started >= retry_after:
+        if retry is not None and not retried and not extended and time.monotonic()-started >= retry_after:
             retried = True
             retry()
         time.sleep(min(.2, max(0, deadline-time.monotonic())))
@@ -616,6 +638,12 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                         from .official_ui import submission_pending
                         s = probe.send(dict(kind='state'))['state']
                         waiting = submission_pending(s, public, name, plan)
+                        if (not waiting and blank_scene(s)
+                                and plan['confirmation_state'].get('commandPanes') == [plan['pane']]):
+                            # A vanished document is not acceptance. Wait for
+                            # authoritative progress without touching the UI.
+                            waiting = True
+                            current_record['acceptance_blank_wait'] = True
                         if waiting:
                             current_record['acceptance_wait_extended'] = True
                         return waiting
@@ -702,6 +730,8 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 stopped['confirmation_retries'] = current_record['confirmation_retries']
             if current_record.get('acceptance_wait_extended'):
                 stopped['acceptance_wait_extended'] = True
+            if current_record.get('acceptance_blank_wait'):
+                stopped['acceptance_blank_wait'] = True
         journal.write(stopped)
         print(json.dumps(dict(reason=code, detail=detail), ensure_ascii=False, allow_nan=False), file=sys.stderr)
         # Keep observation failures independent so one broken probe command

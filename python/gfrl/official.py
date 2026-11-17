@@ -28,6 +28,18 @@ def parser_module():
         ROOT / 'third_party/goodfield/scripts/parse_official_webchannel.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Local, path-scoped extension of the vendored parser. Keep its strict
+    # schema everywhere else; do not broaden GAME_KEYS for unrelated objects.
+    validate = module._validate_game_values
+    def validate_public(value, path='game', key=None):
+        if path == 'game.players[]' and isinstance(value, dict) and 'confusionCount' in value:
+            count = value['confusionCount']
+            if type(count) is not int or not 0 <= count <= 9007199254740991:
+                raise module.ParseError('unsupported_game_schema',
+                    module._detail(count, path + '.confusionCount'))
+            value = {k: v for k, v in value.items() if k != 'confusionCount'}
+        return validate(value, path, key)
+    module._validate_game_values = validate_public
     return module
 
 
@@ -367,16 +379,16 @@ def project_game(game, viewer, *, prior=None):
                     out['pending']['amount'] = _integer(a['atk'], -9007199254740991)
             if models[0] in (4, 5):
                 out['pending']['power'] = 0
-            # p6/fu/gf2 display a positive DTO rate, otherwise the catalog rate.
-            # The Match-view adapter reconstructs catalog rates only. A display
-            # override is not proof of a native activation/death/redirect state.
+            # Positive DTO rates override the catalog for observation only.
+            # They do not prove an executable activation/death/redirect state.
             catalog_rate = _core.play_catalog()[models[0]]['hit_rate']
             rate = _integer(a['hitRate'], 0, 100) if 'hitRate' in a else 0
             if rate > 0 and rate != catalog_rate:
+                out['pending']['hit_rate'] = rate
                 out['unsupported'].append('dynamic_hit_rate_unavailable')
                 out['detail'].append(dict(code='dynamic_hit_rate_unavailable',
                     models=models, hit_rate=rate, catalog_hit_rate=catalog_rate,
-                    reason='native_pending_uses_catalog_hit_rate'))
+                    reason='dynamic_rate_requires_policy_response'))
             # Native death bows carry both rate=75 and death=true. Neither a
             # 30-power DTO nor a 75% label establishes that execution provenance.
             if models[0] == 112 and (a.get('atk', 0) == 30 or rate == 75):
@@ -686,9 +698,11 @@ class OfficialSession:
             p['removal'] = deepcopy(working['removal'])
         p['decisions'] = self.decisions
         p['last_decision'] = deepcopy(self.events[-1]['decision']) if self.events else None
-        if any(d['code'] == 'multiple_pending_frames' for d in p['detail']):
+        if (any(d['code'] == 'multiple_pending_frames' for d in p['detail'])
+                or 'death_attack_decision_unavailable' in p['unsupported']):
             # The event tail need not describe the head of this queue. Never
             # transfer its redirect/provenance/dynamic value onto another frame.
+            # A death bow may follow our own lethal attack in this same update.
             launch = None
             self.history_complete = False
         if p['pending']:
@@ -723,6 +737,9 @@ class OfficialSession:
                 pending['forced_hit'] = None if _core.play_catalog()[pending['models'][0]]['hit_rate'] else False
             else:
                 pending['forced_hit'] = None if s is None else bool(_core.play_catalog()[pending['models'][0]]['hit_rate'] and 'darkcloud' in s['curses'])
+            if any(code in p['unsupported'] for code in (
+                    'dynamic_hit_rate_unavailable', 'death_attack_decision_unavailable')):
+                pending['forced_hit'] = None
         # Status delta failures expose missing event semantics, not private data.
         for x, y in zip(working['players'], p['players']):
             if x['status'] != y['status'] or x['fogged'] != y['fogged']:
@@ -822,12 +839,19 @@ class OfficialSession:
             if 'redirect_chance_activation_unavailable' in p['unsupported']:
                 relaxable.append('redirect_chance_activation_unavailable')
             own = next(x for x in p['players'] if x['id'] == self.viewer)
-            if (p.get('dying_players') and self.viewer not in p['dying_players']
-                    and not own['dead'] and own['status'] and own['status']['hp'] > 0
-                    and not (set(p['unsupported']) - {'dying_players_decision_unavailable',
-                                                     'redirect_chance_activation_unavailable'})
-                    and 'dying_players_decision_unavailable' in p['unsupported']):
-                relaxable.append('dying_players_decision_unavailable')
+            response_only = {'dying_players_decision_unavailable',
+                             'redirect_chance_activation_unavailable',
+                             'dynamic_hit_rate_unavailable', 'death_attack_decision_unavailable'}
+            if (not own['dead'] and own['status'] and own['status']['hp'] > 0
+                    and self.viewer not in p.get('dying_players', [])
+                    and not (set(p['unsupported']) - response_only)):
+                # A death candidate needs authoritative power. Never answer a
+                # rate75 bow as if its missing power were the catalog's ATK1.
+                death_known_power = ('death_attack_decision_unavailable' not in p['unsupported']
+                                     or public_source['pending'].get('base_override', 0) > 0)
+                if death_known_power:
+                    relaxable.extend(code for code in p['unsupported']
+                        if code in response_only and code not in relaxable)
             for code in relaxable:
                 p['unsupported'].remove(code)
             if relaxable or any(d['code'] == 'multiple_pending_frames' for d in p['detail']):
@@ -837,14 +861,25 @@ class OfficialSession:
                 p['_search_fallback'] = ('response_execution_state_unavailable' if relaxable
                                          else 'response_public_journal_unavailable')
                 p.setdefault('warnings', []).extend('policy_only:' + code for code in p['_policy_only'])
+        if any(x['status'] and x['status']['confused'] for x in p['players']):
+            # Only the visible boolean is public. Do not simulate an invented
+            # number of automatic confused turns, even for the other player.
+            p.setdefault('_policy_only', []).append('confusion_count_unavailable')
+            p.pop('_search_launch', None)
+            p['_search_fallback'] = 'confusion_execution_state_unavailable'
+            p.setdefault('warnings', []).append('policy_only:confusion_count_unavailable')
         self.previous = deepcopy(p)
         self.previous['_source'] = public_source
+        own = next(x for x in p['players'] if x['id'] == self.viewer)
+        confused_wait = (p['phase'] == 0 and p['actor'] == self.viewer and not own['dead']
+                         and own['status'] and own['status']['confused'])
         fatal = [code for code in p['unsupported']
-                 if p['actor'] == self.viewer or code not in DECISION_ONLY_UNSUPPORTED]
+                 if not (code == 'confused_main' and confused_wait)
+                 and (p['actor'] == self.viewer or code not in DECISION_ONLY_UNSUPPORTED)]
         if fatal:
             return dict(status='unsupported', public=p, unsupported=p['unsupported'], detail=unsupported_detail(p),
                         history_complete=self.history_complete)
-        if p['actor'] != self.viewer or p['is_over']:
+        if p['actor'] != self.viewer or p['is_over'] or confused_wait:
             return dict(status='finished' if p['is_over'] else 'waiting', public=p,
                         unsupported=p['unsupported'], detail=unsupported_detail(p),
                         history_complete=self.history_complete)

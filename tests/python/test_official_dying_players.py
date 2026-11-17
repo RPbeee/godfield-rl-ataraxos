@@ -36,8 +36,8 @@ def test_nonempty_dying_stops_only_at_own_decision(response, own_decision):
     game = parser_module().sanitize_game(game, 1)
     session = OfficialSession(1)
     result = session.ingest(game)
-    assert result['status'] == ('unsupported' if own_decision else 'waiting')
-    assert 'env' not in result
+    assert result['status'] == (('decision' if response else 'unsupported') if own_decision else 'waiting')
+    assert ('env' in result) == (response and own_decision)
     assert result['public']['dying_players'] == [2]
     assert result['public']['players'][1]['dead'] is False
     expected = [dict(code='dying_players_decision_unavailable',

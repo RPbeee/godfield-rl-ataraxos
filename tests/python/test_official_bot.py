@@ -759,8 +759,11 @@ def test_screen_changing_effects_still_stop(effect, player):
         p['status']['curses'].append('fog')
     else:
         p.update(status=None, fogged=True)
-    with pytest.raises(UIUnsupported, match='unobserved_screen_effect'):
+    if effect == 'confused' and (p['id'] != r['public']['viewer'] or r['public']['phase'] == 1):
         prepare(r['state'], r['public'], r['action'], 'SyntheticName')
+    else:
+        with pytest.raises(UIUnsupported, match='unobserved_screen_effect'):
+            prepare(r['state'], r['public'], r['action'], 'SyntheticName')
 
 
 @pytest.mark.parametrize('curse', ['cold', 'fever', 'hell', 'heaven', 'dream', 'flash', 'darkcloud'])
