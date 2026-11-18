@@ -289,16 +289,21 @@ def test_wide_shortfall_and_bootstrap_clusters():
     assert combined['metric_roots']['discovery/2/heldout_gap'] == 1
 
 
-def test_all_json_report_paths_numpy_scalars_and_cuda_metadata(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('with_opponent', [False, True])
+def test_all_json_report_paths_numpy_scalars_and_cuda_metadata(tmp_path, monkeypatch, capsys, with_opponent):
     from time import perf_counter
     rec, data = wide_fixture()
     analyze_wide_root(rec, data)
     rec.update(world_counts=dict(requested=80, completed=80, load_failed=0, truncated=0),
                continuation_decisions=100, coverage_met=np.bool_(True),
                top_certified=np.bool_(False), candidate_mass=np.float64(.9))
-    games = [dict(g=0, truncated=np.bool_(False))]
+    games = [dict(g=0, truncated=np.bool_(False), agent_seat=np.int64(0), result=np.int64(1))]
     config = parser().parse_args(['--device', 'cuda', '--wide-candidates', '2', '--bootstrap', '10',
                                   '--out', str(tmp_path/'report.json')])
+    if with_opponent:
+        config.opponent_checkpoint = 'opponent.pt'
+        config.opponent_model_config = dict(d=np.int64(24))
+        rec['diagnostic_decision_index'] = np.int64(2)
     monkeypatch.setattr(torch.cuda, 'get_device_name', lambda: 'mock CUDA (serialization only)')
     start = perf_counter()
     # Initial, checkpoint and final reports all exercise the same encoder.
@@ -307,6 +312,12 @@ def test_all_json_report_paths_numpy_scalars_and_cuda_metadata(tmp_path, monkeyp
         loaded = json.loads(config.out.read_text())
         assert loaded['runtime']['device_name'].startswith('mock CUDA')
     assert loaded['roots'][0]['coverage_met'] is True
+    if with_opponent:
+        assert loaded['schema_version'] == 3
+        assert loaded['collection_summary']['win_rate'] == 1.
+        assert loaded['selection']['selected_diagnostic_indices_by_game'][0] == [2]
+    else:
+        assert not any(k.startswith('opponent_') for k in loaded['config'])
     assert loaded['wide_summary']['overall']['estimate']['discovery/2/heldout_gap'] == pytest.approx(.7)
     monkeypatch.setattr(sys, 'argv', ['luck_diagnostic.py', '--summarize', str(config.out),
                                      '--out', str(tmp_path/'resummary.json'), '--bootstrap', '10'])
@@ -319,7 +330,7 @@ def test_all_json_report_paths_numpy_scalars_and_cuda_metadata(tmp_path, monkeyp
                                 allow_nan=False, default=_json_default)) == dict(b=True, i=2, a=[3])
     config.wide_candidates = 0
     legacy = save_report(config, [], games, None, start, start)
-    assert legacy['schema_version'] == 1 and 'wide_summary' not in legacy
+    assert legacy['schema_version'] == (3 if with_opponent else 1) and 'wide_summary' not in legacy
     assert not any(k.startswith('wide_') for k in legacy['config'])
 
 
@@ -371,3 +382,296 @@ def test_wide_underflowed_legal_action_and_extreme_temperature(monkeypatch, meth
     action, = rec['wide']['actions']
     assert action['path'] == [1] and action['pi'] == 0.
     assert action['log_pi'] == -1000. and action['proposal_index'] <= 128
+
+
+class FixedDiagnosticModel(Model):
+    """Different policy and V per model, independent of numerical batching."""
+    def __init__(self, d, last, value_logits):
+        super().__init__(ModelConfig(d=d, heads=2, depth=1, ff=2*d))
+        self.last = last
+        self.fixed_value = value_logits
+
+    def heads(self, encoded, **prefix):
+        mask = prefix['mask'].bool()
+        index = torch.arange(mask.shape[1], device=mask.device).expand_as(mask)
+        chosen = index.masked_fill(~mask, -1 if self.last else mask.shape[1])
+        chosen = chosen.max(1).values if self.last else chosen.min(1).values
+        logits = torch.full(mask.shape, -30., device=mask.device).masked_fill(~mask, -torch.inf)
+        logits.scatter_(1, chosen[:, None], 0.)
+        return logits.log_softmax(-1), torch.tensor(self.fixed_value, device=mask.device).expand(len(mask), -1)
+
+
+@pytest.fixture
+def diagnostic_single_thread():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+@pytest.mark.parametrize('selection', ['reservoir', 'window'])
+def test_opponent_collection_matches_independent_games_and_own_gae(selection, diagnostic_single_thread):
+    from luck_diagnostic import scalar, collection_summary
+    model = FixedDiagnosticModel(16, False, [1., 0., -.5]).eval()
+    opponent = FixedDiagnosticModel(24, True, [-1., 2., 0.]).eval()
+    config = args(games=5, num_envs=2, root_selection=selection, target_range=100)
+    archive, records, games, targets = collect(config, model, opponent)
+    # Independent ordinary Actor execution, without archive/reservoir logic.
+    env = VecEnv(2, 1, eval_pairs=3, opponent='external', eval_seed=config.seed)
+    actors = [Actor(model, env, 'cpu'), Actor(opponent, env, 'cpu')]
+    lengths, sequences, paths, current = {}, {}, {}, {}
+    while not env.eval_done():
+        active = np.flatnonzero(env.stage >= 0)
+        for r in active[env.substep[active] == 0]:
+            g, seat = int(env.episode_id[r]), int(env.actor_seat[r])
+            d = lengths.get(g, 0)
+            lengths[g] = d+1
+            current[int(r)] = (g, d)
+            paths[g, d] = []
+            if seat == g % 2:
+                sequences.setdefault(g, []).append(torch.tensor(model.fixed_value).softmax(-1).numpy())
+        choices = np.zeros(2, np.int32)
+        for actor, own in zip(actors, (True, False)):
+            rows = active[(env.actor_seat[active] == env.episode_id[active] % 2) == own]
+            result = actor.act(rows, compact_transfer=True)
+            choices[rows] = result.choices[rows]
+        for r in active:
+            paths[current[int(r)]].append(int(choices[r]))
+        env.step(choices)
+    reference = {g['g']: g for g in env.eval_results() if g['g'] < config.games}
+    for g in games:
+        assert {k: v for k, v in g.items() if k not in ('external_decisions', 'diagnostic_decisions')} == reference[g['g']]
+        assert g['external_decisions'] == lengths[g['g']]
+        assert g['diagnostic_decisions'] == len(sequences[g['g']])
+        selected = [r for r in records if r['game'] == g['g']]
+        if selection == 'reservoir':
+            assert len(selected) == min(config.roots_per_game, g['diagnostic_decisions'])
+    for rec in records:
+        g = rec['game']
+        assert rec['seat'] == g % 2
+        assert rec['actual_path'] == paths[g, rec['decision_index']]
+        ps = sequences[g]
+        _, gae = sequence_targets(ps, reference[g]['result'], config.lambda_v, config.lambda_a, config.gamma)
+        assert rec['v'] == pytest.approx(scalar([model.fixed_value])[0])
+        assert rec['gae'] == pytest.approx(gae[rec['sequence_index']])
+        assert rec['sequence_index'] == rec['diagnostic_decision_index']
+        if targets is not None:
+            assert rec['diagnostic_decision_index'] in targets[g]
+        replay = SearchEnv(1, 1)
+        copy_exact(replay, archive, [rec['archive_row']])
+        assert replay.actor_seat[0] == rec['seat']
+        for choice in rec['actual_path']:
+            assert replay.mask[0, choice]
+            replay.step(np.array([choice], np.int32))
+        assert replay.decisions[0] == 1
+    summary = collection_summary(games)
+    assert [summary['by_seat'][str(s)]['games'] for s in (0, 1)] == [3, 2]
+    assert summary['win_rate'] == pytest.approx(np.mean([(g['result']+1)/2 for g in games]))
+
+
+def test_opponent_panel_independent_replay_value_source_and_chunks(diagnostic_single_thread):
+    from luck_diagnostic import scalar
+    model = FixedDiagnosticModel(16, False, [1., 0., -.5]).eval()
+    opponent = FixedDiagnosticModel(24, True, [-1., 2., 0.]).eval()
+    config = args(games=2, num_envs=2, roots_per_game=1, wide_candidates=2, wide_draws=64,
+                  wide_method='prefix-uniform', wide_temperature=2., wide_max_pi=1.)
+    archive, records, _, _ = collect(config, model, opponent)
+    for rec in records:
+        candidates(config, model, archive, rec)
+        wide_candidates(config, model, archive, rec)
+        data = panel(config, model, archive, rec, opponent)
+        changed = copy.copy(config)
+        changed.world_batch, changed.inference_batch = 7, 3
+        other = panel(changed, model, archive, rec, opponent)
+        for key in data:
+            np.testing.assert_array_equal(data[key], other[key])
+        # Replay every forced arm with ordinary Actors and the saved chance seed.
+        # Fixed policies make all P columns equal; no diagnostic actor is used.
+        arms = rec['candidate_paths']+[rec['candidate_paths'][0]]+[a['path'] for a in rec['wide']['actions']]
+        for a, path in enumerate(arms):
+            for c, seed in enumerate(data['chance_seeds']):
+                env = SearchEnv(1, 1)
+                copy_exact(env, archive, [rec['archive_row']], [seed])
+                ps = [torch.tensor(model.fixed_value).softmax(-1).numpy()]
+                for choice in path:
+                    env.step(np.array([choice], np.int32))
+                post = None
+                first = None
+                actors = [Actor(model, env, 'cpu'), Actor(opponent, env, 'cpu')]
+                while env.stage[0] >= 0:
+                    own = env.actor_seat[0] == rec['seat']
+                    v = float(scalar([model.fixed_value])[0])
+                    if post is None:
+                        post = v if own else -v
+                    if own and env.substep[0] == 0:
+                        ps.append(torch.tensor(model.fixed_value).softmax(-1).numpy())
+                        if first is None:
+                            first = v
+                    env.step(actors[0 if own else 1].act(compact_transfer=True).choices)
+                z = int(env.result[0])
+                _, gae = sequence_targets(ps, z, config.lambda_v, config.lambda_a, config.gamma)
+                np.testing.assert_allclose(data['outcome'][a, c], z)
+                np.testing.assert_allclose(data['gae'][a, c], gae[0], atol=1e-6)
+                np.testing.assert_allclose(data['post_v'][a, c], post if post is not None else z)
+                np.testing.assert_allclose(data['next_own_v'][a, c], first if first is not None else z)
+        assert not data['status'].any()
+        analyze_root(rec, data)
+        assert 'metrics' in rec and 'summary' in rec['wide']
+
+
+def test_opponent_stochastic_tail_wide_and_precision_caches(diagnostic_single_thread):
+    from luck_diagnostic import OpponentDiagnosticActor
+    torch.manual_seed(19)
+    model = Model(ModelConfig(d=16, heads=2, depth=1, ff=32)).eval()
+    opponent = Model(ModelConfig(d=24, heads=2, depth=2, ff=48)).eval()
+    # CPU autocast exercises distinct actual encoding dtypes without CUDA.
+    # The CLI continues to require fp32 for CPU production runs.
+    config = args(games=2, num_envs=2, roots_per_game=1, max_candidates=2, mass=.5,
+                  wide_candidates=2, wide_draws=64, wide_method='prefix-uniform',
+                  wide_temperature=2., wide_max_pi=1., opponent_dtype='bf16')
+    archive, records, games, _ = collect(config, model, opponent)
+    _, repeat, repeat_games, _ = collect(config, model, opponent)
+    assert records == repeat and games == repeat_games
+    tails = []
+    for rec in records:
+        candidates(config, model, archive, rec)
+        tails.append(rec['tail_mass'])
+        wide_candidates(config, model, archive, rec)
+        original = copy.deepcopy(rec)
+        data = panel(config, model, archive, rec, opponent)
+        changed = copy.copy(config)
+        changed.world_batch, changed.inference_batch = 7, 3
+        small = panel(changed, model, archive, copy.deepcopy(original), opponent)
+        for key in data:
+            np.testing.assert_allclose(data[key], small[key], atol=2e-6)
+        if rec['tail_mass'] > 1e-7:
+            assert np.all(data['tail_retained_index'] == -1)
+        assert not data['status'].any()
+        # Removing wide proposals preserves every original arm and summary.
+        no_wide = copy.deepcopy(original)
+        no_wide.pop('wide')
+        base = panel(config, model, archive, no_wide, opponent)
+        K = len(rec['candidate_paths'])
+        for key in ('outcome', 'gae', 'post_v', 'next_own_v', 'status'):
+            np.testing.assert_array_equal(base[key], data[key][:K+1])
+        analyze_root(rec, data)
+        analyze_root(no_wide, base)
+        assert rec['metrics'] == no_wide['metrics']
+        # Inspect live caches across seat transitions: each keeps its own
+        # shape and dtype, while only diagnostic values are returned.
+        env = SearchEnv(1, 1)
+        copy_exact(env, archive, [rec['archive_row']])
+        actor = OpponentDiagnosticActor(config, model, opponent, env, [42], rec['seat'])
+        seen_opponent = False
+        while env.stage[0] >= 0:
+            result = actor.act(compact_transfer=True)
+            if env.actor_seat[0] != rec['seat']:
+                seen_opponent = True
+                assert actor.token_cache.dtype == torch.float32
+                assert actor.opponent.token_cache.dtype == torch.bfloat16
+                assert actor.token_cache.shape[-1] == 16
+                assert actor.opponent.token_cache.shape[-1] == 24
+                break
+            env.step(result.choices)
+        assert seen_opponent
+    assert any(t > 1e-7 for t in tails)
+
+
+def test_opponent_loads_independent_size_weights_and_auto_dtype(tmp_path, monkeypatch):
+    from luck_diagnostic import load_model, opponent_precision
+    from contextlib import contextmanager
+    torch.manual_seed(3)
+    models = [Model(ModelConfig(d=d, heads=2, depth=1, ff=2*d)) for d in (16, 24)]
+    for i, model in enumerate(models):
+        ema = {k: v.clone() for k, v in model.state_dict().items()}
+        ema['value_head.bias'].fill_(7)
+        torch.save(dict(model_config=vars(model.config), model=model.state_dict(), ema=ema,
+                        config=dict(dtype=('bf16', 'fp32')[i], tf32=(i == 0)), iteration=np.int64(10+i)),
+                   tmp_path/f'{i}.pt')
+    config = parser().parse_args(['--checkpoint', str(tmp_path/'0.pt'), '--opponent-checkpoint', str(tmp_path/'1.pt'),
+                                  '--opponent-weights', 'ema', '--device', 'cuda'])
+    monkeypatch.setattr(Model, 'to', lambda self, *a, **kw: self)
+    diagnostic = load_model(config, parser())
+    other = load_model(config, parser(), opponent=True)
+    assert diagnostic.config.d == 16 and other.config.d == 24
+    assert config.dtype == 'bf16' and config.opponent_dtype == 'fp32'
+    assert config.checkpoint_iteration == 10 and config.opponent_checkpoint_iteration == 11
+    assert config.checkpoint_sha256 != config.opponent_checkpoint_sha256
+    for k, v in other.state_dict().items():
+        torch.testing.assert_close(v, torch.load(tmp_path/'1.pt', weights_only=False)['ema'][k])
+    events = []
+    @contextmanager
+    def autocast(device, **kwargs):
+        events.append((device, kwargs))
+        yield
+    monkeypatch.setattr(torch, 'autocast', autocast)
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        with pytest.raises(RuntimeError, match='restore'):
+            with opponent_precision(config):
+                assert not torch.backends.cuda.matmul.allow_tf32
+                raise RuntimeError('restore')
+        assert torch.backends.cuda.matmul.allow_tf32
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+    assert events == [('cuda', dict(dtype=torch.float16, enabled=False))]
+
+
+def test_collection_summary_truncation_and_empty():
+    from luck_diagnostic import collection_summary
+    games = [dict(agent_seat=i % 2, result=z, truncated=i == 3) for i, z in enumerate((1, -1, 0, 0))]
+    summary = collection_summary(games)
+    assert (summary['wins'], summary['losses'], summary['draws'], summary['truncated']) == (1, 1, 1, 1)
+    assert summary['win_rate'] == summary['evaluation_win_rate'] == .5
+    assert summary['strict_win_rate'] == pytest.approx(1/3)
+    assert collection_summary([])['win_rate'] is None
+    assert collection_summary([games[-1]])['win_rate'] is None
+
+
+def test_opponent_main_all_save_paths_with_numpy_and_mock_cuda(tmp_path, monkeypatch, capsys,
+                                                              diagnostic_single_thread):
+    import luck_diagnostic as diagnostic
+    from contextlib import nullcontext
+    torch.manual_seed(23)
+    model = Model(ModelConfig(d=16, heads=2, depth=1, ff=32)).eval()
+    opponent = Model(ModelConfig(d=24, heads=2, depth=1, ff=48)).eval()
+    config = args(games=2, num_envs=2, roots_per_game=1, max_candidates=2)
+    archive, records, games, targets = collect(config, model, opponent)
+    panels = {}
+    for rec in records:
+        candidates(config, model, archive, rec)
+        panels[rec['archive_row']] = panel(config, model, archive, rec, opponent)
+        rec['coverage_met'] = np.bool_(rec['coverage_met'])
+    def load(config, parser, *, opponent=False):
+        if opponent:
+            config.opponent_dtype = 'bf16'
+            config.opponent_checkpoint_iteration = np.int64(500)
+        else:
+            config.dtype, config.training_tf32 = 'fp32', False
+        return object()
+    monkeypatch.setattr(diagnostic, 'load_model', load)
+    monkeypatch.setattr(diagnostic, 'collect', lambda *a: (archive, records, games, targets))
+    monkeypatch.setattr(diagnostic, 'candidates', lambda *a: None)
+    monkeypatch.setattr(diagnostic, 'panel', lambda config, model, archive, rec, opponent: panels[rec['archive_row']])
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda: 'mock CUDA serialization')
+    monkeypatch.setattr(torch, 'autocast', lambda *a, **kw: nullcontext())
+    output = tmp_path/'main.json'
+    monkeypatch.setattr(sys, 'argv', ['luck_diagnostic.py', '--checkpoint', 'diagnostic.pt',
+        '--opponent-checkpoint', 'opponent.pt', '--device', 'cuda', '--threads', '1',
+        '--games', '2', '--roots-per-game', '1', '--bootstrap', '10', '--out', str(output)])
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        main()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+    saved = json.loads(output.read_text())
+    assert saved['final'] and saved['schema_version'] == 3
+    assert saved['config']['opponent_checkpoint_iteration'] == 500
+    assert saved['collection_summary']['completed'] == 2
+    assert '"collection_summary"' in capsys.readouterr().out
+    assert len(list(output.with_suffix('.samples').glob('*.npz'))) == 2
+    assert not list(tmp_path.glob('*.tmp'))

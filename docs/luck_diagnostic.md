@@ -2,8 +2,19 @@
 
 `scripts/luck_diagnostic.py`。bot・探索・learner から呼ばれない独立 CLI。
 両者の **online `model`** を固定し、学習 collector と同じカテゴリカル sampling を使う。
-`--weights ema` で評価用 EMA に変更可能。CUDA の `--dtype auto` は checkpoint の
-学習 dtype、CPU は fp32。CUDA の TF32 設定も checkpoint から引き継ぐ。
+`--checkpoint` は診断対象、`--opponent-checkpoint` は固定相手。相手を省略すると
+従来どおりの自己対戦で、根の抽出・raw 配列・summary・config/schema を保つ。
+相手指定時は schema_version=3（wide 有無共通）。実ゲームから chance/policy grid、
+wide、tail の全継続まで、診断対象の席は診断対象モデル、相手席は相手モデルを使う。
+根は診断対象の手番だけから取る。同一 checkpoint を相手として明示した場合も、
+根を片側から取る新しい測定になるため、省略時の自己対戦診断とは区別する。
+
+`--weights ema` で診断対象を EMA に変更可能。相手には独立の
+`--opponent-weights online|ema`（既定 online）、`--opponent-dtype auto|fp32|bf16|fp16`
+（既定 auto）がある。CUDA の各 `--dtype auto` はそれぞれの checkpoint の
+学習 dtype、CPU は双方 fp32。モデルのサイズが異なってもよい。
+CUDA の TF32 設定も各 checkpoint から引き継ぎ、モデルを切り替える間だけ変更する。
+推論はモデル別の cache とバッチを使う。キャッシュの予算 `--cache-mb` は各モデルに適用。
 相手 pool、探索、privileged critic は使わず、shared value head を読む。
 
 ## 実行
@@ -20,13 +31,14 @@ Mac の小規模検証（本番の結論には使わない）:
 
 ```sh
 .venv/bin/python scripts/luck_diagnostic.py \
-  --checkpoint /Users/yuto/godfield-rl-ataraxos/runs/play/m-xit1.pt \
-  --device cpu --threads 1 --games 8 --num-envs 8 \
+  --checkpoint runs/play/m-xit1.pt --opponent-checkpoint runs/play/m-2166.pt \
+  --device cpu --threads 1 --games 8 --num-envs 4 \
   --roots-per-game 2 --root-selection reservoir \
   --chance-repeats 4 --policy-repeats 4 \
   --max-candidates 8 --candidate-nodes 256 --prefix-batch 8 \
+  --wide-candidates 8 --wide-draws 256 \
   --world-batch 128 --inference-batch 64 --bootstrap 100 \
-  --out measurements/luck-reservoir-cpu.json
+  --out measurements/luck-opp-cpu.json
 ```
 
 TSUBAME では CUDA が見える既存環境で、最初に wide pilot:
@@ -34,12 +46,13 @@ TSUBAME では CUDA が見える既存環境で、最初に wide pilot:
 ```sh
 python scripts/luck_diagnostic.py \
   --checkpoint runs/hp-lr1e5/ckpt-4500.pt --device cuda --threads 32 \
+  --opponent-checkpoint runs/ml-M/ckpt-500.pt \
   --games 16 --num-envs 16 --roots-per-game 2 --root-selection reservoir \
   --mass .99 --min-candidates 2 --max-candidates 32 --candidate-nodes 2048 \
   --wide-candidates 8 --wide-method prefix-uniform --wide-max-pi .01 --wide-draws 256 \
   --chance-repeats 16 --policy-repeats 16 \
   --world-batch 2048 --inference-batch 512 --cache-mb 1024 \
-  --bootstrap 200 --out measurements/luck-wide-pilot.json
+  --bootstrap 200 --out measurements/luck-opp-wide-pilot.json
 ```
 
 本番の推奨開始点（最大 256 根、追加最大 8 手、16×16。以下以外は既定値）:
@@ -47,30 +60,30 @@ python scripts/luck_diagnostic.py \
 ```sh
 python scripts/luck_diagnostic.py \
   --checkpoint runs/hp-lr1e5/ckpt-4500.pt --device cuda --threads 32 \
+  --opponent-checkpoint runs/ml-M/ckpt-500.pt \
   --games 128 --num-envs 32 --roots-per-game 2 --root-selection reservoir \
   --mass .99 --min-candidates 2 --max-candidates 32 --candidate-nodes 2048 \
   --wide-candidates 8 --wide-method prefix-uniform --wide-max-pi .01 --wide-draws 256 \
   --chance-repeats 16 --policy-repeats 16 \
   --world-batch 2048 --inference-batch 512 --cache-mb 1024 --bootstrap 2000 \
-  --out measurements/luck-wide-production.json
+  --out measurements/luck-opp-wide-production.json
 ```
 
 各根 `(従来候補数 K + tail 1 + 実際の追加数 N)×16×16` 継続。
-external decision が 2 回未満のゲームでは根が減る。K は実着手を含み、
+診断対象側の external decision が 2 回未満のゲームでは根が減る。K は実着手を含み、
 最大候補数には実着手追加で +1 があり得る。低 π の合法手が少なければ N は減る。
 **CUDA は推論だけ、ゲーム進行は C++ CPU workers**。GPU engine の oracle importer
 を新設する代わりに、CPU の完全状態をそのまま利用する。40GB MIG 向けに推論を
-512 行、world を 2048 行に分割し、encoding cache は 1GB 上限かつ空き GPU
+512 行、world を 2048 行に分割し、encoding cache は各モデル 1GB 上限かつ空き GPU
 メモリの 1/4 以下。収まらない cache は host に置く。共有 GPU で不足する場合は
 `--inference-batch 256 --world-batch 1024 --cache-mb 512`。
 
-時間見積りは前回の **493 根（要求 512）、16×16、約 85 分、16 threads で
-約 1700 continuation decisions/s** という実測を基準にする。32 threads が比例して
-速くなるとは仮定しない。同じ残り長・速度で K が 2 / 3 / 5 なら、追加 8 手・256 根は
-`85分 × (256/493) × (K+9)/(K+1)` = **約 162 / 132 / 103 分**。
-したがって **約 2–3 時間を狙う設定**。これは K の単純例であり、厳密な見積りには
-根の残り長で重み付けした arm 数が必要。追加手がゲーム長を変えること、候補生成と
-bootstrap の時間、共有 GPU の混雑で超過し得る。新機能の CUDA 計時は手元では未実測。
+時間見積りは直近の **wide 8・256 根・32 threads で約 60 分**という自己対戦の
+実測を基準にする。同程度のモデルサイズなら、相手手番では相手方策に加えて診断対象の
+value head も評価するため、手番が半々なら総推論量は約 1.5 倍相当になる。
+モデル別バッチが小さくなる影響も見込み、**暫定で約 90–120 分、余裕を見て 2–3 時間**。
+ゲーム長・候補数・wide shortfall・CPU/GPU の律速割合・モデルサイズで変わり、
+CUDA の計時は手元では未実測。60 分を保証した見積りではない。
 pilot は同じ 16×16 と 32 threads なので、本番はその継続時間の約 8 倍が目安。
 pilot の diagnostic_seconds が 20 分超なら 160 分超となるため、
 本番を `--games 96`（最大 192 根）に下げて約 6 倍にする。比較時は
@@ -81,14 +94,41 @@ CI が未解決なら根数か種数を増やし、精度不足をゼロと解�
 
 ## 抽出・完全状態・候補
 
-既定の `--root-selection reservoir` は、各ゲームの全 external decision を流しながら
+相手指定時、ゲーム番号 g の診断対象席は `g % 2`。同一 deal-pair の 2 局で席を
+入れ替える。公平な比較には偶数の `--games` を使う。奇数も許すが片席が 1 局多い。
+環境スロットの再利用後もゲーム番号に従って切り替える。
+
+既定の `--root-selection reservoir` は、各ゲームの対象 external decision を流しながら
 標準の reservoir sampling で最大 roots-per-game 個の異なる時点を保持する。
-両 seat を含め、終局後に各ゲーム内で一様な根が残る。ゲームを等重みにしてその中の
+相手指定時は診断対象の手番だけ、省略時は従来どおり両 seat を含め、終局後に各ゲーム内で
+一様な根が残る。ゲームを等重みにしてその中の
 決定点を抽出する分布であり、長いゲームを長さに比例して重くする分布ではない。
 比較用の `--root-selection window` では、開始前に `[0,target-range)` から異なる
-index を一様に抽出し、未到達を置換せず別計上する。この場合だけ生存・窓内に条件付く。
+index を一様に抽出し、未到達を置換せず別計上する。相手指定時は診断対象側だけの
+decision index に適用する。この場合だけ生存・窓内に条件付く。
 `selection` と各根の開始 index・残り長・progress を保存する。
 実ゲームの方策 RNG は独立。実着手の完全な外部 choice 列とその時点の V を保存する。
+
+相手指定時の根の `diagnostic_decision_index` / `sequence_index` は診断対象だけの
+通算 index、既存の `decision_index` / `decisions_to_end` / `progress` は両者を含む
+対局全体の位置を表す。`selection.selected_diagnostic_indices_by_game` に抽出用 index、
+各 game の `diagnostic_decisions` に診断対象の手数を保存する。
+
+Q・advantage・GAE・outcome は常に診断対象の席から見た値。root V と next-own V は
+診断対象の観測に対する診断対象モデルの head を使う。post V も常に診断対象モデルの
+head で、直後が相手手番なら相手 viewer の観測に対する V の符号を反転する
+（診断対象 viewer に固定した V とは異なる従来の定義）。相手モデルの value head は
+これらの統計に混ぜない。GAE は診断対象の手番だけで learner と同じ再帰を計算する。
+継続の inverse-CDF RNG はモデルの振り分け後に lane ごとに一度だけ消費し、
+共通 chance/policy grid と root/continuation の stream 分離を維持する。
+
+相手指定時は JSON と完了時 stdout の `collection_summary` で実ゲームの勝率を照合できる。
+`win_rate` は打ち切りを除いた `(勝ち + 引分/2) / 終局数`（既存評価と同じ半勝換算）、
+`strict_win_rate` は引分を勝ちに数えない率、`evaluation_win_rate` は既存 evaluation と
+同じく打ち切りも引分に数えた率。`wins/losses/draws/truncated` と `by_seat` も出す。
+打ち切りがなければ約 62% の既知の評価との比較には `win_rate` を使える。
+128 局だけの率には標本誤差があるので厳密な一致は要求しない。
+相手省略時は report 形式まで維持し、この新しい集計欄は加えない。
 
 `SearchEnv.diagnostic_copy_exact` は Match、選択 cursor、**双方の実履歴**をコピーする。
 既存 oracle loader の determinization・履歴 projection・own Dream 再抽選を使わず、
@@ -121,7 +161,8 @@ wide 無効時は raw の最後が tail。wide 有効時はその後に追加手
 評価バッチ、統計を維持する。有効時も `candidate_paths/pi/mass`、`tail_mass`、
 `actual_index`、`q`、`summary` は従来集合だけを表す。追加手を全方策平均の層化に
 組み込まない。追加手自身が tail サンプルで選ばれることは正しい挙動。
-追加は `roots[i].wide` と `wide_summary` に保存し、schema_version は 2（無効時は 1）。
+追加は `roots[i].wide` と `wide_summary` に保存する。相手省略時の schema_version は
+2（wide 無効時は 1）、相手指定時は wide 有無にかかわらず 3。
 raw NPZ は `[従来 K 手, tail, 追加 N 手]`。C/P seed はすべての arm で同じ。
 
 | オプション | 既定 | 意味 |
@@ -358,3 +399,38 @@ load failure・打ち切り 0。約 72.5 秒、19,033 continuation decisions、�
 特に 0 の evidence 区間は「存在しない」証明ではない。全例ゼロの通常 bootstrap は
 未検出の母集団率を推定できず、小さな crossed grid の検出力も低い。
 JSON、stdout log、raw NPZ は `measurements/luck-wide-validation*` に保存した。
+
+## 固定相手拡張の検証記録（2026-11-18）
+
+この worktree 内で指定の CMake configure/build と CTest **19/19** に成功。
+指定 MPS case を除く全 pytest は **1563 passed, 122 skipped, 1 deselected**
+（113.20 秒）。既存の read-only NumPy→Torch warning 1 件。
+診断テストは **28 passed**。独立した通常 Actor による実ゲーム・継続 replay と照合し、
+診断対象の根だけを選ぶこと、deal-pair の席交換、スロット再利用・奇数局、reservoir/window、
+診断対象だけの GAE、post V の参照元と符号、tail/wide、world/inference 分割を検証した。
+異なるサイズ（d=16/24、depth=1/2）と異なる encoding dtype（CPU autocast の fp32/bf16）
+でも確認。CUDA の auto dtype・EMA・TF32 切替/例外時の復元は mock で確認した。
+CUDA device_name 分岐で NumPy scalar を含む初期・途中・最終保存、完了 stdout、
+`--summarize` を通し、全 JSON 経路で `_json_default` を使うことも確認。
+**CUDA 推論の実機確認はしていない。** CPU CLI の dtype は従来どおり fp32 に限定。
+
+HEAD 版と直接比較し、相手省略・wide 0/3 の各 8 根で collection・候補・全 raw 配列・
+根の統計・summary/wide_summary が完全一致。時計だけ固定した report 全体でも
+config/schema を含め完全一致（`measurements/luck-opp-legacy-equivalence.log`）。
+実 checkpoint の report を `--summarize` し直した際も、両 summary と
+`collection_summary`・根・実ゲーム・config が完全一致した。
+
+上記 CPU コマンドの `m-xit1.pt` online 対 `m-2166.pt` online は、
+学習 dtype がそれぞれ bf16/fp32、CPU 推論は双方 fp32。
+8 局（各席 4 局）で **2 勝 6 敗、勝率 25%**（各席とも 25%）、打ち切りなし。
+16 根（main 12 / response 4）、追加 **88 手**（平均 5.5、平均 shortfall 2.5）、
+**2,208 / 2,208 継続が終局**、load failure・継続打ち切り 0。
+総時間 **205.16 秒**、うち収集 1.36 秒、59,567 continuation decisions、
+**292.3 decisions/s**。テストと並走した参考の CPU 計時。
+追加手の根平均 `Q−Qπ` は −0.11156、最大 8 手の cross-fit held-out gap は −0.07692。
+少数根・4×4 grid の動作確認であり、**ckpt-4500 対 ml-M の学習停滞やゲームの天井の
+結論には一切使わない**。JSON/log/raw は `measurements/luck-opp-cpu*`。
+
+変更対象は診断 CLI・診断テスト・この文書だけ。`third_party/goodfield`・bot・探索・
+学習の既定動作には変更を加えていない。メインへの書き込み、コミット、ネットワーク利用、
+TSUBAME 接続は行っていない。

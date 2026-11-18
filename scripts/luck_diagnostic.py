@@ -8,6 +8,7 @@ simulate games on the host. Nothing in play/search/training imports this script.
 """
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 import heapq
 import hashlib
 import json
@@ -46,8 +47,38 @@ def scalar(logits):
     return p[:, 0]-p[:, 1]
 
 
+@contextmanager
+def opponent_precision(args):
+    """Override the diagnostic autocast/TF32 settings only for the opponent."""
+    cuda = args.device == 'cuda'
+    previous = torch.backends.cuda.matmul.allow_tf32 if cuda else None
+    try:
+        if cuda:
+            torch.backends.cuda.matmul.allow_tf32 = args.opponent_training_tf32
+        dtype = getattr(args, 'opponent_dtype', 'fp32')
+        with torch.autocast(args.device, dtype=torch.bfloat16 if dtype == 'bf16' else torch.float16,
+                            enabled=dtype != 'fp32'):
+            yield
+    finally:
+        if cuda:
+            torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+def collection_action(args, actor, opponent):
+    env = actor.env
+    own = env.actor_seat == env.episode_id % 2
+    active = env.stage >= 0
+    selected = actor.act(np.flatnonzero(active & own), compact_transfer=True)
+    with opponent_precision(args):
+        other = opponent.act(np.flatnonzero(active & ~own), compact_transfer=True)
+    choices = selected.choices.copy()
+    choices[~own] = other.choices[~own]
+    # Opponent values/log probabilities are not diagnostic observations.
+    return ActResult(choices, selected.log_prob, selected.value_logits, selected.log_probs)
+
+
 @torch.inference_mode()
-def collect(args, model):
+def collect(args, model, opponent_model=None):
     """Uniform per-game reservoir, or pre-drawn fixed-window indices."""
     env = VecEnv(min(args.games, args.num_envs), args.threads, eval_pairs=(args.games+1)//2,
                  opponent='external', eval_seed=args.seed)
@@ -57,12 +88,19 @@ def collect(args, model):
     targets = [set() if reservoir else set(rng.choice(args.target_range, args.roots_per_game, replace=False).tolist())
                for _ in range(args.games)]
     target_list = None if reservoir else [sorted(t) for t in targets]
-    actor = Actor(model, env, args.device)
+    if opponent_model is None:
+        actor = Actor(model, env, args.device)
+        opponent = None
+    else:
+        actor = _SearchActor(model, env, args.device, max_batch=args.inference_batch, cache_mb=args.cache_mb)
+        opponent = _SearchActor(opponent_model, env, args.device, max_batch=args.inference_batch,
+                                cache_mb=args.cache_mb)
     lengths = Counter()
+    own_lengths = Counter()
     sequences, pending, records_by_slot = {}, {}, {}
     phase_index = env.obs_schema()['cat']['phase']['index']
     last = perf_counter()
-    with _policy_rng(args.seed+2, (actor,)):
+    with _policy_rng(args.seed+2, (actor,) if opponent is None else (actor, opponent)):
         while not env.eval_done():
             active = np.flatnonzero(env.stage >= 0)
             fresh = active[env.substep[active] == 0]
@@ -70,30 +108,39 @@ def collect(args, model):
             for r in fresh:
                 g, seat = int(env.episode_id[r]), int(env.actor_seat[r])
                 d = lengths[g]
+                lengths[g] += 1
+                if opponent is not None and seat != g % 2:
+                    continue
+                selection_index = d if opponent is None else own_lengths[g]
+                own_lengths[g] += 1
                 seq = sequences.setdefault((g, seat), [])
                 idx = None
                 if g < args.games:
                     if reservoir:
-                        slot = d if d < args.roots_per_game else int(rng.integers(d+1))
+                        slot = selection_index if selection_index < args.roots_per_game else int(rng.integers(selection_index+1))
                         if slot < args.roots_per_game:
                             idx = g*args.roots_per_game+slot
-                    elif d in targets[g]:
-                        targets[g].remove(d)
+                    elif selection_index in targets[g]:
+                        targets[g].remove(selection_index)
                         idx = len(records_by_slot)
                 if idx is not None:
                     rec = dict(game=g, seat=seat, decision_index=d, sequence_index=len(seq),
                                phase='response' if env.obs_cat[r, 0, phase_index] == 2 else 'main',
                                actual_path=[], actual_log_pi=0., archive_row=idx)
                     records_by_slot[idx] = rec
+                    if opponent is not None:
+                        rec['diagnostic_decision_index'] = selection_index
                     pending[int(r)] = rec
                     save.append(r); dest.append(idx)
-                lengths[g] += 1
             if save:
                 copy_exact(archive, env, save, destinations=dest)
-            result = actor.act(compact_transfer=True)
+            result = (actor.act(compact_transfer=True) if opponent is None
+                      else collection_action(args, actor, opponent))
             probs = torch.from_numpy(result.value_logits).softmax(-1).numpy()
             for r in fresh:
                 g, seat = int(env.episode_id[r]), int(env.actor_seat[r])
+                if opponent is not None and seat != g % 2:
+                    continue
                 sequences[g, seat].append(probs[r].copy())
                 if int(r) in pending:
                     pending[int(r)]['v'] = float(probs[r, 0]-probs[r, 1])
@@ -107,6 +154,9 @@ def collect(args, model):
                 last = perf_counter()
     games = {int(g['g']): dict(g, external_decisions=int(lengths[g['g']]))
              for g in env.eval_results() if g['g'] < args.games}
+    if opponent is not None:
+        for g, game in games.items():
+            game['diagnostic_decisions'] = int(own_lengths[g])
     gae = {}
     for (g, seat), ps in sequences.items():
         if g in games:
@@ -343,11 +393,14 @@ class DiagnosticActor(_SearchActor):
         self.continuation_random = _RolloutRandom(policy_seeds)
         self.root_random = _RolloutRandom(np.asarray(policy_seeds, np.uint64)^np.uint64(0x6A09E667F3BCC909))
 
+    def policy_result(self, rows, **kwargs):
+        return super().act(rows, **kwargs)
+
     def act(self, rows=None, **kwargs):
         groups = np.arange(self.env.num_envs)+1
         groups[self.env.decisions == 0] = 0
         kwargs.setdefault('observation_groups', groups)
-        result = super().act(rows, **kwargs)
+        result = self.policy_result(rows, **kwargs)
         active = np.flatnonzero(self.env.stage >= 0) if rows is None else np.asarray(rows)
         u = np.empty(len(active), np.float32)
         root = self.env.decisions[active] == 0
@@ -362,8 +415,31 @@ class DiagnosticActor(_SearchActor):
         return ActResult(choices, result.log_prob, result.value_logits, result.log_probs)
 
 
+class OpponentDiagnosticActor(DiagnosticActor):
+    """One CRN stream per lane; separate model caches and diagnostic-only V.
+
+    The diagnostic head sees every acting viewer, including the opponent viewer
+    used for signed post V. Only opponent policy logits replace its predictions.
+    """
+    def __init__(self, args, model, opponent_model, env, policy_seeds, seat):
+        super().__init__(args, model, env, policy_seeds)
+        self.args, self.seat = args, seat
+        self.opponent = _SearchActor(opponent_model, env, args.device, sample=False,
+                                    max_batch=args.inference_batch, cache_mb=args.cache_mb)
+
+    def policy_result(self, rows, **kwargs):
+        result = super().policy_result(rows, **kwargs)
+        active = np.flatnonzero(self.env.stage >= 0) if rows is None else np.asarray(rows)
+        other_rows = active[self.env.actor_seat[active] != self.seat]
+        if len(other_rows):
+            with opponent_precision(self.args):
+                other = self.opponent.act(other_rows, **kwargs)
+            result.log_probs[other_rows] = other.log_probs[other_rows]
+        return result
+
+
 @torch.inference_mode()
-def panel(args, model, archive, rec):
+def panel(args, model, archive, rec, opponent_model=None):
     paths = rec['candidate_paths']
     K = len(paths)
     extra = [a['path'] for a in rec.get('wide', {}).get('actions', [])]
@@ -398,7 +474,8 @@ def panel(args, model, archive, rec):
                     status.ravel()[flat[i]] = 1
             rec.setdefault('load_errors', []).append(str(error))
         valid = status.ravel()[flat] != 1
-        actor = DiagnosticActor(args, model, env, policy_seeds[pp])
+        actor = (DiagnosticActor(args, model, env, policy_seeds[pp]) if opponent_model is None else
+                 OpponentDiagnosticActor(args, model, opponent_model, env, policy_seeds[pp], rec['seat']))
         tail_sampler = TailSampler(rec, len(flat))
         seat = rec['seat']
         accum = np.full(len(flat), -rec['v'], np.float64)
@@ -929,13 +1006,31 @@ def _json_default(o):
     raise TypeError(f'Object of type {o.__class__.__name__} is not JSON serializable')
 
 
+def collection_summary(games):
+    """Diagnostic-seat score rate; never quietly count truncations as draws."""
+    complete = [g for g in games if not g['truncated']]
+    wins = sum(g['result'] == 1 for g in complete)
+    losses = sum(g['result'] == -1 for g in complete)
+    draws = len(complete)-wins-losses
+    return dict(games=len(games), completed=len(complete), truncated=len(games)-len(complete),
+                wins=wins, losses=losses, draws=draws,
+                win_rate=(wins+.5*draws)/len(complete) if complete else None,
+                strict_win_rate=wins/len(complete) if complete else None,
+                evaluation_win_rate=(wins+.5*(len(games)-wins-losses))/len(games) if games else None,
+                by_seat={str(seat): dict(games=sum(g['agent_seat'] == seat for g in games),
+                    completed=sum(g['agent_seat'] == seat for g in complete),
+                    win_rate=float(np.mean([(g['result']+1)/2 for g in complete if g['agent_seat'] == seat]))
+                    if any(g['agent_seat'] == seat for g in complete) else None) for seat in (0, 1)})
+
+
 def save_report(args, records, games, targets, start, ready, final=False):
     completed = [r for r in records if 'world_counts' in r]
     seconds = perf_counter()-start
     totals = {k: sum(r['world_counts'][k] for r in completed) for k in ('requested', 'completed', 'load_failed', 'truncated')}
     decision_count = sum(r['continuation_decisions'] for r in completed)
     report = dict(schema_version=1, config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
-                                          if not k.startswith('wide_') or getattr(args, 'wide_candidates', 0)},
+                                          if (not k.startswith('wide_') or getattr(args, 'wide_candidates', 0))
+                                          and (not k.startswith('opponent_') or getattr(args, 'opponent_checkpoint', None))},
                   runtime=dict(python=sys.version, torch=str(torch.__version__), platform=platform.platform(),
                                cuda=torch.version.cuda, device_name=torch.cuda.get_device_name() if args.device == 'cuda' else platform.machine()),
                   summary_config=dict(bootstrap=args.bootstrap, seed=args.seed+9, cluster='deal_pair'),
@@ -954,6 +1049,12 @@ def save_report(args, records, games, targets, start, ready, final=False):
         report['schema_version'] = 2
         report['wide_summary'] = summarize_wide(completed, games, args.bootstrap, args.seed+10) if final else None
         report['summary_config']['wide_seed'] = args.seed+10
+    if getattr(args, 'opponent_checkpoint', None):
+        report['schema_version'] = 3
+        report['collection_summary'] = collection_summary(games)
+        report['selection']['decision_scope'] = 'diagnostic_seat'
+        report['selection']['selected_diagnostic_indices_by_game'] = [
+            [r['diagnostic_decision_index'] for r in records if r['game'] == g] for g in range(args.games)]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     temp = args.out.with_suffix(args.out.suffix+'.tmp')
     temp.write_text(json.dumps(report, indent=2, allow_nan=False, default=_json_default)+'\n')
@@ -964,6 +1065,10 @@ def save_report(args, records, games, targets, start, ready, final=False):
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', default='runs/hp-lr1e5/ckpt-4500.pt')
+    p.add_argument('--opponent-checkpoint', help='fixed opponent; omit for the exact legacy self-play diagnostic')
+    p.add_argument('--opponent-weights', choices=('online', 'ema'), default='online')
+    p.add_argument('--opponent-dtype', choices=('auto', 'fp32', 'bf16', 'fp16'), default='auto',
+                   help='independent opponent inference precision; auto follows its checkpoint on CUDA')
     p.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     p.add_argument('--root-selection', choices=('reservoir', 'window'), default='reservoir',
                    help='reservoir: uniform decisions across each complete game; window: fixed pre-drawn indices')
@@ -991,6 +1096,30 @@ def parser():
     for name, default in [('mass', .95), ('lambda-v', .8), ('lambda-a', .5), ('gamma', 1.)]:
         p.add_argument('--'+name, type=float, default=default)
     return p
+
+
+def load_model(args, p, *, opponent=False):
+    prefix = 'opponent_' if opponent else ''
+    path = getattr(args, prefix+'checkpoint')
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    with Path(path).open('rb') as source:
+        setattr(args, prefix+'checkpoint_sha256', hashlib.file_digest(source, 'sha256').hexdigest())
+    setattr(args, prefix+'model_config', checkpoint['model_config'])
+    model = Model(ModelConfig(**checkpoint['model_config']))
+    weights = getattr(args, prefix+'weights')
+    model.load_state_dict(checkpoint['model' if weights == 'online' else 'ema'])
+    model = model.to(args.device).eval().requires_grad_(False)
+    setattr(args, prefix+'checkpoint_iteration', int(checkpoint['iteration']) if 'iteration' in checkpoint else None)
+    training = checkpoint.get('config', {})
+    setattr(args, prefix+'training_dtype', training.get('dtype'))
+    setattr(args, prefix+'training_tf32', bool(training.get('tf32', False)))
+    dtype = getattr(args, prefix+'dtype')
+    if dtype == 'auto':
+        dtype = training.get('dtype', 'fp32') if args.device == 'cuda' else 'fp32'
+        setattr(args, prefix+'dtype', dtype)
+    if dtype not in ('fp32', 'bf16', 'fp16') or (args.device == 'cpu' and dtype != 'fp32'):
+        p.error(prefix+'dtype: supported dtype is fp32 on CPU; fp32/bf16/fp16 on CUDA')
+    return model
 
 
 def main():
@@ -1024,29 +1153,15 @@ def main():
         p.error('CUDA unavailable')
     torch.set_num_threads(args.threads)
     start = perf_counter()
-    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    with Path(args.checkpoint).open('rb') as source:
-        args.checkpoint_sha256 = hashlib.file_digest(source, 'sha256').hexdigest()
-    args.model_config = checkpoint['model_config']
-    model = Model(ModelConfig(**checkpoint['model_config']))
-    model.load_state_dict(checkpoint['model' if args.weights == 'online' else 'ema'])
-    model = model.to(args.device).eval().requires_grad_(False)
-    args.checkpoint_iteration = int(checkpoint['iteration']) if 'iteration' in checkpoint else None
-    training = checkpoint.get('config', {})
-    args.training_dtype = training.get('dtype')
-    args.training_tf32 = bool(training.get('tf32', False))
-    if args.dtype == 'auto':
-        args.dtype = training.get('dtype', 'fp32') if args.device == 'cuda' else 'fp32'
-    if args.dtype not in ('fp32', 'bf16', 'fp16') or (args.device == 'cpu' and args.dtype != 'fp32'):
-        p.error('supported dtype is fp32 on CPU; fp32/bf16/fp16 on CUDA')
+    model = load_model(args, p)
+    opponent_model = load_model(args, p, opponent=True) if args.opponent_checkpoint else None
     if args.device == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = args.training_tf32
-    del checkpoint
     def precision():
         return torch.autocast(args.device, dtype=torch.bfloat16 if args.dtype == 'bf16' else torch.float16,
                               enabled=args.dtype != 'fp32')
     with precision():
-        archive, records, games, targets = collect(args, model)
+        archive, records, games, targets = collect(args, model, opponent_model)
     ready = perf_counter()
     rawdir = args.out.with_suffix('.samples')
     rawdir.mkdir(parents=True, exist_ok=True)
@@ -1058,7 +1173,7 @@ def main():
             with precision():
                 candidates(args, model, archive, rec)
                 wide_candidates(args, model, archive, rec)
-                data = panel(args, model, archive, rec)
+                data = panel(args, model, archive, rec, opponent_model)
             rawpath = rawdir/f'root-{rec["archive_row"]:05d}.npz'
             np.savez_compressed(rawpath, **data)
             rec['samples'] = str(rawpath)
@@ -1072,8 +1187,10 @@ def main():
         report = save_report(args, records, games, targets, start, ready, final=True)
         report['final'] = final
         args.out.write_text(json.dumps(report, indent=2, allow_nan=False, default=_json_default)+'\n')
-    print(json.dumps(dict(counts=report['counts'], timing=report['timing'],
-                         overall=report['summary']['overall']['estimate']), indent=2, allow_nan=False, default=_json_default))
+    output = dict(counts=report['counts'], timing=report['timing'], overall=report['summary']['overall']['estimate'])
+    if 'collection_summary' in report:
+        output['collection_summary'] = report['collection_summary']
+    print(json.dumps(output, indent=2, allow_nan=False, default=_json_default))
     print(f'Saved {args.out}; raw crossed panels: {rawdir}')
 
 
