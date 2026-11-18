@@ -64,9 +64,22 @@ template<class M> bool can_finish(const M& position, gf::CommandKind kind,
 template<class M> bool Selection::completion(const M& position,gf::CommandKind kind,std::vector<gf::ItemToken> prefix,bool canonical) const {
     const auto node=policy_extensions(position,kind,prefix,canonical);
     if(can_finish(position,kind,prefix,node,exclusions))return true;
+    // SelectionTree::reachable guarantees a short repair: a sale commodity,
+    // or FREE immediately after the last miracle. Earlier paid costs cannot
+    // be repaired by adding more material. A root needs at most a base + repair.
+    // Keep order: FREE, reactions, Dream barriers and canonical slots make a
+    // multiset cache incorrect for this oracle.
+    const auto& snap=position.snapshot();
+    const auto& own=snap.state.players[actor_seat];
     for(auto token:node.next)if(std::find(exclusions.tokens.begin(),exclusions.tokens.end(),token)==exclusions.tokens.end()) {
+        if(!prefix.empty() && kind!=gf::CommandKind::sell) {
+            const auto item=std::find_if(own.items.begin(),own.items.end(),[&](const auto& h){return h.token==token;});
+            if(gf::find_card(item->fake_model.value_or(item->model))->ability!=gf::Ability::cut_cost)continue;
+        }
         auto next=prefix;next.push_back(token);
-        if(completion(position,kind,std::move(next),canonical))return true;
+        if(prefix.empty()) {
+            if(completion(position,kind,std::move(next),canonical))return true;
+        } else if(can_finish(position,kind,next,policy_extensions(position,kind,next,canonical),exclusions))return true;
     }
     return false;
 }

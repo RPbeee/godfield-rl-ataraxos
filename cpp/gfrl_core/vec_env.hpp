@@ -70,7 +70,8 @@ public:
            std::optional<std::size_t> eval_pairs = std::nullopt,
            Controller opponent = Controller::greedy, std::uint64_t eval_seed = 0,
            bool track_projection = false, bool search = false, std::size_t max_decisions = 512,
-           std::optional<std::vector<int>> a_restrict_kinds = std::nullopt);
+           std::optional<std::vector<int>> a_restrict_kinds = std::nullopt,
+           OfficialRestrictionCategories a_restrict_categories = {});
     std::vector<EvalResult> eval_results() const;
     bool eval_done() const;
     RestrictionCounts restriction_counts() const;
@@ -123,6 +124,7 @@ private:
     const Controller opponent_;
     const std::uint64_t eval_seed_;
     const std::optional<std::vector<int>> a_restrict_kinds_;
+    const OfficialRestrictionCategories a_restrict_categories_;
     std::vector<Env> envs_;
     Workers workers_;
     mutable std::mutex api_mutex_;

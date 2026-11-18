@@ -240,10 +240,10 @@ NB_MODULE(_core, m) {
         .def_rw("local_guardian_payloads", &gf::MatchConfig::local_guardian_payloads);
     auto cls = nb::class_<VecEnv>(m, "VecEnv")
         .def("__init__", [](VecEnv* self, std::size_t n,std::size_t threads,std::uint64_t seed,bool canonical,gf::MatchConfig config,std::size_t k,
-                             std::array<std::string,2> controls,std::optional<std::size_t> pairs,std::string opponent,std::uint64_t eval_seed,bool track_projection,std::optional<std::vector<int>> a_restrict_kinds){
-            new(self)VecEnv(n,threads,seed,canonical,config,k,{controller(controls[0]),controller(controls[1])},pairs,controller(opponent),eval_seed,track_projection,false,512,std::move(a_restrict_kinds));
+                             std::array<std::string,2> controls,std::optional<std::size_t> pairs,std::string opponent,std::uint64_t eval_seed,bool track_projection,std::optional<std::vector<int>> a_restrict_kinds,bool a_restrict_dream,bool a_restrict_self_target){
+            new(self)VecEnv(n,threads,seed,canonical,config,k,{controller(controls[0]),controller(controls[1])},pairs,controller(opponent),eval_seed,track_projection,false,512,std::move(a_restrict_kinds),{true,a_restrict_dream,a_restrict_self_target});
         }, "num_envs"_a,"num_threads"_a,"base_seed"_a=0,"canonical"_a=true,"config"_a=gf::MatchConfig{},"history_len"_a=64,
-           "controllers"_a=std::array<std::string,2>{"external","external"},"eval_pairs"_a=nb::none(),"opponent"_a="greedy","eval_seed"_a=0,"track_projection"_a=false,"a_restrict_kinds"_a=nb::none())
+           "controllers"_a=std::array<std::string,2>{"external","external"},"eval_pairs"_a=nb::none(),"opponent"_a="greedy","eval_seed"_a=0,"track_projection"_a=false,"a_restrict_kinds"_a=nb::none(),"a_restrict_dream"_a=true,"a_restrict_self_target"_a=true)
         .def_ro("track_projection", &VecEnv::track_projection)
         .def("eval_done", &VecEnv::eval_done)
         .def("eval_results", [](const VecEnv& e){return result_list(e.eval_results());})

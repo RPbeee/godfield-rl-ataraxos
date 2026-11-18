@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 import torch
 from gfrl import VecEnv
 from gfrl.actor import Actor
-from gfrl.evaluation import evaluate_policies, list_pool_iterations, load_policy_model
+from gfrl.evaluation import evaluate_policies, list_pool_iterations, load_policy_model, restriction_categories
 from gfrl.runtime import add_runtime_args, configure_precision
 
 
@@ -23,8 +23,8 @@ def main():
     parser.add_argument('--threads', type=int, default=8)
     parser.add_argument('--device', choices=('cpu', 'cuda', 'mps'), default='cpu')
     parser.add_argument('--eval-seed', type=int, default=0)
-    parser.add_argument('--a-restrict', choices=('none', 'official'), default='none',
-                        help='apply official UI action restrictions to A only')
+    parser.add_argument('--a-restrict', default='none',
+                        help='A only: none, official, or comma list of kind,dream,self_target')
     parser.add_argument('--pool-epsilon', type=float, default=0.,
                         help='stage-wise epsilon-uniform legal noise for B only (same as training pool)')
     parser.add_argument('--out', type=Path, default=Path('eval-policies.json'))
@@ -47,6 +47,10 @@ def main():
         parser.error('--pool-epsilon must be in [0,1]')
     if args.compile != 'off':
         parser.error('policy evaluation does not use compile; use --compile off')
+    try:
+        active_categories = restriction_categories(args.a_restrict)
+    except ValueError as error:
+        parser.error(str(error))
     torch.set_num_threads(args.threads)
     configure_precision(args.device, args.tf32)
     # Actors bind to the evaluator's environment on first use.
@@ -72,7 +76,8 @@ def main():
               f"{summary['truncations']} |", flush=True)
         del actor_b
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    restriction_metadata = dict(a_restrict=args.a_restrict) if args.a_restrict != 'none' else {}
+    restriction_metadata = (dict(a_restrict=args.a_restrict, a_restrict_categories=list(active_categories))
+                            if active_categories else {})
     args.out.write_text(json.dumps(dict(pairs=args.pairs, eval_seed=args.eval_seed,
                                       num_envs=args.num_envs, threads=args.threads,
                                       device=args.device, tf32=args.tf32,

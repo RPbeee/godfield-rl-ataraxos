@@ -12,7 +12,7 @@ import torch
 
 from gfrl import VecEnv
 from gfrl.actor import Actor
-from gfrl.evaluation import evaluate_policies, list_pool_iterations, load_policy_model
+from gfrl.evaluation import evaluate_policies, list_pool_iterations, load_policy_model, restriction_categories
 from gfrl.model import Model, ModelConfig, OBS_FIELDS
 
 
@@ -195,6 +195,41 @@ def test_official_restrictions_only_a_and_decision_counts():
         evaluate_policies(None, None, 1, 1, 1, 0, a_restrict='invalid')
 
 
+@pytest.mark.parametrize('active', [
+    'kind', 'dream', 'self_target', 'kind,dream', 'kind,self_target',
+    'dream,self_target', 'kind,dream,self_target', 'self_target,dream,kind',
+])
+def test_restriction_subsets(active):
+    categories = restriction_categories(active)
+    seen_kinds = set()
+    def choose(env, rows):
+        for r in rows:
+            if env.stage[r] == 0:
+                seen_kinds.update(np.flatnonzero(env.mask[r]))
+                if 'kind' in categories:
+                    assert not env.mask[r, 2] and not env.mask[r, 9]
+        return extreme_policy(last=True)(env, rows)
+    result = evaluate_policies(choose, extreme_policy(True), 4, 8, 2, 321, a_restrict=active)
+    assert result['a_restrict_categories'] == list(categories)
+    counts = result['a_restrictions']
+    assert counts['decisions'] > 0
+    for category in ('kind', 'dream', 'self_target'):
+        if category not in categories:
+            assert counts[category] == 0
+    if 'dream' not in categories:
+        assert counts['ambiguous'] == counts['dream_last_resort'] == 0
+    if 'kind' not in categories:
+        assert 2 in seen_kinds
+    if len(categories) == 3:
+        assert result == evaluate_policies(choose, extreme_policy(True), 4, 8, 2, 321, a_restrict='official')
+
+
+@pytest.mark.parametrize('value', ['', 'kind,', ',dream', 'kind,kind', 'official,dream', 'none,kind', 'self', 'Dream'])
+def test_invalid_restriction_subsets(value):
+    with pytest.raises(ValueError, match='a_restrict'):
+        evaluate_policies(None, None, 1, 1, 1, 0, a_restrict=value)
+
+
 def test_cli(checkpoints, tmp_path):
     script = Path(__file__).resolve().parents[2] / 'scripts' / 'eval_policies.py'
     out = tmp_path / 'nested' / 'results.json'
@@ -219,7 +254,16 @@ def test_cli(checkpoints, tmp_path):
                     '--out', str(out)], capture_output=True, text=True, check=True)
     restricted = json.loads(out.read_text())
     assert restricted['a_restrict'] == 'official'
+    assert restricted['a_restrict_categories'] == ['kind', 'dream', 'self_target']
     assert restricted['results'][0]['a_restrictions']['decisions'] > 0
+    subprocess.run(command + ['--a-restrict', 'dream,self_target'],
+                   capture_output=True, text=True, check=True)
+    subset = json.loads(out.read_text())
+    assert subset['a_restrict_categories'] == ['dream', 'self_target']
+    assert all(r['a_restrictions']['kind'] == 0 for r in subset['results'])
+    invalid = subprocess.run(command + ['--a-restrict', 'dream,unknown'],
+                             capture_output=True, text=True)
+    assert invalid.returncode == 2 and 'a_restrict must be' in invalid.stderr
     run = subprocess.run([sys.executable, str(script), '--list', str(checkpoints[0])],
                          capture_output=True, text=True, check=True)
     assert json.loads(run.stdout)['iterations'] == [30]

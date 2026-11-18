@@ -10,6 +10,13 @@ seed, batching, checkpoints, and device fixed:
   --compile off --out /tmp/official-restricted.json
 ```
 
+`--a-restrict` also accepts a comma list of `kind`, `dream`, and `self_target`,
+for example `--a-restrict kind,self_target`. `dream` includes both disguised
+items and ordinary items sharing a disguised face. Only active categories are
+counted and applied; relaxation restores active Dream exclusions first, then
+any remaining active restrictions. JSON records the normalized category list
+in `a_restrict_categories` at the top level and in each opponent result.
+
 Only A is restricted, including when A occupies the second seat of a paired
 deal. The native sequential masks remove unobserved kinds, disguised items,
 ordinary items sharing a disguised face, and enemy-default self targets for
@@ -42,3 +49,30 @@ for the next opponent.
 `--a-restrict none` is the default and preserves the original execution path,
 RNG use, and output schema. The option changes neither paired-deal generation
 nor evaluation seeds.
+
+The diagnostic counts use exact short witnesses, without enumerating complete
+commands or exchange allocations. They inspect at most the root, one-card,
+and two-card prefixes for each kind. Under the current append rules, a face
+can be selected directly, after a base, or after one enabler (a miracle before
+FREE, FREE after a miracle, or a defense filter before a reaction). Removing
+other material reduces cost and cannot introduce a canonical ordering barrier.
+Every equivalent slot is in the same Dream/ambiguous category, so testing the
+first canonical copy suffices. Explicit self targets need at most a base plus
+FREE or a sale commodity; additional attack material only removes targets.
+
+Completion pruning uses the engine's `SelectionTree::reachable` invariant:
+only an immediate FREE or a sale commodity can repair a nonempty incomplete
+prefix. A root therefore needs at most two further cards. This preserves item
+order and works for arbitrary advisor exclusions, including noncanonical slots.
+A multiset memo would be unsafe because FREE, reactions and barriers depend on
+order. Both searches have polynomial bounds in hand size, with no timeout or
+approximate fallback.
+
+`gfrl_official_restrictions` retains the recursive `dac9be8` implementation
+only in test sources. It compares plans and sequential masks on simulated-game
+positions and randomized Dream scenes, with both canonical settings and arbitrary
+advisor exclusions. Its stress phase times thousands of random/greedy self-play
+decisions, full hands, Dream, ordered defense, and allocation stages; every plan,
+Selection construction and substep must take less than 100 ms. The test prints
+observed maxima. CTest also imposes an overall timeout so a regression cannot
+hang the test runner indefinitely.

@@ -55,7 +55,7 @@ void Workers::run(std::function<void(std::size_t)> job) {
     job_ = {};
     if (error_) std::rethrow_exception(error_);
 }
-VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool canonical, gf::MatchConfig config, std::size_t k, std::array<Controller,2> controllers, std::optional<std::size_t> eval_pairs, Controller opponent, std::uint64_t eval_seed, bool track_projection, bool search, std::size_t max_decisions, std::optional<std::vector<int>> a_restrict_kinds)
+VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool canonical, gf::MatchConfig config, std::size_t k, std::array<Controller,2> controllers, std::optional<std::size_t> eval_pairs, Controller opponent, std::uint64_t eval_seed, bool track_projection, bool search, std::size_t max_decisions, std::optional<std::vector<int>> a_restrict_kinds, OfficialRestrictionCategories a_restrict_categories)
     : num_envs(positive(n, "num_envs")), num_threads(positive(threads, "num_threads")),
       history_len(k<=4096 ? k : throw std::invalid_argument("history_len must be <=4096")), tokens(history_offset + history_len), track_projection(track_projection),
       obs_type(n*tokens), obs_cat(n*tokens*C), obs_cards(n*tokens*8), obs_aux_card(n*tokens),
@@ -65,7 +65,7 @@ VecEnv::VecEnv(std::size_t n, std::size_t threads, std::uint64_t seed, bool cano
       mask(n), substep(n), decision_done(n), episode_done(n), truncated(n), episode_id(n), decisions(n), world_status(n), searcher_seat(n), result(n),
       leaf_obs_type(0), leaf_obs_cat(0), leaf_obs_cards(0),
       leaf_obs_aux_card(0), leaf_obs_num(0), leaf_obs_valid(0),
-      search_(search), max_decisions_(positive(max_decisions,"max_decisions")), base_seed_(seed), canonical_(canonical), controllers_(controllers), eval_pairs_(eval_pairs), opponent_(opponent), eval_seed_(eval_seed), a_restrict_kinds_(std::move(a_restrict_kinds)), workers_(threads) {
+      search_(search), max_decisions_(positive(max_decisions,"max_decisions")), base_seed_(seed), canonical_(canonical), controllers_(controllers), eval_pairs_(eval_pairs), opponent_(opponent), eval_seed_(eval_seed), a_restrict_kinds_(std::move(a_restrict_kinds)), a_restrict_categories_(a_restrict_categories), workers_(threads) {
     if (config != gf::MatchConfig{}) throw std::invalid_argument("VecEnv supports only default MatchConfig (max_decisions=512, include_fate/external_*=false)");
     if(eval_pairs_ && *eval_pairs_>10000000)throw std::invalid_argument("invalid evaluation configuration");
     if(a_restrict_kinds_ && (!eval_pairs_ || opponent_!=Controller::external))
@@ -226,7 +226,7 @@ void VecEnv::drive(std::size_t i) {
         }
         if (!e.selection) {
             if(a_restrict_kinds_ && seat==e.game%2) {
-                const auto plan=official_restriction_plan(e.match.view(*s.actor),canonical_,*a_restrict_kinds_);
+                const auto plan=official_restriction_plan(e.match.view(*s.actor),canonical_,*a_restrict_kinds_,a_restrict_categories_);
                 for(std::size_t j=0;j<plan.counts.size();++j)e.restriction_counts[j]+=plan.counts[j];
                 e.selection.emplace(e.match,canonical_,plan.exclusions);
             } else e.selection.emplace(e.match, canonical_);

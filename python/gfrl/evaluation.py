@@ -143,6 +143,21 @@ def evaluate_bots(bot_a, bot_b, pairs, threads, eval_seed):
     return summarize(_core.evaluate_bots(bot_a, bot_b, pairs, threads, eval_seed))
 
 
+RESTRICTION_CATEGORIES = ('kind', 'dream', 'self_target')
+
+
+def restriction_categories(value):
+    """Parse CLI/API restrictions into a stable order for native flags and JSON."""
+    if value == 'none':
+        return ()
+    if value == 'official':
+        return RESTRICTION_CATEGORIES
+    parts = value.split(',')
+    if not parts or any(p not in RESTRICTION_CATEGORIES for p in parts) or len(set(parts)) != len(parts):
+        raise ValueError("a_restrict must be 'none', 'official', or a comma list of kind,dream,self_target")
+    return tuple(k for k in RESTRICTION_CATEGORIES if k in parts)
+
+
 def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_seed, *,
                       track_projection=False, progress=None, progress_interval_s=600,
                       a_restrict='none'):
@@ -163,14 +178,18 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
     gaps, restoring Dream/ambiguous items only if necessary, then the original
     mask if hard restrictions also exhaust the decision. Diagnostics count
     all A decisions (including forced choices), before last-resort relaxation.
-    Each category independently compares against the original legal set.
+    Each category independently compares against the original legal set. A comma
+    list of kind,dream,self_target enables only those categories (dream includes
+    ambiguous faces); 'none' preserves the unrestricted path and JSON schema.
     """
-    if a_restrict not in ('none', 'official'):
-        raise ValueError("a_restrict must be 'none' or 'official'")
+    active_categories = restriction_categories(a_restrict)
     restrictions = {}
-    if a_restrict == 'official':
+    if active_categories:
         from .official import KINDS, OBSERVED_UI_KINDS
-        restrictions['a_restrict_kinds'] = [i for i, k in enumerate(KINDS) if k not in OBSERVED_UI_KINDS]
+        restrictions['a_restrict_kinds'] = ([i for i, k in enumerate(KINDS) if k not in OBSERVED_UI_KINDS]
+                                             if 'kind' in active_categories else [])
+        restrictions['a_restrict_dream'] = 'dream' in active_categories
+        restrictions['a_restrict_self_target'] = 'self_target' in active_categories
     # Count external decisions at their first stage, excluding automatic engine
     # transitions and avoiding counting autoregressive stages more than once.
     lengths = np.zeros(2*pairs, dtype=np.int64)
@@ -201,10 +220,11 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
         if reporter is not None:
             reporter(env, final=True)
         summary = summarize(records(env.eval_results()))
-        if a_restrict == 'official':
+        if active_categories:
             keys = ('decisions', 'restricted_decisions', 'kind', 'dream', 'ambiguous',
                     'self_target', 'dream_last_resort', 'unrestricted_last_resort')
             summary['a_restrictions'] = dict(zip(keys, env.a_restriction_counts()))
+            summary['a_restrict_categories'] = list(active_categories)
         return summary
 
 
