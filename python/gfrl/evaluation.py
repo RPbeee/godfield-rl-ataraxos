@@ -144,7 +144,8 @@ def evaluate_bots(bot_a, bot_b, pairs, threads, eval_seed):
 
 
 def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_seed, *,
-                      track_projection=False, progress=None, progress_interval_s=600):
+                      track_projection=False, progress=None, progress_interval_s=600,
+                      a_restrict='none'):
     """Evaluate A against B on paired deals, returning A-relative statistics.
 
     Callbacks receive (env, rows) and return int32 choices of shape [num_envs],
@@ -157,7 +158,19 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
     time interval and at completion. Only finished games are included; bootstrap
     uses complete pairs. Reporting uses a local NumPy generator, leaving policy
     RNGs untouched. The callback itself must not consume policy RNGs.
+
+    a_restrict='official' masks A's sequential choices using the official UI
+    gaps, restoring Dream/ambiguous items only if necessary, then the original
+    mask if hard restrictions also exhaust the decision. Diagnostics count
+    all A decisions (including forced choices), before last-resort relaxation.
+    Each category independently compares against the original legal set.
     """
+    if a_restrict not in ('none', 'official'):
+        raise ValueError("a_restrict must be 'none' or 'official'")
+    restrictions = {}
+    if a_restrict == 'official':
+        from .official import KINDS, OBSERVED_UI_KINDS
+        restrictions['a_restrict_kinds'] = [i for i, k in enumerate(KINDS) if k not in OBSERVED_UI_KINDS]
     # Count external decisions at their first stage, excluding automatic engine
     # transitions and avoiding counting autoregressive stages more than once.
     lengths = np.zeros(2*pairs, dtype=np.int64)
@@ -168,7 +181,7 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
     with _policy_rng(eval_seed, (policy_a, policy_b)):
         env = _core.VecEnv(num_envs, num_threads, eval_pairs=pairs,
                            opponent='external', eval_seed=eval_seed,
-                           track_projection=track_projection)
+                           track_projection=track_projection, **restrictions)
         while not env.eval_done():
             active = env.stage >= 0
             starts = active & (env.substep == 0)
@@ -187,7 +200,12 @@ def evaluate_policies(policy_a, policy_b, pairs, num_envs, num_threads, eval_see
                 reporter(env)
         if reporter is not None:
             reporter(env, final=True)
-        return summarize(records(env.eval_results()))
+        summary = summarize(records(env.eval_results()))
+        if a_restrict == 'official':
+            keys = ('decisions', 'restricted_decisions', 'kind', 'dream', 'ambiguous',
+                    'self_target', 'dream_last_resort', 'unrestricted_last_resort')
+            summary['a_restrictions'] = dict(zip(keys, env.a_restriction_counts()))
+        return summary
 
 
 @contextmanager

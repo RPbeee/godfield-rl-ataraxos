@@ -30,6 +30,9 @@ struct SelectionExclusions {
     std::vector<gf::ItemToken> tokens;
     std::vector<int> kinds;
     bool enemy_default_self = false;
+    // Evaluation removes branches from the original canonical policy tree.
+    // The advisor may instead need equivalent, noncanonical item slots.
+    bool preserve_canonical = false;
 };
 // A pure selection cursor over one immutable Match. Does not execute Commands.
 class Selection {
@@ -52,8 +55,8 @@ public:
     void choose(const gf::PublicSelection& match, int choice, bool canonical);
 private:
     std::int64_t total_ = 0;
-    template<class M> bool completion(const M&, gf::CommandKind, std::vector<gf::ItemToken>) const;
-    template<class M> void prune(const M&);
+    template<class M> bool completion(const M&, gf::CommandKind, std::vector<gf::ItemToken>, bool) const;
+    template<class M> void prune(const M&, bool);
     template<class M> void init(const M& match, bool canonical);
     template<class M> void refresh(const M& match, bool canonical);
     template<class M> void select(const M& match, int choice, bool canonical);

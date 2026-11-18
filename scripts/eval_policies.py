@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--threads', type=int, default=8)
     parser.add_argument('--device', choices=('cpu', 'cuda', 'mps'), default='cpu')
     parser.add_argument('--eval-seed', type=int, default=0)
+    parser.add_argument('--a-restrict', choices=('none', 'official'), default='none',
+                        help='apply official UI action restrictions to A only')
     parser.add_argument('--pool-epsilon', type=float, default=0.,
                         help='stage-wise epsilon-uniform legal noise for B only (same as training pool)')
     parser.add_argument('--out', type=Path, default=Path('eval-policies.json'))
@@ -58,7 +60,7 @@ def main():
         actor_b = Actor(load_policy_model(opponent, args.device), idle_env,
                         args.device, sample=True, epsilon=args.pool_epsilon)
         summary = evaluate_policies(actor_a, actor_b, args.pairs, args.num_envs,
-                                    args.threads, args.eval_seed)
+                                    args.threads, args.eval_seed, a_restrict=args.a_restrict)
         results.append(dict(a=args.a, b=opponent, **summary))
         interval = lambda v: f'{v[0]:.2%}–{v[1]:.2%}'
         length = lambda key: f'{summary[key]:.2f}' if summary[key] is not None else '—'
@@ -70,10 +72,12 @@ def main():
               f"{summary['truncations']} |", flush=True)
         del actor_b
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    restriction_metadata = dict(a_restrict=args.a_restrict) if args.a_restrict != 'none' else {}
     args.out.write_text(json.dumps(dict(pairs=args.pairs, eval_seed=args.eval_seed,
                                       num_envs=args.num_envs, threads=args.threads,
                                       device=args.device, tf32=args.tf32,
                                       pool_epsilon=args.pool_epsilon,
+                                      **restriction_metadata,
                                       results=results), indent=2) + '\n')
 
 

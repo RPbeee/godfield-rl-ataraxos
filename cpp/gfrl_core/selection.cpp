@@ -43,42 +43,57 @@ template<class M> void Selection::init(const M& match, bool canonical) {
     }
     refresh(match, canonical);
 }
-template<class M> bool Selection::completion(const M& position,gf::CommandKind kind,std::vector<gf::ItemToken> prefix) const {
-    const auto node=position.legal_extensions(kind,prefix,{exclusions.tokens.empty()});
-    if(node.can_finish)return true;
+namespace {
+template<class M> bool excludes_self(const M& position, gf::CommandKind kind,
+        std::span<const gf::ItemToken> prefix, const SelectionExclusions& exclusions) {
+    if(!exclusions.enemy_default_self || prefix.empty()
+        || (kind!=gf::CommandKind::play && kind!=gf::CommandKind::sell && kind!=gf::CommandKind::buy))return false;
+    const auto& snap=position.snapshot();
+    const auto& own=*std::find_if(snap.state.players.begin(),snap.state.players.end(),
+        [&](const auto& p){return p.id==*snap.actor;});
+    const auto base=std::find_if(own.items.begin(),own.items.end(),[&](const auto& h){return h.token==prefix.front();});
+    return base!=own.items.end() && gf::targets_enemy_by_default(base->fake_model.value_or(base->model));
+}
+template<class M> bool can_finish(const M& position, gf::CommandKind kind,
+        std::span<const gf::ItemToken> prefix, const gf::SelectionNode& node, const SelectionExclusions& exclusions) {
+    return node.can_finish && std::any_of(node.targets.begin(),node.targets.end(),[&](auto target){
+        return target!=position.snapshot().actor || !excludes_self(position,kind,prefix,exclusions);
+    });
+}
+}
+template<class M> bool Selection::completion(const M& position,gf::CommandKind kind,std::vector<gf::ItemToken> prefix,bool canonical) const {
+    const auto node=policy_extensions(position,kind,prefix,canonical);
+    if(can_finish(position,kind,prefix,node,exclusions))return true;
     for(auto token:node.next)if(std::find(exclusions.tokens.begin(),exclusions.tokens.end(),token)==exclusions.tokens.end()) {
         auto next=prefix;next.push_back(token);
-        if(completion(position,kind,std::move(next)))return true;
+        if(completion(position,kind,std::move(next),canonical))return true;
     }
     return false;
 }
-template<class M> void Selection::prune(const M& position) {
+template<class M> void Selection::prune(const M& position,bool canonical) {
     if(complete)return;
     auto& s=*this;
-    if(exclusions.enemy_default_self && s.stage==Stage::target && !s.command.items.empty()
-        && (s.command.kind==gf::CommandKind::play || s.command.kind==gf::CommandKind::sell
-            || s.command.kind==gf::CommandKind::buy)) {
-        const auto& hand=position.snapshot().state.players[s.actor_seat].items;
-        const auto base=std::find_if(hand.begin(),hand.end(),[&](const auto& h){return h.token==s.command.items.front();});
-        if(base!=hand.end() && gf::targets_enemy_by_default(base->fake_model.value_or(base->model)))s.mask[1]=false;
-    }
+    if(s.stage==Stage::target && excludes_self(position,s.command.kind,s.command.items,exclusions))s.mask[1]=false;
+    const bool check_completion=!exclusions.tokens.empty() || exclusions.enemy_default_self;
     if(s.stage==Stage::kind) {
         for(auto kind:exclusions.kinds)if(kind>=0 && kind<10)s.mask[kind]=false;
-        for(int i=0;i<10;++i)if(!exclusions.tokens.empty() && s.mask[i] && !completion(position,static_cast<gf::CommandKind>(i),{}))s.mask[i]=false;
-    } else if(!exclusions.tokens.empty() && s.stage==Stage::card) {
+        for(int i=0;i<10;++i)if(check_completion && s.mask[i] && !completion(position,static_cast<gf::CommandKind>(i),{},canonical))s.mask[i]=false;
+    } else if(check_completion && s.stage==Stage::card) {
         const auto& hand=position.snapshot().state.players[s.actor_seat].items;
         for(std::size_t i=0;i<hand.size();++i)if(s.mask[i]) {
             auto prefix=s.command.items;prefix.push_back(hand[i].token);
             if(std::find(exclusions.tokens.begin(),exclusions.tokens.end(),hand[i].token)!=exclusions.tokens.end()
-                || !completion(position,s.command.kind,std::move(prefix)))s.mask[i]=false;
+                || !completion(position,s.command.kind,std::move(prefix),canonical))s.mask[i]=false;
         }
+        if(s.mask[18])s.mask[18]=can_finish(position,s.command.kind,s.command.items,
+            policy_extensions(position,s.command.kind,s.command.items,canonical),exclusions);
     }
     if(std::count(s.mask.begin(),s.mask.end(),true)==0)
         throw std::invalid_argument("no supported public selection after exclusions");
 }
 
 template<class M> void Selection::refresh(const M& match, bool canonical) {
-    canonical = canonical && exclusions.tokens.empty();
+    canonical = canonical && (exclusions.tokens.empty() || exclusions.preserve_canonical);
     mask.fill(false);
     if (complete) return;
     if (stage == Stage::kind) {
@@ -110,7 +125,7 @@ template<class M> void Selection::refresh(const M& match, bool canonical) {
             }
         }
     }
-    try {prune(match);}
+    try {prune(match,canonical);}
     catch(const std::invalid_argument&) {
         if constexpr(std::is_same_v<M,gf::Match>) {
             if(public_root)throw std::invalid_argument("restricted_root_world_mismatch");

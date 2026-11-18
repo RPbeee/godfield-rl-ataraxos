@@ -1,5 +1,6 @@
 """Two-policy routing, paired deals, checkpoint loading, and CPU CLI smoke."""
 from dataclasses import asdict
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -108,6 +109,7 @@ def test_actor_sampling_reproducible_and_rng_isolated(checkpoints, monkeypatch):
     result = evaluate_policies(a, b, 8, 16, 2, 123)
     assert torch.equal(before, torch.get_rng_state())
     assert result == evaluate_policies(a, b, 8, 16, 2, 123)
+    assert json.dumps(result) == json.dumps(evaluate_policies(a, b, 8, 16, 2, 123, a_restrict='none'))
     # A simulated clock makes periodic reporting deterministic and fast.
     import gfrl.evaluation as evaluation
     ticks = iter(range(1_000_000))
@@ -133,18 +135,91 @@ def test_actor_sampling_reproducible_and_rng_isolated(checkpoints, monkeypatch):
     assert evaluate_policies(a, b, 1, 4, 1, 123)['games'] == 2
 
 
+def test_no_restriction_matches_pre_restriction_trace():
+    # Recorded with the pre-change native module and evaluator. Include every
+    # mask and sampled substep, so matching only the final scores cannot pass.
+    rng = np.random.default_rng(991)
+    trace = hashlib.sha256()
+    def policy(env, rows):
+        choices = np.zeros(env.num_envs, np.int32)
+        for row in rows:
+            choices[row] = rng.choice(np.flatnonzero(env.mask[row]))
+        for name in ('episode_id', 'substep', 'stage', 'mask'):
+            trace.update(np.asarray(getattr(env, name)[rows]).tobytes())
+        trace.update(choices[rows].tobytes())
+        return choices
+    result = evaluate_policies(policy, policy, 4, 8, 1, 321, a_restrict='none')
+    assert trace.hexdigest() == '63549656e7a254e72452ddef76876476d99e5d86810fc8188dfb950fa1351c62'
+    assert result == dict(games=8, wins=4, losses=4, draws=0, win_rate=.5,
+                          first_win_rate=.5, second_win_rate=.5,
+                          mean_decisions=18.625, mean_game_length=15.875,
+                          mean_loss_decisions=15.5, mean_win_decisions=16.25,
+                          truncation_rate=0., truncations=0,
+                          bootstrap_interval=(.5, .5),
+                          wilson_interval=(0.21521252682444186, 0.7847874731755582))
+
+
+def test_official_restrictions_only_a_and_decision_counts():
+    seen_a, seen_b = set(), set()
+    def policy(seen, restricted):
+        def choose(env, rows):
+            for r in rows:
+                board = env.play_view(int(r), int(env.actor_seat[r]))
+                seen.add((int(env.episode_id[r]), board['decisions']))
+                if env.stage[r] == 0:
+                    if restricted:
+                        assert not env.mask[r, 2] and not env.mask[r, 9]
+                    else:
+                        seen_b_kinds.update(np.flatnonzero(env.mask[r]))
+                if restricted and env.stage[r] == 2 and env.chosen_count[r]:
+                    hand = env.play_hand(int(r), int(env.actor_seat[r]))
+                    base = hand[env.chosen_cards[r, 0]]['face']
+                    if env.chosen_kind[r] in (0, 5, 6) and catalog[base]['targets_enemy_by_default']:
+                        assert not env.mask[r, 1]
+            return extreme_policy(last=True)(env, rows)
+        return choose
+    from gfrl import _core
+    catalog = _core.play_catalog()
+    seen_b_kinds = set()
+    result = evaluate_policies(policy(seen_a, True), policy(seen_b, False),
+                               4, 8, 2, 321, a_restrict='official')
+    counts = result['a_restrictions']
+    assert seen_a and seen_b and 2 in seen_b_kinds
+    assert counts['decisions'] >= len(seen_a)
+    assert counts['restricted_decisions'] >= counts['kind'] > 0
+    assert counts['restricted_decisions'] >= counts['self_target'] > 0
+    assert all(0 <= n <= counts['decisions'] for n in counts.values())
+    assert result == evaluate_policies(policy(set(), True), policy(set(), False),
+                                      4, 8, 2, 321, a_restrict='official')
+    with pytest.raises(ValueError, match='a_restrict'):
+        evaluate_policies(None, None, 1, 1, 1, 0, a_restrict='invalid')
+
+
 def test_cli(checkpoints, tmp_path):
     script = Path(__file__).resolve().parents[2] / 'scripts' / 'eval_policies.py'
     out = tmp_path / 'nested' / 'results.json'
-    run = subprocess.run([sys.executable, str(script), '--a', str(checkpoints[0]),
-                          '--b', f'{checkpoints[0]}@pool:30', str(checkpoints[1]),
-                          '--pairs', '1', '--device', 'cpu', '--num-envs', '4',
-                          '--threads', '1', '--eval-seed', '12345', '--no-tf32',
-                          '--out', str(out)], capture_output=True, text=True, check=True)
+    command = [sys.executable, str(script), '--a', str(checkpoints[0]),
+               '--b', f'{checkpoints[0]}@pool:30', str(checkpoints[1]),
+               '--pairs', '1', '--device', 'cpu', '--num-envs', '4',
+               '--threads', '1', '--eval-seed', '12345', '--no-tf32',
+               '--out', str(out)]
+    run = subprocess.run(command, capture_output=True, text=True, check=True)
     assert 'Wilson 95%' in run.stdout and 'Pair bootstrap 95%' in run.stdout
     data = json.loads(out.read_text())
     assert data['eval_seed'] == 12345 and data['tf32'] is False
     assert [r['games'] for r in data['results']] == [2, 2]
+    assert 'a_restrict' not in data
+    original_json = out.read_bytes()
+    explicit_none = subprocess.run(command + ['--a-restrict', 'none'],
+                                   capture_output=True, text=True, check=True)
+    assert explicit_none.stdout == run.stdout and out.read_bytes() == original_json
+    subprocess.run([sys.executable, str(script), '--a', str(checkpoints[0]),
+                    '--b', str(checkpoints[0]), '--a-restrict', 'official',
+                    '--pairs', '1', '--num-envs', '2', '--threads', '1',
+                    '--out', str(out)], capture_output=True, text=True, check=True)
+    restricted = json.loads(out.read_text())
+    assert restricted['a_restrict'] == 'official'
+    assert restricted['results'][0]['a_restrictions']['decisions'] > 0
     run = subprocess.run([sys.executable, str(script), '--list', str(checkpoints[0])],
                          capture_output=True, text=True, check=True)
     assert json.loads(run.stdout)['iterations'] == [30]
