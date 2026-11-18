@@ -9,43 +9,162 @@ from gfrl.model import OBS_FIELDS
 from gfrl.official import OfficialDecision, OfficialSession
 from gfrl.official_advisor import AMBIGUOUS_REASON, DREAM_REASON, advise, advise_supported
 from gfrl.official_bot import Journal, private_directory, run
-from gfrl.official_ui import UIUnsupported, prepare
+from gfrl.official_ui import PATHS, UIUnsupported, execute, prepare
 from test_official_bot import FakeProbe, GAMES, advisor, results, visible
 from test_official_live_fixes import PreferFirst
 from test_official_unobserved_kinds import PreferUnobserved
 
 
-def test_real_card_sharing_disguised_public_face_is_excluded():
+@pytest.mark.parametrize('dream', [None, 'allow', 'last-resort'])
+def test_bot_cli_plumbs_dream_mode(tmp_path, monkeypatch, dream):
+    from gfrl import actor, evaluation, official_bot as bot
     p = deepcopy(results()[2]['public'])
-    p['hand'] = [dict(id=18, face=200, used=False, disguised=False),
-                 dict(id=99, face=200, used=False, disguised=True),
+    p['hand'] = [dict(id=99, face=200, used=False, disguised=True),
+                 dict(id=100, face=6, used=False, disguised=False)]
+    monkeypatch.setattr(evaluation, 'load_policy_model', lambda *a: None)
+    monkeypatch.setattr(actor, 'Actor', lambda *a, **kw: PreferFirst())
+    monkeypatch.setattr(bot, 'Probe', lambda *a: None)
+    observed = []
+    def running(probe, advisor, journal, **kwargs):
+        observed.append(advisor(dict(env=OfficialDecision(p), history_complete=False)))
+        return dict(status='complete')
+    monkeypatch.setattr(bot, 'run', running)
+    args = ['--checkpoint', 'unused', '--playwright', 'unused', '--out-dir', str(tmp_path/'log')]
+    assert bot.main(args + ([] if dream is None else ['--dream', dream])) == 0
+    assert len(observed) == 1
+    advice = observed[0]
+    assert advice['action']['cards'] == [dict(item_id=100, model=6) if dream == 'last-resort'
+                                        else dict(item_id=99, model=200)]
+    assert bool(advice.get('dream_played')) == (dream != 'last-resort')
+
+
+def test_dream_allow_still_requires_selected_visible_face(tmp_path):
+    games = deepcopy(GAMES)
+    games[2]['players'][0]['items'] = [dict(id=99, modelId=218, fakeModelId=6, used=False)]
+    class WrongSelection(FakeProbe):
+        def send(self, command):
+            response = super().send(command)
+            if command.get('y') == 635 and self.selected:
+                self.selected = [PATHS[7]]
+                response['state'] = self.state()
+            return response
+    probe = WrongSelection(tmp_path, games=games)
+    probe.phase = 'battle'; probe.index = 2
+    result = probe.rs[2]; p = result['public']
+    advice = advise_supported(result, PreferFirst())
+    assert advice['dream_played']
+    with pytest.raises(UIUnsupported, match='selected_cards_mismatch'):
+        execute(probe, probe.state(), p, advice['action'], 'SyntheticName',
+                allow_dream=True, settle_timeout=0)
+    assert not any(c.get('y') == 193 for c in probe.commands)
+
+
+def test_dream_defense_requires_next_response_stability_without_face_inference(tmp_path, monkeypatch):
+    from gfrl import official_bot as bot
+    from gfrl.official_ui import REFLECT_MODELS
+    games = deepcopy(GAMES)
+    games[3]['players'][0]['items'] = [dict(id=99, modelId=39, fakeModelId=130, used=False)]
+    games[3]['attacks'][0]['itemModelIds'] = [6]
+    games[3]['events'][0]['items'] = [dict(id=5, modelId=6)]
+    assert 130 not in REFLECT_MODELS
+    def advising(result):
+        if result['public']['update'] == 4:
+            advice = advise_supported(result, PreferFirst())
+            assert advice['dream_played'] and advice['action']['cards'] == [dict(item_id=99, model=130)]
+            return advice
+        return advisor(result)
+    observed = []
+    def executing(probe, state, public, action, name, **kwargs):
+        observed.append((public['update'], kwargs['previous_reflect']))
+        return execute(probe, state, public, action, name, **kwargs)
+    monkeypatch.setattr(bot, 'execute', executing)
+    probe = FakeProbe(tmp_path, games=games)
+    journal = Journal(private_directory(tmp_path/'log'))
+    report = run(probe, advising, journal, name='SyntheticName', timeout=.05, settle_timeout=1)
+    journal.close()
+    assert report['status'] == 'complete'
+    assert (5, True) in observed
+
+
+@pytest.mark.parametrize('dream', [None, 'allow', 'last-resort'])
+@pytest.mark.parametrize('search', [False, True])
+def test_unique_face_dream_mode_preserves_or_excludes_sampled_action(dream, search):
+    p = deepcopy(results()[2]['public'])
+    p['hand'] = [dict(id=99, face=200, used=False, disguised=True),
+                 dict(id=100, face=6, used=False, disguised=False)]
+    position = lambda: dict(env=OfficialDecision(p), history_complete=False)
+    actor = PreferFirst(); actor.sample = True
+    class Search:
+        def __init__(self): self.actor = actor
+        def __call__(self, env, rows): return actor(env, rows)
+    agent = Search() if search else actor
+    initial = advise(position(), agent, search=search)
+    calls = len(actor.modes)
+    assert initial['unsupported'] == [DREAM_REASON]
+    actor.modes.clear()
+    advice = advise_supported(position(), agent, search=search,
+                              **({} if dream is None else dict(dream=dream)))
+    assert advice['status'] == 'advice' and advice['unsupported'] == []
+    if dream == 'last-resort':
+        assert advice['action']['cards'] == [dict(item_id=100, model=6)]
+        assert dict(reason=DREAM_REASON, item_ids=[99]) in advice['mask_exclusions']
+        assert not advice.get('dream_played')
+    else:
+        assert advice['action'] == initial['action']
+        assert advice['selections'] == initial['selections']
+        assert advice['search_status'] == initial['search_status']
+        assert advice['dream_played'] is True and DREAM_REASON in advice['warnings']
+        assert not advice.get('mask_exclusions') and not advice.get('dream_last_resort')
+        assert len(actor.modes) == calls
+        assert prepare(visible(p), p, advice['action'], 'SyntheticName', allow_dream=True)['cards']
+    assert actor.sample and all(actor.modes)
+
+
+@pytest.mark.parametrize('dream', ['allow', 'last-resort'])
+@pytest.mark.parametrize('search', [False, True])
+@pytest.mark.parametrize('disguises', [(False, True), (True, False), (True, True)])
+def test_shared_disguised_public_face_is_excluded(dream, search, disguises):
+    p = deepcopy(results()[2]['public'])
+    p['hand'] = [dict(id=18, face=200, used=False, disguised=disguises[0]),
+                 dict(id=99, face=200, used=False, disguised=disguises[1]),
                  dict(id=100, face=6, used=False, disguised=False)]
     position = lambda: dict(env=OfficialDecision(p), history_complete=False)
     initial = advise(position(), PreferFirst())
     assert initial['action']['cards'] == [dict(item_id=18, model=200)]
-    assert initial['unsupported'] == [AMBIGUOUS_REASON]
-    advice = advise_supported(position(), PreferFirst())
+    assert initial['unsupported'] == ([DREAM_REASON] if disguises[0] else []) + [AMBIGUOUS_REASON]
+    actor = PreferFirst()
+    class Search:
+        def __init__(self): self.actor = actor
+        def __call__(self, env, rows): return actor(env, rows)
+    advice = advise_supported(position(), Search() if search else actor, search=search, dream=dream)
     assert advice['status'] == 'advice' and advice['unsupported'] == []
     assert advice['action']['cards'] == [dict(item_id=100, model=6)]
     assert dict(reason=AMBIGUOUS_REASON, item_ids=[18]) in advice['mask_exclusions']
-    assert dict(reason=DREAM_REASON, item_ids=[99]) in advice['mask_exclusions']
-    assert not advice.get('dream_last_resort')
+    assert dict(reason=AMBIGUOUS_REASON, item_ids=[99]) in advice['mask_exclusions']
+    assert not advice.get('dream_played') and not advice.get('dream_last_resort')
+    # UI preflight must reject the original ambiguous command even under allow.
+    for allow_dream in (False, True):
+        with pytest.raises(UIUnsupported, match=AMBIGUOUS_REASON):
+            prepare(visible(p), p, initial['action'], 'SyntheticName', allow_dream=allow_dream)
+    assert prepare(visible(p), p, initial['action'], 'SyntheticName', dream_last_resort=True)['cards']
 
 
 @pytest.mark.parametrize('search', [False, True])
-def test_ambiguous_real_card_reaches_last_resort(search):
+@pytest.mark.parametrize('dream', ['allow', 'last-resort'])
+@pytest.mark.parametrize('disguises', [(False, True), (True, False), (True, True)])
+def test_ambiguous_card_reaches_last_resort(search, dream, disguises):
     p = deepcopy(results()[2]['public'])
-    p['hand'] = [dict(id=18, face=6, used=False, disguised=False),
-                 dict(id=99, face=6, used=False, disguised=True)]
+    p['hand'] = [dict(id=18, face=6, used=False, disguised=disguises[0]),
+                 dict(id=99, face=6, used=False, disguised=disguises[1])]
     actor = PreferFirst()
     class Search:
         def __init__(self): self.actor = actor
         def __call__(self, env, rows): return actor(env, rows)
     advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False),
-                              Search() if search else actor, search=search)
+                              Search() if search else actor, search=search, dream=dream)
     assert advice['status'] == 'advice' and advice['unsupported'] == []
     assert advice['dream_last_resort'] and AMBIGUOUS_REASON in advice['warnings']
-    assert DREAM_REASON not in advice['warnings']
+    assert (DREAM_REASON in advice['warnings']) == disguises[0]
     assert advice['action']['cards'] == [dict(item_id=18, model=6)]
     assert dict(reason=AMBIGUOUS_REASON, item_ids=[18]) in advice['mask_exclusions']
     with pytest.raises(UIUnsupported, match=AMBIGUOUS_REASON):
@@ -67,7 +186,7 @@ def test_ambiguity_only_exhaustion_restores_real_card(monkeypatch):
         # Exercise the recovery boundary with no DREAM_REASON exclusion.
         return original(result, agent, **kwargs) if kwargs.get('allow_dream') else exhausted
     monkeypatch.setattr(official_advisor, '_advise_supported', recover)
-    advice = advise_supported(position, PreferFirst())
+    advice = advise_supported(position, PreferFirst(), dream='last-resort')
     assert advice['status'] == 'advice' and advice['unsupported'] == []
     assert advice['dream_last_resort'] and AMBIGUOUS_REASON in advice['warnings']
     assert advice['action']['cards'] == [dict(item_id=18, model=6)]
@@ -81,7 +200,7 @@ def test_legal_cardless_move_survives_all_dream_card_exclusions(response, sample
     p['hand'] = [dict(id=99, face=130, used=False, disguised=True)]
     actor = PreferUnobserved(); actor.sample = sample
     original = OfficialDecision(p)
-    advice = advise_supported(dict(env=original, history_complete=False), actor)
+    advice = advise_supported(dict(env=original, history_complete=False), actor, dream='last-resort')
     assert advice['status'] == 'advice'
     assert advice['action']['kind'] == ('defend' if response else 'pray')
     assert advice['action']['cards'] == []
@@ -106,7 +225,7 @@ def test_dream_restores_cards_only_after_safe_moves_are_exhausted(sample, search
         def __init__(self): self.actor = actor
         def __call__(self, env, rows): return actor(env, rows)
     advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False),
-                              Search() if search else actor, search=search)
+                              Search() if search else actor, search=search, dream='last-resort')
     assert advice['status'] == 'advice' and advice['unsupported'] == []
     assert advice['dream_last_resort'] and DREAM_REASON in advice['warnings']
     assert advice['action']['kind'] == 'play'
@@ -121,13 +240,14 @@ def test_dream_restores_cards_only_after_safe_moves_are_exhausted(sample, search
     assert len(plan['cards']) == 1
 
 
-def test_dream_never_restores_discard_even_when_policy_prefers_it():
+@pytest.mark.parametrize('dream', ['allow', 'last-resort'])
+def test_dream_never_restores_discard_even_when_policy_prefers_it(dream):
     p = deepcopy(results()[2]['public'])
     p['hand'] = [dict(id=99, face=6, used=False, disguised=True),
                  dict(id=100, face=158, used=False, disguised=True)]
     actor = PreferUnobserved()
-    advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False), actor)
-    assert advice['status'] == 'advice' and advice['dream_last_resort']
+    advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False), actor, dream=dream)
+    assert advice['status'] == 'advice' and advice['dream_played']
     # PreferUnobserved would choose discard first if it were restored.
     assert advice['action']['kind'] == 'play'
     assert dict(reason='ui_kind_unobserved:discard', kind='discard') in advice['mask_exclusions']
@@ -136,7 +256,8 @@ def test_dream_never_restores_discard_even_when_policy_prefers_it():
 
 @pytest.mark.parametrize('reject', [False, True])
 @pytest.mark.parametrize('ambiguous', [False, True])
-def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject, ambiguous):
+@pytest.mark.parametrize('dream', ['allow', 'last-resort'])
+def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject, ambiguous, dream):
     games = deepcopy(GAMES)
     # One apparent weapon with a different actual miracle. No non-card main
     # command is legal, so the bot must select the visible weapon as a last resort.
@@ -157,7 +278,7 @@ def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject, a
     def advising(result):
         observed.append(result['public'])
         if result['public']['update'] == 3:
-            return advise_supported(result, PreferFirst())
+            return advise_supported(result, PreferFirst(), dream=dream)
         return advisor(result)
     directory = private_directory(tmp_path/'log')
     journal = Journal(directory)
@@ -166,16 +287,21 @@ def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject, a
     journal.close()
     rows = [json.loads(line) for line in (directory/'moves.jsonl').read_text().splitlines()]
     row = next(r for r in rows if r.get('state', {}).get('update') == 3)
-    assert row['dream_last_resort']
+    assert row['dream_played'] is True
+    assert bool(row.get('dream_last_resort')) == (dream == 'last-resort' or ambiguous)
+    assert reason in row['warnings']
     if reject:
         assert report['reason'] == 'acceptance_timeout' and not row['accepted']
         assert reason in row['warnings']
-        assert dict(reason=reason, item_ids=[18 if ambiguous else 99]) in row['mask_exclusions']
+        if dream == 'last-resort' or ambiguous:
+            assert dict(reason=reason, item_ids=[18 if ambiguous else 99]) in row['mask_exclusions']
+        else:
+            assert not row.get('mask_exclusions')
         assert not any(p['update'] > 3 for p in observed)
     else:
         assert report['status'] == 'complete' and row['accepted']
         assert row['received_update'] == 4
-        assert row['advice']['dream_last_resort'] and reason in row['advice']['warnings']
+        assert row['advice']['dream_played'] is True and reason in row['advice']['warnings']
         assert row['advice']['unsupported'] == []
         assert row['advice']['action']['cards'] == [dict(item_id=18 if ambiguous else 99, model=6)]
         received = next(p for p in observed if p['update'] == 4)
@@ -186,7 +312,8 @@ def test_dream_journal_acceptance_and_received_actual_result(tmp_path, reject, a
         assert any(h['face'] == 218 and h['used'] for h in received['hand'])
 
 
-def test_dream_last_resort_preserves_other_card_and_target_exclusions():
+@pytest.mark.parametrize('dream', ['allow', 'last-resort'])
+def test_dream_preserves_other_card_and_target_exclusions(dream):
     p = deepcopy(results()[2]['public'])
     p['hand'] = [dict(id=99, face=94, used=False, disguised=True),
                  dict(id=100, face=232, used=False, disguised=True)]
@@ -195,8 +322,8 @@ def test_dream_last_resort_preserves_other_card_and_target_exclusions():
             if int(env.stage[0]) == 1 and env.chosen_count[0] > 0 and env.mask[0, 1]:
                 return np.array([1], np.int32)
             return super().__call__(env, rows)
-    advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False), PreferWide())
-    assert advice['status'] == 'advice' and advice['dream_last_resort']
+    advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False), PreferWide(), dream=dream)
+    assert advice['status'] == 'advice' and advice['dream_played']
     assert advice['action']['cards'] == [dict(item_id=99, model=94)]
     # 94+232 is forbidden by the gfrl selection mask, not by a UI exclusion.
     assert not any(e.get('reason') == 'danger_wide_requires_unobservable_mortar_absence'
@@ -208,7 +335,7 @@ def test_dream_last_resort_preserves_other_card_and_target_exclusions():
             if int(env.stage[0]) == 2 and env.mask[0, 1]:
                 return np.array([1], np.int32)
             return super().__call__(env, rows)
-    advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False), PreferSelf())
-    assert advice['status'] == 'advice' and advice['dream_last_resort']
+    advice = advise_supported(dict(env=OfficialDecision(p), history_complete=False), PreferSelf(), dream=dream)
+    assert advice['status'] == 'advice' and advice['dream_played']
     assert advice['action']['target'] == 2
     assert dict(reason='self_target_of_enemy_default_unobserved', target='self') in advice['mask_exclusions']

@@ -4,6 +4,7 @@ No transport, browser, account, or networking code lives in this module.
 """
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 import importlib.util
 import json
@@ -21,6 +22,13 @@ KINDS = ('play', 'defend', 'discard', 'pray', 'exchange', 'sell', 'buy', 'accept
 OBSERVED_UI_KINDS = frozenset(('play', 'defend', 'exchange', 'sell', 'buy', 'pray', 'accept', 'decline'))
 DTYPES = dict(obs_type=np.int8, obs_aux_card=np.int16, obs_valid=bool,
               obs_cards=np.int16, obs_cat=np.int8, obs_num=np.float32)
+
+
+def ambiguous_disguised_ids(hand):
+    """Items whose shared public face cannot identify a Dream click."""
+    counts = Counter(h['face'] for h in hand)
+    faces = {h['face'] for h in hand if h['disguised'] and counts[h['face']] > 1}
+    return {h['id'] for h in hand if h['face'] in faces}
 
 
 def parser_module():
@@ -959,8 +967,8 @@ class OfficialDecision:
             reasons.append('danger_wide_requires_unobservable_mortar_absence')
         if any(h['disguised'] for h in selected):
             reasons.append('dream_actual_execution_not_verified_from_public_faces')
-        disguised_faces = {h['face'] for h in self.public['hand'] if h['disguised']}
-        if any(not h['disguised'] and h['face'] in disguised_faces for h in selected):
+        ambiguous = ambiguous_disguised_ids(self.public['hand'])
+        if any(h['id'] in ambiguous for h in selected):
             reasons.append('ambiguous_disguised_face')
         return reasons
 

@@ -9,7 +9,7 @@ import json
 import re
 import time
 
-from .official import ROOT, OBSERVED_UI_KINDS
+from .official import ROOT, OBSERVED_UI_KINDS, ambiguous_disguised_ids
 from . import MatchConfig, _core
 
 
@@ -377,7 +377,7 @@ def used_positions(state, public):
     return result
 
 
-def prepare(state, public, action, name, *, dream_last_resort=False):
+def prepare(state, public, action, name, *, allow_dream=False, dream_last_resort=False):
     """Validate whole semantic command before the first UI mutation."""
     require((action['expected_update'], action['expected_gf'], action['viewer']) ==
             (public['update'], public['gf'], public['viewer']), 'stale_advice')
@@ -427,6 +427,7 @@ def prepare(state, public, action, name, *, dream_last_resort=False):
         return dict(cards=[], stages=[], attempted=[], card_paths=[], allocation=[],
                     confirm=confirm, pane=x, commands=[confirm])
     own = {h['id']: h for h in public['hand']}
+    ambiguous = ambiguous_disguised_ids(public['hand'])
     ids = [c['item_id'] for c in action['cards']]
     require(len(ids) == len(set(ids)), 'duplicate_selected_id')
     available = hand_images(state); clicks = []; expected = Counter(); stages = []
@@ -435,8 +436,8 @@ def prepare(state, public, action, name, *, dream_last_resort=False):
         require(h is not None and h['face'] == card['model'], 'card_not_in_public_hand')
         require(not h['used'] or PATHS.get(h['face'], '').startswith('/images/items/miracles/'),
                 'card_not_in_public_hand')
-        require(dream_last_resort or not any(i['disguised'] for i in public['hand']
-                if i['face'] == h['face']), 'ambiguous_disguised_face')
+        require(dream_last_resort or (h['id'] not in ambiguous and (allow_dream or not h['disguised'])),
+                'ambiguous_disguised_face')
         path = PATHS.get(card['model'])
         matches = [r for r in available if r['path'] == path]
         require(path and matches, 'card_image_missing')
@@ -483,13 +484,13 @@ def verify(state, public, name, plan, expected):
     verify_scene(state, public)
 
 
-def execute(probe, state, public, action, name, *, commands=None, settle_timeout=30, refresh=None, dream_last_resort=False, previous_reflect=False):
+def execute(probe, state, public, action, name, *, commands=None, settle_timeout=30, refresh=None, allow_dream=False, dream_last_resort=False, previous_reflect=False):
     """Send one click at a time and verify its resulting visible state.
 
     Caller owns capture/update acceptance and saving a screenshot on failure.
     commands is populated before dispatch, including a failed attempted click.
     """
-    plan = prepare(state, public, action, name, dream_last_resort=dream_last_resort)
+    plan = prepare(state, public, action, name, allow_dream=allow_dream, dream_last_resort=dream_last_resort)
     commands = commands if commands is not None else []
     # Counters (e.g. ring counter-attacks) also arrive right after an animation.
     pending = public.get('pending') or {}
@@ -500,7 +501,7 @@ def execute(probe, state, public, action, name, *, commands=None, settle_timeout
                                      timeout=settle_timeout, refresh=refresh)
         # Geometry may have settled into a different hand arrangement.
         ready(state, public, name)
-        plan = prepare(state, public, action, name, dream_last_resort=dream_last_resort)
+        plan = prepare(state, public, action, name, allow_dream=allow_dream, dream_last_resort=dream_last_resort)
     expected = {}
     def settled(state, expected, values=None, initial=False, final=False):
         def check(s):

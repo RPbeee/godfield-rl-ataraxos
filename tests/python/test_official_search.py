@@ -349,6 +349,25 @@ def small_search(model, seed=7):
     return agent
 
 
+def test_dream_allow_keeps_search_choice_and_budget(models):
+    from gfrl.official_advisor import DREAM_REASON, advise_supported
+    agent = small_search(models[0])
+    with _policy_rng(7, (agent,)):
+        initial = advise(result_for([research_game()]), agent, search=True)
+    assert initial['action']['cards'] == [dict(model=55, item_id=991)]
+    agent = small_search(models[0])
+    with _policy_rng(7, (agent,)):
+        advice = advise_supported(result_for([research_game()]), agent, search=True)
+    assert advice['status'] == 'advice' and advice['unsupported'] == []
+    assert advice['action'] == initial['action']
+    assert advice['dream_played'] is True and DREAM_REASON in advice['warnings']
+    assert advice['search_status'] == initial['search_status'] == 'main_public_worlds'
+    assert advice['pi_search_top'] == initial['pi_search_top']
+    assert advice['pi_theta_top'] == initial['pi_theta_top']
+    assert agent.counts['searched'] == 1
+    assert not advice.get('mask_exclusions') and not advice.get('dream_last_resort')
+
+
 def test_ui_exclusion_searches_again(models, monkeypatch):
     from gfrl.official_advisor import advise_supported
     agent = small_search(models[0])
@@ -365,7 +384,7 @@ def test_ui_exclusion_searches_again(models, monkeypatch):
     monkeypatch.setattr(advisor, 'advise', timed)
     agent = small_search(models[0])
     with _policy_rng(7, (agent,)):
-        advice = advise_supported(result_for([research_game()]), agent, search=True)
+        advice = advise_supported(result_for([research_game()]), agent, search=True, dream='last-resort')
     assert advice['search_status'] == 'ui_mask_search'
     assert advice['status'] == 'advice'
     assert advice['action']['cards'] == [dict(model=19, item_id=992)]
@@ -472,7 +491,7 @@ def test_research_unsupported_reason(models, monkeypatch, reason, failure_at):
             return original_world(*args, **kwargs)
         monkeypatch.setattr(agent, '_world_env', worlds)
     with _policy_rng(7, (agent,)):
-        advice = advise_supported(result_for([research_game()]), agent, search=True)
+        advice = advise_supported(result_for([research_game()]), agent, search=True, dream='last-resort')
     assert advice['status'] == 'advice'
     assert advice['search_status'] == 'ui_mask_policy_fallback'
     assert advice['search_fallback_reason'] == reason + '_policy_fallback'
@@ -496,7 +515,7 @@ def test_search_cap_includes_further_retries(models, monkeypatch):
     monkeypatch.setattr(OfficialDecision, 'action_support', gaps)
     agent = small_search(models[0])
     with _policy_rng(7, (agent,)):
-        advice = advise_supported(result_for([research_game()]), agent, search=True)
+        advice = advise_supported(result_for([research_game()]), agent, search=True, dream='last-resort')
     assert advice['status'] == 'advice'
     assert agent.counts['searched'] == 2
     assert advice['search_status'] == 'ui_retry_policy_fallback'
@@ -509,7 +528,7 @@ def test_dream_last_resort_uses_remaining_search_budget(models):
     game['players'][0]['items'] = [dict(id=991, modelId=6, fakeModelId=6)]
     agent = small_search(models[0], seed=0)
     with _policy_rng(0, (agent,)):
-        advice = advise_supported(result_for([game]), agent, search=True)
+        advice = advise_supported(result_for([game]), agent, search=True, dream='last-resort')
     assert advice['search_status'] == 'dream_last_resort_search'
     assert advice['dream_last_resort'] and advice['status'] == 'advice'
     assert agent.counts['searched'] == 2
@@ -586,7 +605,7 @@ def test_world_rejection_does_not_repeat_search_on_ui_exclusion(models, monkeypa
         return original(src, rows, invalid, seeds, depth, role)
     monkeypatch.setattr(agent, '_world_env', rejected)
     with _policy_rng(7, (agent,)):
-        advice = advise_supported(result_for([research_game()]), agent, search=True)
+        advice = advise_supported(result_for([research_game()]), agent, search=True, dream='last-resort')
     assert advice['status'] == 'advice'
     assert calls == ['candidate']
     assert advice['initial_search_status'] == 'no_candidates_policy_fallback'

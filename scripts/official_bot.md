@@ -26,6 +26,26 @@
 再構成できる通常応答も探索する。対応範囲は下記。複数局は `--games N`。
 出力先の `moves.jsonl` は上書きしないので、毎回新しいディレクトリを使う。
 
+`--dream allow|last-resort` の既定は **allow**。Dream の偽装カードは、同じ公開面を
+持つ別の手札がない場合に限り、方策・探索が選んだ手をそのまま使う。
+偽装カードと同じ公開面を共有するカードは、偽装の有無にかかわらず両モードで
+`ambiguous_disguised_face` として除外して選び直し、他に実行できる手が
+なくなった場合だけ除外を戻す。UI も `dream_last_resort` なしでは曖昧なクリックを拒否する。
+許可した `dream_actual_execution_not_verified_from_public_faces` / `ambiguous_disguised_face` は
+助言と `moves.jsonl` 行の `warnings` に残し、該当カードを使う手には助言と行に
+`dream_played: true` を付ける。曖昧な同一面のコピーは可視画像で区別できないため、
+記録の item ID は助言上の選択を表し、実際に使われたコピーの識別を保証しない。
+`--dream last-resort` は従来通り、公開面が一意な偽装カードも除外して選び直す。
+最後の手段で除外を戻した場合は、両モードで `dream_last_resort: true` も残す。
+どちらのモードも discard・sacrifice、敵を既定対象とするカードの自分指定、94+232 の
+制限は維持する。
+
+送信前の画像・対象・資源の照合と、送信後の updateCount 前進の必須条件は維持する。
+使用後のカード・効果は受信した公開状態から取り込み、偽装面から結果を予測して照合しない。
+受信不整合や未受理は従来通り停止・復旧する。Dream の防御では公開面から反射能力の
+有無を確定できないので、次の応答でも既存の連続2状態の表示安定確認を行う。
+相手の非公開手札は使わない。
+
 受信は全 stream の不変 prefix を解析する。bot は events だけ寛容に取り込み、
 未知のイベントを内容のない `unknownEvent` に置き換える。履歴は部分記録となり、
 安全な key 名と action 値だけを助言の警告・`moves.jsonl`・標準エラーに残す。
@@ -68,7 +88,7 @@ pixel probe の矢印検出に使う上部名前帯を演出として除外し�
 
 - catalog の category/imageName から model の画像 path を作る。手札の80×80画像を
   2段の手札領域だけで探し、自己 item ID/face/未使用状態と必要枚数を照合する。
-  同じ face の偽装品があれば曖昧として停止する。
+  同じ face の偽装品がある場合も、Dream を許可した助言に限り可視面をクリックする。
 - probe に可視テキストの矩形を追加した。上部 y=55〜95 にある自分の名前帯から
   左350／右690の欄を決める。ヘッダや右側の status、フッタの名前を使わない。
 - カードごとに自分の欄の画像 path と枚数を再確認する。GF と両者の可視資源も
@@ -98,10 +118,10 @@ pixel probe の矢印検出に使う上部名前帯を演出として除外し�
   未観測の `discard`・`sacrifice` は `ui_kind_unobserved:<kind>` として
   kind の mask から除き、同じ greedy/sample 設定で助言を作り直す。
   除外は `moves.jsonl` の `mask_exclusions` に理由と `kind` を記録する。
-  合法な選択が残らない場合は `selection_exhausted` とする。Dream のみ、下記の
-  最後の手段で偽装カードの除外を緩める。
+  合法な選択が残らない場合は `selection_exhausted` とする。Dream 関連の
+  除外のみ、下記の最後の手段で緩める。
   UI に直接渡された未観測種類は `unobserved_ui_kind` で停止し、detail に kind を残す。
-  偽装カードの未検証理由と個体 ID の除外は捨てる手にも維持する。空応答は対応済み。
+  `--dream last-resort` では偽装カードの未検証理由と個体 ID の除外も維持する。空応答は対応済み。
 - 自分が霧のときは、右の状態欄で自分の名前がある段と反対の段に、名前・数字の
   無い紫の帯があることを確認する。上段／下段のどちらの並びにも対応する。
   応答の局面で `--settle-timeout` まで待っても上部に自分の帯が無ければ、
@@ -261,7 +281,7 @@ Nodeもブラウザも起動せず、元資料は変更しない。5つの自分
 - 霧の帯は半透明なので、内側の RGB 範囲と R/G 差で判定する。左側の丸みを避けた x=870–1194、上下 5px を除く領域を検査する。帯内に名前・数字がないことは引き続き `texts` で確認する。回帰テストは実測色に基づく合成 PNG のみを使う。
 - Earth/Moon の所持自体は決定を止めない。公開の guardian identity は観測に入るが、将来の一般神器・奇跡の抽選は現在の合法手を決める入力ではない。`earth_moon_general_execution` は助言の警告に残す。受信済み攻撃は v33 typed payload の native `guardian_payload_legal` でモデル列の domain を検査し、対応範囲だけ通常の公開応答カーソルへ渡す。動的威力・redirect 等の既存停止条件は維持する。
 - native の Earth120/Moon26 の各単品と Earth の複合列から作った応答について、公開観測・mask を照合する。205/206 の公開 amount も native と同じ 3/2 にする。守護神なし・Earth・Moon・Mars の main/通常応答では、native と公開選択木の全接頭辞を比較する。
-- Dream の選択は見かけと個体 ID に基づくが、goodfield の `docs/official-execution-subset.md` の v28/v32 は互換クラス外の実体不適合入力について公式 server の受理規約を確定していない。discard でも actual を reveal する共有消費経路を使うため、偽装カードはまず `dream_actual_execution_not_verified_from_public_faces` として除外する。合法な祈り・空応答を含む安全な候補が尽きた場合だけ、2x の最後の手段を使う。
+- Dream の選択は見かけと個体 ID に基づくが、goodfield の `docs/official-execution-subset.md` の v28/v32 は互換クラス外の実体不適合入力について公式 server の受理規約を確定していない。従来の除外・最終手段の動作は `--dream last-resort` で利用できる。既定の `allow` は公開面が一意な偽装カードの未検証理由を警告として選択を許可し、共有面の曖昧なカードは最後の手段に限る。受理は従来通り公開受信で確認する。
 - auto39 の最終停止行は GF38/main。除外 5 件の後、最後の除外で公開選択が尽きると、その除外を戻して再抽選していた。これをやめ、最後の除外も `mask_exclusions` に残し、`selection_exhausted` で停止する。安全な候補がある場合は除外後の mask で選び直す。同一 face の先頭コピーを除外したとき、canonical な重複省略で後続コピーまで選べなくならないよう、除外中だけ全順序の選択木を使う。学習・収集・評価用の選択木は変更しない。
 
 ### 2s 実機停止の調査（オフライン）
@@ -286,7 +306,7 @@ Nodeもブラウザも起動せず、元資料は変更しない。5つの自分
 - 2人戦の target None はカードの種類に依存せず、自分の帯1本と相手の対象帯ありの
   両方を許可する。対象側が自分なら停止する。match1 の 232 と auto50 の 104 を
   合成 state で検証し、両表示の確定操作が同じ自分の欄のクリックであることも確認する。
-- Dream は元の公開手札を保持したまま mask を作り直し、偽装カードと未観測の kind を
+- `--dream last-resort` は元の公開手札を保持したまま mask を作り直し、偽装カードと未観測の kind を
   除外する。合法な祈り・空応答が残るなら、それを優先する。武器を選択から除外しても、
   手札に武器があるため禁止される祈りを新たに合法にはしない。
 - `--search` では UI 除外を根の全 substep に適用して1回だけ再探索する。
@@ -294,11 +314,11 @@ Nodeもブラウザも起動せず、元資料は変更しない。5つの自分
   初回を含め最大2探索。以降の retry は方策を使う。非対応・公開マスク不一致は
   従来の fallback 状態と `search_fallback_reason` を残し、`search_seconds` は累積する。
   世界内の後続決定には UI 除外を持ち越さない。計測条件・結果は `official_advisor.md` 参照。
-- 安全な mask が尽きた場合に限り、偽装カードの除外だけを戻す。その他のカード・対象の
+- 両モードで安全な mask が尽きた場合に限り、Dream 関連の除外だけを戻す。その他のカード・対象の
   除外は維持し、discard・sacrifice は常に禁止する。Dream の未検証理由は警告に下げ、
-  `moves.jsonl` の行と助言に `dream_last_resort: true`、助言の `warnings` に
-  `dream_actual_execution_not_verified_from_public_faces` を残す。停止時にも固定の警告を残す。
-  UI はこの場合だけ見えている面をクリックする。
+  `moves.jsonl` の行と助言に `dream_last_resort: true` と `dream_played: true`、`warnings` に
+  `dream_actual_execution_not_verified_from_public_faces` または `ambiguous_disguised_face` を残す。
+  停止時にも固定の警告を残す。UI は Dream を許可した助言で見えている面をクリックする。
 - 受理は従来通り受信の updateCount の前進を必須とし、受理されなければ停止する。
   `OfficialSession.ingest()` は受信 game の公開状態を盤面に投影するため、使用結果の実体が
   偽装の面と異なっても、選択した面から盤面を推測して上書きしない。合成受信と probe で

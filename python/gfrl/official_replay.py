@@ -58,7 +58,9 @@ def replay_advice(probe, advisor, journal):
         try:
             if advice['status'] != 'advice':
                 raise UIUnsupported('unsupported_advice')
-            row['planned_clicks'] = prepare(state, public, advice['action'], name)['commands']
+            row['planned_clicks'] = prepare(state, public, advice['action'], name,
+                allow_dream=advice.get('dream_played') is True,
+                dream_last_resort=advice.get('dream_last_resort') is True)['commands']
             supported += 1
         except UIUnsupported as error:
             row['ui_unsupported'] = str(error)

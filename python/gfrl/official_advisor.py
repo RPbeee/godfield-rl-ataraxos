@@ -175,11 +175,14 @@ AMBIGUOUS_REASON = 'ambiguous_disguised_face'
 DREAM_RELAXABLE_REASONS = (DREAM_REASON, AMBIGUOUS_REASON)
 
 
-def advise_supported(result, agent, *, search=False, max_samples=16):
-    """Prefer verified actions; relax Dream gaps only after the safe mask is exhausted."""
+def advise_supported(result, agent, *, search=False, max_samples=16, dream='allow'):
+    """Prune execution gaps, allowing Dream by default or only as a last resort."""
     from .official import OfficialDecision, OBSERVED_UI_KINDS, KINDS as ACTION_KINDS
+    if dream not in ('allow', 'last-resort'):
+        raise ValueError('invalid_dream_mode')
     budget = dict(remaining=2, blocked_reason=None)
-    advice = _advise_supported(result, agent, search=search, max_samples=max_samples, search_budget=budget)
+    advice = _advise_supported(result, agent, search=search, max_samples=max_samples,
+                              search_budget=budget, allow_dream=dream == 'allow')
     exclusions = advice.get('mask_exclusions', [])
     if not advice.get('selection_exhausted') or not any(e['reason'] in DREAM_RELAXABLE_REASONS for e in exclusions):
         return advice
@@ -196,9 +199,11 @@ def advise_supported(result, agent, *, search=False, max_samples=16):
         return advice
     recovered = _advise_supported(fresh, agent, search=search, search_budget=budget,
         prior_diagnostics={k: advice[k] for k in empty_diagnostics()},
-        max_samples=max_samples, allow_dream=True,
+        max_samples=max_samples, allow_dream=True, allow_ambiguous=True,
         excluded_ids=hard_ids, excluded_kinds=kinds, exclude_self=prune_self,
         initial_exclusions=exclusions)
+    if recovered.get('dream_played'):
+        recovered['dream_last_resort'] = True
     if search:
         recovered['initial_search_status'] = advice['search_status']
         recovered['search_status'] = ('dream_last_resort_search' if recovered['search_status'] in (
@@ -207,11 +212,11 @@ def advise_supported(result, agent, *, search=False, max_samples=16):
     return recovered
 
 
-def _advise_supported(result, agent, *, search=False, max_samples=16, allow_dream=False,
+def _advise_supported(result, agent, *, search=False, max_samples=16, allow_dream=False, allow_ambiguous=False,
                       excluded_ids=(), excluded_kinds=(), exclude_self=False, initial_exclusions=(),
                       search_budget=None, prior_diagnostics=None):
     """Prune UI gaps; search at most twice across all recovery paths."""
-    from .official import OfficialDecision
+    from .official import OfficialDecision, ambiguous_disguised_ids
     env = result['env']
     budget = search_budget if search_budget is not None else dict(remaining=2, blocked_reason=None)
     totals = dict(prior_diagnostics or empty_diagnostics())
@@ -241,12 +246,13 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
                 advice['search_status'] = recovery + ('_search' if success else '_policy_fallback')
                 if not success:
                     advice['search_fallback_reason'] = (status if use_search else budget['blocked_reason'] or 'search_limit')
-        relaxed = [r for r in advice['unsupported'] if r in DREAM_RELAXABLE_REASONS]
-        if allow_dream and relaxed:
-            advice['unsupported'] = [r for r in advice['unsupported'] if r not in DREAM_RELAXABLE_REASONS]
+        relaxed = [r for r in advice['unsupported'] if
+                   (r == DREAM_REASON and allow_dream) or (r == AMBIGUOUS_REASON and allow_ambiguous)]
+        if relaxed:
+            advice['unsupported'] = [r for r in advice['unsupported'] if r not in relaxed]
             advice['status'] = 'unsupported' if advice['unsupported'] else 'advice'
             advice['warnings'].extend(relaxed)
-            advice['dream_last_resort'] = True
+            advice['dream_played'] = True
         if initial_exclusions:
             advice['mask_exclusions'] = list(initial_exclusions)
         return advice
@@ -266,10 +272,9 @@ def _advise_supported(result, agent, *, search=False, max_samples=16, allow_drea
             blocked_by_reason.append(dict(reason=DREAM_REASON,
                 item_ids=[h['id'] for h in env.public['hand'] if h['disguised'] and h['id'] in selected]))
         if AMBIGUOUS_REASON in reasons:
-            disguised_faces = {h['face'] for h in env.public['hand'] if h['disguised']}
+            ambiguous = ambiguous_disguised_ids(env.public['hand'])
             blocked_by_reason.append(dict(reason=AMBIGUOUS_REASON,
-                item_ids=[h['id'] for h in env.public['hand'] if not h['disguised']
-                          and h['face'] in disguised_faces and h['id'] in selected]))
+                item_ids=[h['id'] for h in env.public['hand'] if h['id'] in ambiguous and h['id'] in selected]))
         if 'danger_wide_requires_unobservable_mortar_absence' in reasons:
             blocked_by_reason.append(dict(reason='danger_wide_requires_unobservable_mortar_absence',
                 item_ids=[c['item_id'] for c in advice['action']['cards'] if c['model'] == 232]))

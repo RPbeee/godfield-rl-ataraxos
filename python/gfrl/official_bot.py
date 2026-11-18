@@ -565,9 +565,11 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 advice = advisor(result)
                 current_record = dict(state=summary(public), advice=advice, clicks=[], accepted=False,
                                       replaced_events=replacements)
-                for key in ('fallback_samples', 'selection_exhausted', 'dream_last_resort'):
+                for key in ('fallback_samples', 'selection_exhausted', 'dream_last_resort', 'dream_played'):
                     if key in advice:
                         current_record[key] = advice[key]
+                if advice.get('dream_played') is True:
+                    current_record['warnings'] = advice['warnings']
                 require(advice['status'] == 'advice', 'unsupported_advice',
                         dict(unsupported=advice.get('unsupported', []),
                              action=dict(kind=advice.get('action', {}).get('kind'),
@@ -590,6 +592,7 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                     def preflight(s):
                         ready(s, public, name)
                         return prepare(s, public, advice['action'], name,
+                                       allow_dream=advice.get('dream_played') is True,
                                        dream_last_resort=advice.get('dream_last_resort') is True)
                     try:
                         plan = preflight(state)
@@ -604,6 +607,7 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                     if not dry_run:
                         plan = execute(probe, state, public, advice['action'], name,
                                 commands=current_record['clicks'], settle_timeout=settle_timeout,
+                                allow_dream=advice.get('dream_played') is True,
                                 refresh=refresh, dream_last_resort=advice.get('dream_last_resort') is True,
                                 previous_reflect=previous_reflect)
                 except ReceiveAdvanced as advanced:
@@ -671,8 +675,12 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 except ReceiveAdvanced as advanced:
                     result = advanced.result
                 current_record.update(status='accepted', accepted=True, received_update=result['public']['update'])
-                previous_reflect = (advice['action']['kind'] == 'defend' and any(
-                    c['model'] in REFLECT_MODELS for c in advice['action']['cards']))
+                # A disguised/ambiguous defense's actual ability is unknown.
+                # Conservatively use the existing visible stability check next
+                # time; never infer absence of reflection from its public face.
+                previous_reflect = (advice['action']['kind'] == 'defend' and (
+                    advice.get('dream_played') is True or any(
+                        c['model'] in REFLECT_MODELS for c in advice['action']['cards'])))
                 kind = advice['action']['kind']
                 if kind not in successful_kinds:
                     current_record['first_success_kind'] = kind
@@ -708,6 +716,9 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 target=a.get('target') if type(a.get('target')) is int else None)
             if recorded_advice.get('dream_last_resort') is True:
                 stopped['dream_last_resort'] = True
+            if recorded_advice.get('dream_played') is True:
+                stopped['dream_played'] = True
+            if recorded_advice.get('dream_played') is True or recorded_advice.get('dream_last_resort') is True:
                 stopped['warnings'] = [r for r in recorded_advice.get('warnings', [])
                     if isinstance(r, str) and r in (
                         'dream_actual_execution_not_verified_from_public_faces', 'ambiguous_disguised_face')]
@@ -801,6 +812,8 @@ def main(argv=None):
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--greedy', action='store_true')
     parser.add_argument('--search', action='store_true')
+    parser.add_argument('--dream', choices=['allow', 'last-resort'], default='allow',
+                        help='Allow unique-face disguised cards normally (default) or only as a last resort')
     from .official_search import add_search_arguments, search_config, search_agent
     add_search_arguments(parser)
     parser.add_argument('--games', type=int, default=1)
@@ -854,7 +867,7 @@ def main(argv=None):
             nonlocal agent
             if agent is None:
                 agent = Actor(model, result['env'], args.device, sample=not args.greedy)
-            return advise_supported(result, agent, search=args.search)
+            return advise_supported(result, agent, search=args.search, dream=args.dream)
         directory = private_directory(args.out_dir)
         journal = Journal(directory)
         if args.replay:

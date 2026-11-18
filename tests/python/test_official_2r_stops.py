@@ -95,7 +95,7 @@ def test_dream_discard_exhaustion_restores_only_observed_card_actions():
     # A disguised weapon prevents prayer; the only discard is disguised too.
     p['hand']=[dict(id=1,face=6,used=False,disguised=True),
                dict(id=2,face=158,used=False,disguised=True)]
-    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),PreferFirst())
+    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),PreferFirst(), dream='last-resort')
     assert a['status']=='advice' and a['dream_last_resort']
     assert a['action']['kind']=='play'
     assert not a['unsupported']
@@ -111,7 +111,7 @@ def test_dream_discard_can_be_excluded_with_safe_alternative():
         def __call__(self,env,rows):
             if int(env.stage[0])==0 and env.mask[0,2]:return np.array([2],np.int32)
             return super().__call__(env,rows)
-    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),DiscardFirst())
+    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),DiscardFirst(),dream='last-resort')
     assert a['status']=='advice' and a['action']['cards']==[dict(item_id=2,model=6)]
     assert a['mask_exclusions'][0]['item_ids']==[1]
 

@@ -105,7 +105,7 @@ def test_dream_mask_removes_selected_card_preserves_slots_and_mode(greedy):
                dict(id=100,face=6,used=False,disguised=False),
                dict(id=101,face=7,used=False,disguised=False)]
     actor=PreferFirst();actor.sample=not greedy
-    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),actor)
+    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),actor, dream='last-resort')
     assert a['status']=='advice' and a['action']['cards']==[dict(item_id=100,model=6)]
     assert a['mask_exclusions']==[dict(reason='dream_actual_execution_not_verified_from_public_faces',item_ids=[99])]
     assert 'fallback_samples' not in a and actor.modes==[not greedy]*len(actor.modes)
@@ -244,7 +244,7 @@ def test_disguised_exclusions_accumulate_without_sampling():
                dict(id=100,face=6,used=False,disguised=True),
                dict(id=101,face=7,used=False,disguised=False)]
     actor=PreferFirst()
-    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),actor)
+    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),actor, dream='last-resort')
     assert a['status']=='advice' and a['action']['cards']==[dict(item_id=101,model=7)]
     assert [e['item_ids'] for e in a['mask_exclusions']]==[[99],[100]]
     assert not any(actor.modes)
@@ -276,7 +276,7 @@ def test_no_safe_mask_alternative_restores_dream_card_as_last_resort():
     p=deepcopy(results()[2]['public'])
     p['hand']=[dict(id=99,face=90,used=False,disguised=True)]
     actor=PreferFirst()
-    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),actor,max_samples=2)
+    a=advise_supported(dict(env=OfficialDecision(p),history_complete=False),actor,max_samples=2, dream='last-resort')
     assert a['status']=='advice' and a['dream_last_resort']
     assert 'selection_exhausted' not in a
     assert 'dream_actual_execution_not_verified_from_public_faces' in a['warnings']

@@ -559,7 +559,7 @@ def test_bot_advice_fallback_samples_policy_at_same_position(monkeypatch, reject
             def __call__(self, env, rows): return self.actor(env, rows)
         agent = SearchPolicy() if search else actor
         with _policy_rng(17, ()):
-            got = advise_supported(result,agent,search=search)
+            got = advise_supported(result,agent,search=search, dream='last-resort')
         assert got['fallback_samples'] == expected_samples
         assert len(calls) == expected_samples+1
         assert all(p == original for p,_ in calls)
