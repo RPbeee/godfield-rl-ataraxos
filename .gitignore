@@ -7,3 +7,5 @@ __pycache__/
 *.so
 *.dylib
 /AGENTS.local.md
+/.claude/
+/measurements/
