@@ -121,11 +121,16 @@ struct OfficialCursor {
         return x;
     }
     explicit OfficialCursor(nb::dict d):position(official_view(d)),selection(position,true,restrictions(d)) {advance();}
+    explicit OfficialCursor(const gf::MatchView& view):position(view),selection(position,true) {advance();}
     void advance() {
         while(!selection.complete && std::count(selection.mask.begin(),selection.mask.end(),true)==1)
             selection.choose(position,std::find(selection.mask.begin(),selection.mask.end(),true)-selection.mask.begin(),true);
     }
     void choose(int choice) {++selection.substep;selection.choose(position,choice,true);advance();}
+    std::unique_ptr<OfficialCursor> branch(int choice) const {
+        auto child=std::make_unique<OfficialCursor>(*this);
+        child->choose(choice);return child;
+    }
     nb::dict state() const {
         const auto& s=selection;nb::dict d;
         d["complete"]=s.complete;d["stage"]=s.complete?-1:int(s.stage);d["mask"]=nb::cast(s.mask);d["substep"]=s.substep;

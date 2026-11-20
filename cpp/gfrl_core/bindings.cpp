@@ -82,12 +82,15 @@ struct TestAccess {
         for(auto& h:e.history)h=History(env.history_len);
         e.selection.reset();e.encoded=false;e.waiting=false;env.drive(0);
     }
-    static void response_root(VecEnv& env, gf::CardId model, bool fog, std::uint64_t seed) {
+    static void response_root(VecEnv& env, gf::CardId model, bool fog, std::uint64_t seed,
+                              int defender_hp, bool second_armor) {
         auto& e=env.envs_.at(0);
         auto state=e.match.snapshot().state;
         for(auto& p:state.players) {p.items.clear();p.curses.clear();p.guardian=gf::Guardian::none;}
         state.players[0].items={{100,model,{},false},{101,19,{},false}};
         state.players[1].items={{200,8,{},false},{201,120,{},false},{202,190,{},false}};
+        if(defender_hp>=0)state.players[1].hp=defender_hp;
+        if(second_armor)state.players[1].items.push_back({203,120,{},false});
         if(fog)state.players[0].curses={gf::Curse::fog};
         const gf::Command launch{state.players[0].id,gf::CommandKind::play,{100},
             gf::find_card(model)->hit_rate?std::nullopt:std::optional<gf::PlayerId>{state.players[1].id}};
@@ -219,11 +222,13 @@ NB_MODULE(_core, m) {
     m.def("_official_board",[](nb::dict d){return play_board(official_view(d));});
     nb::class_<OfficialCursor>(m,"_OfficialCursor")
         .def(nb::init<nb::dict>()).def("state",&OfficialCursor::state)
-        .def("choose",&OfficialCursor::choose).def("command",&OfficialCursor::command);
+        .def("choose",&OfficialCursor::choose).def("command",&OfficialCursor::command)
+        .def("branch",&OfficialCursor::branch);
 
     m.def("_test_danger_root", &TestAccess::danger_root);
     m.def("_test_dream_root", &TestAccess::dream_root);
-    m.def("_test_response_root", &TestAccess::response_root);
+    m.def("_test_response_root", &TestAccess::response_root, "env"_a, "model"_a, "fog"_a,
+          "seed"_a, "defender_hp"_a=-1, "second_armor"_a=false);
     m.def("_test_replace_hidden_hand", &TestAccess::replace_hidden_hand,
           "env"_a, "row"_a, "seed"_a, "decisions"_a=nb::none());
     nb::class_<gf::MatchConfig>(m, "MatchConfig")
@@ -259,6 +264,23 @@ NB_MODULE(_core, m) {
         .def("stats", &stats_dict)
         .def("obs_schema", [](const VecEnv& e){return schema(e.history_len);});
     cls.def("play_view",[](const VecEnv& e,std::size_t row,int seat){return play_board(e.play_view(row,seat));});
+    cls.def("_diagnostic_public_cursor",[](const VecEnv& e,std::size_t row) {
+        if(row>=e.num_envs || e.stage[row]<0 || e.substep[row]!=0)
+            throw std::invalid_argument("public cursor requires a live root");
+        const int seat=e.actor_seat[row];
+        auto view=e.play_view(row,seat);
+        view.board.hand=e.play_hand(row,seat);
+        // The displayed face may differ from the acting card's model. Danger
+        // with Wide has a special rule that can depend on a hidden third card.
+        const auto face=[&](gf::CardId model) {
+            return std::any_of(view.board.hand.begin(),view.board.hand.end(),
+                               [&](const auto& card){return card.face==model;});
+        };
+        if(std::any_of(view.board.hand.begin(),view.board.hand.end(),[](const auto& card){return card.disguised;})
+           || (view.phase==gf::MatchPhase::main && face(94) && face(232)))
+            throw std::invalid_argument("unsupported public cursor hand");
+        return std::make_unique<OfficialCursor>(view);
+    });
     cls.def("play_hand",[](const VecEnv& e,std::size_t row,int seat){
         nb::list out;for(const auto& h:e.play_hand(row,seat))out.append(play_item(h));return out;
     });
