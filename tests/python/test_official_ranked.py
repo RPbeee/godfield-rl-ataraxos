@@ -1178,7 +1178,11 @@ def test_ranked_receive_reason_allowlist_and_sanitization():
     assert ranked_receive_reason(dict(
         error='ValueError', code='conflicting_update', update=12,
         differences=[dict(path='events[0].damage', kind='changed')],
-    )) == 'ur_cu_events'
+    )) == 'ur_cu_events_only'
+    assert ranked_receive_reason(dict(
+        error='ValueError', code='conflicting_update', update=12,
+        differences=[dict(path='events[0].damage', kind='changed'), dict(path='players[1].status.hp', kind='changed')],
+    )) == 'ur_cu_players_status'
     assert ranked_receive_reason(dict(
         error='ValueError', code='conflicting_update', update=12,
         differences=[dict(path='players[1].status.hp', kind='changed')],

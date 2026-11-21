@@ -41,7 +41,7 @@ EXEMPT_GAMES = frozenset((1, 2))             # the two verified never-applied pr
 STAGE1_BUDGET = APPROVED + len(EXEMPT_GAMES)  # 12
 FULL_BUDGET = HARD_LIMIT + len(EXEMPT_GAMES)  # 102
 MIN_GAP = 20                                 # seconds after a game before the next entry (required)
-DEFAULT_GAP = 25
+DEFAULT_GAP = 60                             # 100-game run: 25s hit visible_state_timeout 100% of the time
 BACKOFF = (30, 60, 120)                      # seconds before retry 1, 2, 3 (so at most 3 retries)
 CHILD_TIMEOUT = 7200
 # Failures that happen BEFORE a game number is reserved (ledger untouched) and that the site's

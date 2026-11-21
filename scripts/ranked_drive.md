@@ -6,7 +6,7 @@
 
 ```sh
 .venv/bin/python scripts/ranked_drive.py --playwright <playwright-core のパス> [--max-games N] \
-    [--gap 25] [--accept-unresolved-through N] [--gate-ack <gate_id>] [ranked_bot の許可フラグ…]
+    [--gap 60] [--accept-unresolved-through N] [--gate-ack <gate_id>] [ranked_bot の許可フラグ…]
 ```
 
 状態はすべて台帳から読み直す（自前の状態ファイルなし）ので、止めてもそのまま再実行すれば続く。
@@ -34,7 +34,7 @@
   ドライバ自身の二重起動は `runs/ranked100.driver.lock` で防ぐ。ドライバは台帳に書かず、`ranked.lock` も持たない。
 - **台帳の固定**: 先行 2 件（game 1・2）が固定イベントと完全一致する台帳だけを使う（`ledger_not_the_campaign_ledger`）。
   壊れた行・書きかけの末尾があれば `stopped`。
-- **20 秒以上空ける**: 台帳の最後のイベントまたは子の終了から `--gap`（既定 25、20 未満は拒否）秒待ってから次の入場。
+- **20 秒以上空ける**: 台帳の最後のイベントまたは子の終了から `--gap`（既定 60、20 未満は拒否）秒待ってから次の入場。
   起動直後の最初の 1 局にも適用する。
 - **新規予約前の一時不良だけ再試行**: 子が台帳に何も書かずに終わり（= 予約前）、理由が
   `visible_state_timeout` / `login_not_accepted` / `ranked_lobby_missing` / `ranked_button_not_unique` のときだけ、

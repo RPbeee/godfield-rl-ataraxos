@@ -595,12 +595,18 @@ class OfficialSession:
                 target = e['player']
                 if action and action['phase'] == 0 and action['kind'] in (0, 5, 6):
                     action['target'] = target
-            elif kind == 'nextAttack':
+            elif kind in ('nextAttack', 'attackByGuardian'):
                 a = e['attack']; actor = a['playerId']
+                if a.get('targetPlayerId') is not None:
+                    target = a['targetPlayerId']
+                elif kind == 'attackByGuardian':
+                    target = actor
                 removal_model = a.get('itemModelIds', [None])[0]
                 launch = dict(origin=actor, source=actor,
-                              counter=removal_model in range(181, 189), death=False,
-                              reflections=0, bounces=0)
+                              counter=(kind == 'nextAttack' and removal_model in range(181, 189)),
+                              death=False, reflections=0, bounces=0)
+                if kind == 'attackByGuardian':
+                    self.history_complete = False  # guardian auto-opportunity is not a player decision
             elif kind == 'reflect' and launch:
                 launch['reflections'] += 1
                 launch['source'], target = target, launch['source']

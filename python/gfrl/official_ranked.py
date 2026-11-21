@@ -275,7 +275,6 @@ EXC_TYPE_CODES = {
 
 CONFLICT_PATH_RULES = (
     (lambda p: p == 'is_over', 'ur_cu_is_over'),
-    (lambda p: p == 'events' or p.startswith('events['), 'ur_cu_events'),
     (lambda p: p == 'pending' or p.startswith('pending.'), 'ur_cu_pending'),
     (lambda p: p == 'purchase' or p.startswith('purchase.'), 'ur_cu_purchase'),
     (lambda p: p == 'hand' or p.startswith('hand['), 'ur_cu_hand'),
@@ -299,6 +298,10 @@ def _conflict_reason(detail):
     if not isinstance(diffs, list) or not diffs:
         return 'ur_conflicting_update'
     paths = [d.get('path') for d in diffs if isinstance(d, dict) and isinstance(d.get('path'), str)]
+    if not paths:
+        return 'ur_conflicting_update'
+    if all(p == 'events' or p.startswith('events[') for p in paths):
+        return 'ur_cu_events_only'
     for match, code in CONFLICT_PATH_RULES:
         if any(match(p) for p in paths):
             return code
@@ -594,7 +597,7 @@ class RankedSession:
         if action == 'birth' and self.marker is not None:
             self.marker.write_text('1\n'); self.marker.chmod(0o600)
         # A rejected name leaves the name screen: login_not_accepted, nothing is reserved.
-        return wait_login(probe, lobby_screen, self.timeout)
+        return wait_login(probe, lobby_screen, max(self.timeout, self.settle_timeout))
 
     def discover(self, probe):
         """Lobby check only: never reserves, never clicks the ranked button."""

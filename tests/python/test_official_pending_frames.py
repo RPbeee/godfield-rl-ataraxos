@@ -254,3 +254,55 @@ def test_202_wire_magnitude_never_enables_ordinary_armor(atk):
     assert r['public']['pending']['power'] == 0
     assert not r['public'].get('warnings')
     assert not r['env'].mask[0, 0] and r['env'].mask[0, 1]
+
+
+@pytest.mark.parametrize('redirect', ['reflect', 'bounce'])
+def test_attack_by_guardian_redirect_tracks_launch_after_pray(redirect):
+    s = OfficialSession(1)
+    first = base_game()
+    first.update(updateCount=1, attackTurnPlayerId=1, events=[dict(action='pray')], attacks=[])
+    assert s.ingest(first)['status'] == 'decision'
+    second = deepcopy(first)
+    second.update(
+        updateCount=2,
+        events=[
+            dict(action='attackByGuardian',
+                 attack=dict(playerId=1, targetPlayerId=2, itemModelIds=[265], guardian='mars')),
+            dict(action='useDefenseItems', items=[dict(modelId=190)]),
+            dict(action=redirect),
+        ],
+        attacks=[dict(playerId=2, targetPlayerId=1, itemModelIds=[265], guardian='mars', reversed=True)],
+    )
+    r = s.ingest(second)
+    assert r['status'] == 'decision'
+    assert 'redirect_requires_history' not in r['unsupported']
+    pending = r['public']['pending']
+    assert pending['origin'] == 1
+    assert pending['reflections' if redirect == 'reflect' else 'bounces'] == 1
+    assert not pending['counter']
+    assert not r['history_complete']
+
+
+def test_next_attack_updates_target_for_same_update_reflect():
+    s = OfficialSession(1)
+    first = base_game()
+    first.update(updateCount=1, attackTurnPlayerId=2,
+                 attacks=[dict(playerId=2, targetPlayerId=1, itemModelIds=[6], atk=3)],
+                 events=[dict(action='useAttackItems', items=[dict(modelId=6)]),
+                         dict(action='setTargetPlayer', playerId=1)])
+    assert s.ingest(first)['status'] == 'decision'
+    second = deepcopy(first)
+    second.update(
+        updateCount=2,
+        events=[
+            dict(action='nextAttack', attack=dict(playerId=1, targetPlayerId=2, itemModelIds=[184], atk=22)),
+            dict(action='useDefenseItems', items=[dict(modelId=190)]),
+            dict(action='reflect'),
+        ],
+        attacks=[dict(playerId=2, targetPlayerId=1, itemModelIds=[184], atk=22, reversed=True)],
+    )
+    r = s.ingest(second)
+    assert r['status'] == 'decision'
+    pending = r['public']['pending']
+    assert (pending['origin'], pending['source'], pending['target']) == (1, 2, 1)
+    assert pending['reflections'] == 1 and pending['counter'] is True
