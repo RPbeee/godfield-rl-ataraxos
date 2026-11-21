@@ -51,36 +51,52 @@ def _seed_campaign(state_dir):
         )
     finally:
         tr.close()
-    # Append an unterminated trailing line to verify safe mid-write reading.
     with open(state_dir / 'anon_turns.jsonl', 'ab') as f:
         f.write(b'{"ev":"update","partial":')
 
 
 def test_viewer_store_and_dispatch_read_only(tmp_path):
     state_dir = tmp_path / 'ranked1000'
+    assets_dir = tmp_path / 'assets'
+    (assets_dir / 'items/trade').mkdir(parents=True)
+    (assets_dir / 'items/trade/exchange.webp').write_bytes(b'RIFFfakewebp')
     _seed_campaign(state_dir)
-    store = ViewerStore(state_dir, hard_limit=1000, prev_dir=None)
+    store = ViewerStore(state_dir, hard_limit=1000, prev_dir=None, assets_dir=assets_dir)
 
-    code, ctype, body = dispatch_request(store, 'GET', '/')
+    code, ctype, body, _ = dispatch_request(store, 'GET', '/')
     assert code == 200 and 'text/html' in ctype
-    html = body.decode('utf-8')
-    assert 'God Field RL' in html and '/api/live' in html
+    assert 'God Field' in body.decode('utf-8')
 
-    code, _, body = dispatch_request(store, 'GET', '/api/catalog')
-    assert code == 200 and json.loads(body)['3']['name'] == '両替'
+    code, ctype, body, _ = dispatch_request(store, 'GET', '/static/styles.css')
+    assert code == 200 and 'text/css' in ctype and len(body) > 50
 
-    code, _, body = dispatch_request(store, 'GET', '/api/summary')
+    code, ctype, body, _ = dispatch_request(store, 'GET', '/static/app.js')
+    assert code == 200 and 'javascript' in ctype and b'/api/live' in body
+
+    code, ctype, body, _ = dispatch_request(store, 'GET', '/assets/items/trade/exchange.webp')
+    assert code == 200 and ctype == 'image/webp' and body == b'RIFFfakewebp'
+    # Path traversal and unlisted files must be rejected with 404.
+    assert dispatch_request(store, 'GET', '/assets/../secret.txt')[0] == 404
+    assert dispatch_request(store, 'GET', '/assets/items/weapons/does-not-exist.webp')[0] == 404
+
+    code, _, body, _ = dispatch_request(store, 'GET', '/api/catalog')
+    cat = json.loads(body)
+    assert code == 200 and cat['3']['name'] == '両替'
+    assert cat['3']['image_url'] == '/assets/items/trade/exchange.webp'
+
+    code, _, body, _ = dispatch_request(store, 'GET', '/api/summary')
     assert code == 200
     summ = json.loads(body)
     assert summ['current']['counts']['wins'] == 1 and summ['current']['rating_self']['last_after'] == 1786
     assert summ['traced_games'] == [1]
+    assert summ['assets']['items_cached'] == 1
 
-    code, _, body = dispatch_request(store, 'GET', '/api/live')
+    code, _, body, _ = dispatch_request(store, 'GET', '/api/live')
     assert code == 200
     live = json.loads(body)
     assert live['game'] == 1 and len(live['rows']) == 2
 
-    code, _, body = dispatch_request(store, 'GET', '/api/game/1')
+    code, _, body, _ = dispatch_request(store, 'GET', '/api/game/1')
     assert code == 200
     replay = json.loads(body)
     assert replay['game'] == 1 and len(replay['rows']) == 2
@@ -97,7 +113,7 @@ def test_viewer_store_and_dispatch_read_only(tmp_path):
 def test_viewer_http_server_loopback(tmp_path):
     state_dir = tmp_path / 'ranked1000'
     _seed_campaign(state_dir)
-    store = ViewerStore(state_dir, hard_limit=1000, prev_dir=None)
+    store = ViewerStore(state_dir, hard_limit=1000, prev_dir=None, assets_dir=tmp_path / 'empty_assets')
     try:
         server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(store))
     except PermissionError:
@@ -113,7 +129,7 @@ def test_viewer_http_server_loopback(tmp_path):
             if isinstance(exc.reason, PermissionError):
                 pytest.skip('loopback socket connect blocked by sandbox')
             raise
-        assert 'God Field RL' in html
+        assert 'God Field' in html
         live = json.loads(urllib.request.urlopen(base + '/api/live').read())
         assert live['game'] == 1 and len(live['rows']) == 2
         req = urllib.request.Request(base + '/api/summary', method='POST', data=b'{}')

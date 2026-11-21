@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>God Field AI 観戦ダッシュボード</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">◈</span>
+      <div class="brand-text">
+        <h1>God Field <span>観戦ダッシュボード</span></h1>
+        <p>AI (m-xit1 / greedy) の真剣タイマン 1,000 局 ・ 閲覧専用</p>
+      </div>
+    </div>
+    <div id="statusPill" class="pill pill-idle" role="status"><i class="dot"></i><span>読み込み中</span></div>
+    <div class="tools">
+      <nav class="tabs" role="tablist" aria-label="表示切替">
+        <button id="tabBtnLive" class="tab is-active" role="tab" data-tab="live" aria-selected="true">リアルタイム観戦</button>
+        <button id="tabBtnStats" class="tab" role="tab" data-tab="stats" aria-selected="false">戦績・レート推移</button>
+      </nav>
+      <label class="picker" title="記録のある対局を棋譜として再生します">
+        <span>棋譜</span>
+        <select id="gamePicker" aria-label="棋譜を選ぶ"><option value="live">ライブ（最新）</option></select>
+      </label>
+      <label class="switch" title="サーバーから一定間隔で最新状態を取得します">
+        <input id="autoToggle" type="checkbox" checked>
+        <span class="switch-track"><i></i></span>
+        <span class="switch-label">自動更新</span>
+      </label>
+    </div>
+  </div>
+  <div id="kpis" class="kpis" aria-label="主要指標"></div>
+</header>
+
+<main>
+  <section id="tab-live" class="tab-panel" aria-labelledby="tabBtnLive">
+    <div class="live-grid">
+      <div class="live-main">
+        <div id="transport" class="transport"></div>
+        <div id="arena" class="arena">
+          <div id="seat-opp" class="seat seat-opp" data-side="opp"></div>
+          <div id="stage" class="stage"></div>
+          <div id="seat-self" class="seat seat-self" data-side="self"></div>
+        </div>
+        <div class="panel hand-panel">
+          <div class="panel-head">
+            <h2>AI の手札</h2>
+            <span id="handCount" class="muted"></span>
+            <span class="legend"><b class="lg dream">夢</b>偽装カード <b class="lg used">済</b>使用済み奇跡</span>
+          </div>
+          <div id="hand" class="hand"></div>
+        </div>
+      </div>
+      <aside class="live-side">
+        <div class="panel">
+          <div class="panel-head"><h2>AI の勝率予測</h2><span class="muted">モデルの価値関数 (勝ち確率)</span></div>
+          <div id="winChart" class="chart-wrap win-chart"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>対局情報</h2></div>
+          <div id="gameInfo" class="game-info"></div>
+        </div>
+        <div class="panel log-panel">
+          <div class="panel-head"><h2>実況ログ</h2><span id="logCount" class="muted"></span></div>
+          <ol id="log" class="log"></ol>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <section id="tab-stats" class="tab-panel" hidden aria-labelledby="tabBtnStats">
+    <div id="statsRoot" class="stats-root"></div>
+  </section>
+</main>
+
+<footer class="footnote">
+  公式サイトの受信生データは保持せず、匿名化した数値・カードID・固定 enum のみを表示しています。相手の名前・ID・部屋情報は一切含みません。
+</footer>
+
+<div id="tip" class="tip" hidden></div>
+<div id="toast" class="toast" hidden role="alert"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
