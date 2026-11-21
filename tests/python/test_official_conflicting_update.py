@@ -79,3 +79,31 @@ def test_conflict_survives_stop_journal_stderr_and_final_summary(tmp_path, capsy
     assert report['detail'] == row['detail'] == dict(error='ValueError', code='conflicting_update',
         update=1, differences=[dict(path='players[0].status.hp', kind='changed')])
     assert json.loads(capsys.readouterr().err)['detail'] == report['detail']
+
+
+def test_events_only_resend_on_same_update_is_ignored_when_state_matches(tmp_path):
+    first = deepcopy(GAMES[0])
+    resend = deepcopy(first)
+    resend['events'] = []
+    streams = OfficialStreams(OfficialSession(1))
+    initial = streams.poll([capture_file(tmp_path, [first])])
+    assert initial['status'] in ('decision', 'waiting')
+    repeated = streams.poll([capture_file(tmp_path, [resend], seq=2)])
+    assert not streams.failed
+    assert repeated == initial
+    # Next update still advances normally.
+    nxt = deepcopy(GAMES[1])
+    assert streams.poll([capture_file(tmp_path, [first, nxt], seq=3)])['status'] in ('decision', 'waiting', 'finished')
+
+
+def test_events_plus_state_change_beyond_32_diffs_still_conflicts(tmp_path):
+    first = deepcopy(GAMES[0])
+    first['events'] = [dict(action='danger')] * 40
+    changed = deepcopy(first)
+    changed['events'] = [dict(action='safe')] * 40
+    changed['players'][0]['hp'] -= 1
+    streams = OfficialStreams(OfficialSession(1))
+    streams.poll([capture_file(tmp_path, [first])])
+    result = streams.poll([capture_file(tmp_path, [changed], seq=2)])
+    assert result['status'] == 'unsupported' and streams.failed
+    assert result['detail']['code'] == 'conflicting_update'

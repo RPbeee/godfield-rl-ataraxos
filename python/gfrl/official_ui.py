@@ -494,8 +494,9 @@ def execute(probe, state, public, action, name, *, commands=None, settle_timeout
     commands = commands if commands is not None else []
     # Counters (e.g. ring counter-attacks) also arrive right after an animation.
     pending = public.get('pending') or {}
-    redirected = public['phase'] == 1 and (previous_reflect or bool(pending.get('counter')) or any(
-        pending.get(k, 0) > 0 for k in ('reflections', 'bounces')))
+    redirected = public['phase'] == 1 and (previous_reflect or bool(pending.get('counter'))
+        or 'redirect_requires_history' in public.get('_policy_only', ())
+        or any(pending.get(k, 0) > 0 for k in ('reflections', 'bounces')))
     if redirected or (public['phase'] == 1 and 'commandPanes' in state):
         state = wait_response_stable(probe, state, public, name, plan, {},
                                      timeout=settle_timeout, refresh=refresh)

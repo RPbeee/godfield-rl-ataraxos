@@ -379,3 +379,49 @@ def test_bot_waits_for_delayed_receive_without_rebuilding_submitted_command(tmp_
     assert rows[0]['acceptance_wait_extended'] and rows[0]['accepted']
     assert rows[0]['clicks'].count(point(230,533)) == 1
     assert rows[0]['clicks'].count(point(350,250)) == 1
+
+
+@pytest.mark.parametrize('multi', [False, True])
+def test_redirect_requires_history_policy_only_without_inventing_origin(multi):
+    attacks = [dict(playerId=2, targetPlayerId=1, itemModelIds=[184], atk=22, reversed=True)]
+    if multi:
+        attacks.append(dict(playerId=1, targetPlayerId=2, itemModelIds=[6], atk=3))
+    outcomes = []
+    for opp_model in (30, 296):
+        g = base_game()
+        g['attacks'] = deepcopy(attacks)
+        g['players'][1]['items'] = [dict(id=999, modelId=opp_model, used=False)]
+        r = OfficialSession(1).ingest(g)
+        assert r['status'] == 'decision'
+        p = r['public']
+        assert p['pending']['origin'] is None and p['pending']['forced_hit'] is None
+        assert p['pending']['reflections'] == 0 and p['pending']['bounces'] == 0
+        assert 'redirect_requires_history' in p['_policy_only']
+        assert '_search_launch' not in p
+        assert advise_supported(r, PolicyOnly(), search=True)['status'] == 'advice'
+        with pytest.raises(ValueError, match='search_requires_public_launch_journal'):
+            _core._official_search_root(p, [], 64, {})
+        obs = {k: getattr(r['env'], k).copy() for k in (*OBS_FIELDS, 'mask')}
+        outcomes.append((p, obs, advise(r, PreferFirst())['action']))
+    assert outcomes[0][0] == outcomes[1][0] and outcomes[0][2] == outcomes[1][2]
+    for k in outcomes[0][1]:
+        np.testing.assert_array_equal(outcomes[0][1][k], outcomes[1][1][k])
+
+
+@pytest.mark.parametrize('mode', ['foreign_actor', 'own_dying', 'own_hp0', 'other_unsupported'])
+def test_redirect_requires_history_keeps_fail_closed_boundaries(mode):
+    g = base_game()
+    if mode == 'foreign_actor':
+        g['attacks'] = [dict(playerId=1, targetPlayerId=2, itemModelIds=[184], atk=22, reversed=True)]
+        r = OfficialSession(1).ingest(g)
+        assert r['status'] == 'waiting' and 'redirect_requires_history' in r['unsupported']
+        return
+    g['attacks'] = [dict(playerId=2, targetPlayerId=1, itemModelIds=[184], atk=22, reversed=True)]
+    if mode == 'own_dying':
+        g['dyingPlayerIds'] = [1]
+    elif mode == 'own_hp0':
+        g['players'][0]['hp'] = 0
+    elif mode == 'other_unsupported':
+        g['attacks'] = [dict(playerId=2, targetPlayerId=1, itemModelIds=[58], reversed=True)]
+    r = OfficialSession(1).ingest(g)
+    assert r['status'] == 'unsupported' and 'redirect_requires_history' in r['unsupported']

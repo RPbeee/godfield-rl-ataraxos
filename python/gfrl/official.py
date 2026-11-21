@@ -891,8 +891,9 @@ class OfficialSession:
             own = next(x for x in p['players'] if x['id'] == self.viewer)
             response_only = {'dying_players_decision_unavailable',
                              'redirect_chance_activation_unavailable',
+                             'redirect_requires_history',
                              'dynamic_hit_rate_unavailable', 'death_attack_decision_unavailable'}
-            if (not own['dead'] and own['status'] and own['status']['hp'] > 0
+            if (p['actor'] == self.viewer and not own['dead'] and own['status'] and own['status']['hp'] > 0
                     and self.viewer not in p.get('dying_players', [])
                     and not (set(p['unsupported']) - response_only)):
                 # A death candidate needs authoritative power. Never answer a
@@ -904,6 +905,10 @@ class OfficialSession:
                         if code in response_only and code not in relaxable)
             for code in relaxable:
                 p['unsupported'].remove(code)
+            if 'redirect_requires_history' in relaxable:
+                # Never invent an origin or activation provenance from the current source alone.
+                p['pending']['origin'] = None
+                p['pending']['forced_hit'] = None
             if relaxable or any(d['code'] == 'multiple_pending_frames' for d in p['detail']):
                 p['_policy_only'] = relaxable + (['multiple_pending_frames'] if any(
                     d['code'] == 'multiple_pending_frames' for d in p['detail']) else [])
@@ -1090,8 +1095,16 @@ class OfficialStreams:
                 if u in self.seen:
                     projected = project_game(game, self.session.viewer, prior=self.context[u])
                     if projected != self.seen[u]:
-                        raise ValueError('conflicting_update', dict(update=u,
-                            differences=projection_differences(self.seen[u], projected)))
+                        # The pinned official client (fv.fq) ignores events on a repeated
+                        # updateCount; accept an events-only resend only when every
+                        # authoritative state key (players, hand, pending, purchase,
+                        # phase, actor, gf, owner, is_over, unsupported, detail, ...) is
+                        # strictly identical.
+                        same_state = ({k: v for k, v in projected.items() if k != 'events'}
+                                      == {k: v for k, v in self.seen[u].items() if k != 'events'})
+                        if not same_state:
+                            raise ValueError('conflicting_update', dict(update=u,
+                                differences=projection_differences(self.seen[u], projected)))
                     continue
                 prior = self.session.previous
                 projected = project_game(game, self.session.viewer, prior=prior)
