@@ -31,7 +31,7 @@ def ambiguous_disguised_ids(hand):
     return {h['id'] for h in hand if h['face'] in faces}
 
 
-def parser_module():
+def parser_module(duel_fields=False):
     spec = importlib.util.spec_from_file_location('_official_webchannel',
         ROOT / 'third_party/goodfield/scripts/parse_official_webchannel.py')
     module = importlib.util.module_from_spec(spec)
@@ -46,9 +46,45 @@ def parser_module():
                 raise module.ParseError('unsupported_game_schema',
                     module._detail(count, path + '.confusionCount'))
             value = {k: v for k, v in value.items() if k != 'confusionCount'}
+        if duel_fields and path == 'game.players[]' and isinstance(value, dict):
+            value = duel_player(module, value, path)
         return validate(value, path, key)
     module._validate_game_values = validate_public
     return module
+
+
+def duel_player(module, value, path):
+    """Drop the duel-only per-player fields after type checks (rated 1v1 games).
+
+    Per the pinned client (tL), duel players may carry rating/ratingGain (integers),
+    alias (string/null) and team. Their values never reach the projection: the
+    numeric ratings are read before sanitization by the ranked tap, and the alias
+    text is discarded here. A non-zero team is left in place so the strict
+    validator still rejects team games.
+    """
+    out = dict(value)
+    for key in ('rating', 'ratingGain'):
+        if key in out:
+            number = out.pop(key)
+            if number is not None and (type(number) is not int or not -10**9 <= number <= 10**9):
+                raise module.ParseError('unsupported_game_schema', module._detail(number, path + '.?'))
+    if 'alias' in out:
+        alias = out.pop('alias')
+        if alias is not None and type(alias) is not str:
+            raise module.ParseError('unsupported_game_schema', module._detail(alias, path + '.?'))
+    if out.get('team', 0) in (0, None) and 'team' in out:
+        out.pop('team')
+    return out
+
+
+def capture_bytes(c):
+    """Bytes of one probe capture: inline ``data`` (memory-only/ranked) or the file."""
+    data = c.get('data')
+    if data is None:
+        return Path(c['file']).read_bytes()
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError('capture_failed')
+    return bytes(data)
 
 
 # Messages are never serialized: only codes owned by this boundary are allowed.
@@ -1027,7 +1063,7 @@ class OfficialStreams:
                 key = self.stream_key(c['file'])
                 if self.hashes.get(key) == c.get('sha256') and c.get('sha256'):
                     continue
-                raw = Path(c['file']).read_bytes()
+                raw = capture_bytes(c)
                 import hashlib
                 digest = hashlib.sha256(raw).hexdigest()
                 if len(raw) != c['bytes'] or (c.get('sha256') and digest != c['sha256']):

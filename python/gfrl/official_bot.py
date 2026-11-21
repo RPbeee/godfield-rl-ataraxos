@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -16,7 +17,7 @@ import threading
 import tempfile
 import time
 
-from .official import ROOT, OfficialSession, OfficialStreams, conflict_detail, exception_detail, parser_module
+from .official import ROOT, OfficialSession, OfficialStreams, capture_bytes, conflict_detail, exception_detail, parser_module
 from .official_ui import UIUnsupported, require, prepare, execute, ready, wait_visible, PUBLIC_PATHS, REFLECT_MODELS
 
 
@@ -50,10 +51,19 @@ def probe_failure_detail(detail):
 
 
 class Probe:
-    def __init__(self, command, timeout=30):
+    """Drives the node probe over stdin/stdout JSON lines.
+
+    ``memory=True`` (ranked): the probe keeps raw receive bytes in memory and returns
+    them inline (base64) in capture replies, so no capture file, screenshot or output
+    directory exists. Captures without inline data and screenshot commands are refused.
+    """
+    memory = False
+
+    def __init__(self, command, timeout=30, env=None, memory=False):
         self.timeout = timeout
+        self.memory = memory
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                        stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
         self.lines = queue.Queue()
         self.broken = False
         self.command = None  # Startup has no in-flight bot command.
@@ -107,8 +117,27 @@ class Probe:
         detail['exit_code'] = self.process.poll()
         raise UIUnsupported('probe_failure', probe_failure_detail(detail)) from None
 
+    def inline_captures(self, reply):
+        """Decode inline stream bytes; the virtual file names are never opened."""
+        captured = reply.get('capture')
+        if not isinstance(captured, dict) or not isinstance(captured.get('captures'), list):
+            self.broken = True
+            raise UIUnsupported('capture_not_inline')
+        for c in captured['captures']:
+            try:
+                if not isinstance(c, dict) or not isinstance(c.get('data'), str):
+                    raise ValueError
+                c['data'] = base64.b64decode(c['data'], validate=True)
+            except ValueError:
+                self.broken = True
+                raise UIUnsupported('capture_not_inline') from None
+        captured.pop('metadata', None)
+        return reply
+
     def send(self, command):
         require(not self.broken, 'probe_stopped')
+        if self.memory:
+            require(command.get('kind') != 'screenshot', 'screenshot_disabled')
         self.command = command.get('kind')
         self.sent_at = time.monotonic()
         try:
@@ -118,6 +147,8 @@ class Probe:
             self.broken = True
             raise UIUnsupported('probe_input_failure') from None
         reply = self.receive()
+        if self.memory and command['kind'] == 'capture':
+            return self.inline_captures(reply)
         if command['kind'] == 'close' and 'capture' in reply:
             reply = self.receive()
         return reply
@@ -366,28 +397,47 @@ def enter_room(probe, name, mode='room', password=None, *, timeout=20, room_wait
     return prepare_room(probe, name, timeout, room_wait=room_wait, baseline=baseline, strict_events=strict_events)
 
 
-def named_room_parser(name, baseline, viewer=None):
+def named_room_parser(name, baseline, viewer=None, *, require_no_end=True, tap=None):
     # A private parser instance keeps transient raw-name checks out of the
     # shared parser and projections. Only numeric seat IDs escape this hook.
-    parser = parser_module()
+    # ``tap`` (rated duels only) receives integers/booleans per update and the
+    # duel-only text fields are removed before anything else can see them.
+    parser = parser_module(duel_fields=tap is not None)
     sanitize = parser.sanitize_game
     parse = parser.parse_prefix
     boundaries = {OfficialStreams.stream_key(c['file']): c['bytes'] for c in baseline}
     matches = []
     def inspect(game, viewer_id=None, **options):
-        seats = [p.get('id') for p in game.get('players', []) if p.get('name') == name]
-        matches.append((seats, len(game.get('players', [])), game.get('tiebreakGF')))
+        players = game.get('players', [])
+        seats = [p.get('id') for p in players if p.get('name') == name]
+        observed = None
+        if tap is not None:
+            observed = tap.extract(game)
+            for p in players:
+                if isinstance(p, dict):
+                    # Numbers were taken above; the alias text and a benign
+                    # team value never travel further (team games stay rejected).
+                    # Wrong-typed values stay so the strict validator rejects them.
+                    for key, kinds in (('alias', (str, type(None))), ('rating', (int, type(None))),
+                                       ('ratingGain', (int, type(None)))):
+                        if type(p.get(key)) in kinds:
+                            p.pop(key, None)
+                    if p.get('team') in (0, None):
+                        p.pop('team', None)
+        matches.append((seats, len(players), game.get('tiebreakGF'), observed))
         return sanitize(game, viewer_id, **options)
     parser.sanitize_game = inspect
     def checked(raw, viewer_id=None, *, boundary=0, **options):
         matches.clear()
         parsed = parse(raw, viewer_id, **options)
-        for record, (seats, count, end) in zip(parsed['games'], matches):
+        for record, (seats, count, end, observed) in zip(parsed['games'], matches):
             if record['frame_end_byte'] <= boundary:
                 continue
+            if tap is not None:
+                tap.add(observed)
             require(count == 2, 'room_game_not_two_players')
             require(len(seats) == 1 and (viewer is None or seats[0] == viewer), 'viewer_not_unique')
-            require(end is None, 'room_game_end_time')
+            require(end is None or not require_no_end, 'room_game_end_time')
             record['room_viewer'] = seats[0]
         matches.clear()
         return parsed
@@ -436,7 +486,7 @@ def wait_room_start(probe, name, baseline, *, room_start, room_wait, strict_even
 def checked_capture(c):
     import hashlib
     require(not c.get('capture_error'), 'capture_failed')
-    raw = Path(c['file']).read_bytes()
+    raw = capture_bytes(c)
     require(len(raw) == c['bytes'] and (not c.get('sha256') or hashlib.sha256(raw).hexdigest() == c['sha256']),
             'capture_integrity')
     return raw
@@ -492,20 +542,30 @@ def selection_check_detail(detail):
 
 def run(probe, advisor, journal, *, name, games=1, mode='training', password=None,
         dry_run=False, timeout=20, settle_timeout=30, on_stop='save',
-        room_start='human', room_wait=1800, turn_wait=900, strict_events=False, chance_delay=3):
+        room_start='human', room_wait=1800, turn_wait=900, strict_events=False, chance_delay=3,
+        ranked=None):
+    # mode 'ranked' (official 真剣タイマン) is driven by a RankedSession from
+    # official_ranked: it owns the ledger, entry, viewer detection and finish.
     counts = dict(games=0, wins=0, losses=0, draws=0)
     current_record = None
     successful_kinds = set()
     try:
         require(mode != 'room' or on_stop == 'save', 'room_abandon_unsupported')
-        room_baseline = capture(probe) if mode == 'room' else None
-        enter_room(probe, name, mode, password, timeout=settle_timeout, room_wait=room_wait,
-                   login_timeout=timeout, baseline=room_baseline, strict_events=strict_events)
+        require(mode != 'ranked' or (ranked is not None and games == 1 and not dry_run),
+                'ranked_session_required')
+        if mode == 'ranked':
+            room_baseline = ranked.enter(probe)
+        else:
+            room_baseline = capture(probe) if mode == 'room' else None
+            enter_room(probe, name, mode, password, timeout=settle_timeout, room_wait=room_wait,
+                       login_timeout=timeout, baseline=room_baseline, strict_events=strict_events)
         for game_index in range(games):
             previous_reflect = False
-            baseline = room_baseline if mode == 'room' else capture(probe)
+            baseline = room_baseline if mode in ('room', 'ranked') else capture(probe)
             if mode == 'room':
                 viewer = wait_room_start(probe, name, baseline, room_start=room_start, room_wait=room_wait, strict_events=strict_events)
+            elif mode == 'ranked':
+                viewer = ranked.wait_start(probe, baseline)
             else:
                 probe.send(dict(kind='clickText', text='戦いを始める'))
                 poll_state(probe, lambda s: 'G.F.' in s['body'])
@@ -518,7 +578,7 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 humans = set()
                 for c in records:
                     try:
-                        parsed = parser.parse_prefix(Path(c['file']).read_bytes(), lenient_events=not strict_events)
+                        parsed = parser.parse_prefix(capture_bytes(c), lenient_events=not strict_events)
                     except parser.ParseError as error:
                         raise UIUnsupported('unsupported_receive', exception_detail(error, parser.ParseError)) from None
                     for r in parsed['games']:
@@ -530,10 +590,14 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
             reported_events = 0
             if mode == 'room':
                 streams.parser, _ = named_room_parser(name, baseline, viewer)
+            elif mode == 'ranked':
+                streams.parser = ranked.stream_parser(baseline, viewer)
             result = accepted(probe, streams, -1, timeout)
             while True:
                 require(result['status'] != 'unsupported', 'unsupported_receive', result.get('detail', {}))
                 public = result['public']
+                if mode == 'ranked':
+                    ranked.observe(public)
                 replacements = result.get('replaced_events', [])
                 if len(replacements) > reported_events:
                     print('warning:replaced_events ' + json.dumps(replacements[reported_events:], sort_keys=True), file=sys.stderr)
@@ -543,6 +607,12 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                     other = next(p for p in public['players'] if p['id'] != viewer)
                     outcome = 'draws' if own['dead'] == other['dead'] else 'losses' if own['dead'] else 'wins'
                     counts['games'] += 1; counts[outcome] += 1
+                    if mode == 'ranked':
+                        # No journal row. The ledger gets the allowlisted result first (fsynced);
+                        # only then is the end screen's own button pressed once, best effort.
+                        ranked.finish(probe, streams, outcome)
+                        leave = ranked.leave_end_screen(probe)
+                        return dict(counts, status='complete', end_screen=leave)
                     journal.write(dict(status='finished', state=summary(public), outcome=outcome, replaced_events=replacements))
                     if mode == 'room' and counts['games'] >= games:
                         return dict(counts, status='complete')
@@ -560,7 +630,7 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                         poll_state(probe, settings)
                     break
                 if result['status'] != 'decision':
-                    result = accepted(probe, streams, public['update'], turn_wait if mode == 'room' else timeout)
+                    result = accepted(probe, streams, public['update'], turn_wait if mode in ('room', 'ranked') else timeout)
                     continue
                 advice = advisor(result)
                 current_record = dict(state=summary(public), advice=advice, clicks=[], accepted=False,
@@ -675,6 +745,8 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                 except ReceiveAdvanced as advanced:
                     result = advanced.result
                 current_record.update(status='accepted', accepted=True, received_update=result['public']['update'])
+                if mode == 'ranked':
+                    ranked.decisions += 1
                 # A disguised/ambiguous defense's actual ability is unknown.
                 # Conservatively use the existing visible stability check next
                 # time; never infer absence of reflection from its public face.
@@ -689,6 +761,15 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
         return dict(counts, status='complete')
     except Exception as error:
         code = str(error) if isinstance(error, UIUnsupported) else 'bot_input_or_model_failure'
+        if mode == 'ranked':
+            # Nothing but an allowlisted code leaves this boundary: no detail,
+            # no stopped-state file, no screenshot, no stderr text.
+            if ranked is not None and hasattr(ranked, 'stop_code'):
+                code = ranked.stop_code(error)
+            reason = (ranked.stopped(code) if ranked is not None else
+                      code if re.fullmatch(r'[a-z][a-z0-9_]{0,63}', code) else 'other')
+            return dict(counts, status='stopped', reason=reason,
+                        detail=ranked.stop_detail() if ranked is not None else {})
         detail = error.detail if isinstance(error, UIUnsupported) else exception_detail(error, fixed_codes=False, local_only=False)
         if isinstance(detail, dict) and detail.get('code') == 'conflicting_update':
             detail = dict(error='ValueError', code='conflicting_update', **conflict_detail(detail))

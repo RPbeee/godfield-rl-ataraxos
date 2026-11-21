@@ -16,6 +16,11 @@ God Field の 1 対 1 で人間に勝つ。Ataraxos 流の自己対戦 RL（`DES
 ## 2. 守る約束（ユーザーの指示）
 
 - 公式サイトでは **パスワード付きの非公開部屋か CPU 練習だけ**で打つ。公開対戦はしない。
+  - **唯一の例外（2026-11-20、ユーザーが明示承認）**: 運営のメール許可取得済みの公式「真剣タイマン」
+    （ランク戦）を、探索なしの m-xit1 段階別 greedy で、**1局ずつ・同時1・最初の10局を含め総計100局まで**。
+    親が `scripts/ranked_bot.py` で起動する（手順 `scripts/ranked_bot.md`、§5.22）。ランク戦では
+    名前・ユーザーID・部屋キー・URL・受信の生データ・画像・チャット・console を保存も出力もせず、
+    数値と固定 enum だけを台帳に残す。明示的な BOT 禁止表示など実際の支障が出たら報告し、回避しない。
 - bot は **相手の非公開の手札を絶対に使わない**。oracle（真の手札）はオフラインの診断だけに使い、
   `official_*`・bot・蒸留には決してつながない。
 - 受信した生データ・認証情報・名前や識別子・パスワード・スクリーンショットは **commit しない**。
@@ -439,6 +444,97 @@ ml-L の完成手を打つ m-xit1」を素の m-xit1 と比べた。47,429判断
 （`ml_l_gate.py`、`gate_train.json`、`gate_test.json`、`gate_control.json`）は保存。再現コマンドは同
 ディレクトリの README.md。
 
+### 5.22 公式ランク戦（真剣タイマン）100局の実行基盤と途中経過（11-20）
+
+実装は Claude Code が直接行った（この指示では Codex を使わない）。実戦（ランク戦そのもの）は親が起動する。
+手順と仕様は `scripts/ranked_bot.md`、運転は `scripts/ranked_drive.md`、集計は `scripts/ranked_campaign.md`。
+ここには確認できた事実と数値だけを残す（試行錯誤の途中の記述は整理した）。
+
+**仕組み（コードで強制）**
+- 追加: `python/gfrl/ranked_ledger.py`（追記専用の台帳）、`official_ranked.py`（RankedSession・CLI）、
+  `ranked_campaign.py`、`ranked_drive.py`、`scripts/ranked_bot.py`・`ranked_loop.sh`・`ranked_campaign.py`・
+  `ranked_drive.py`、テスト `tests/python/test_official_ranked.py`・`test_ranked_campaign.py`・`test_ranked_drive.py`。
+  `official_bot.run` に `mode='ranked'` を追加（room / training は不変）。
+- 保存・出力は数値と固定 enum だけ（名前・ユーザーID・部屋キー・URL・生データ・画像・チャット・console は出さない）。
+- **受信の生データはメモリだけで扱う**: probe が `GFRL_MEMORY_ONLY=1` でストリームをメモリに持ち、パイプで Python に渡す
+  （`scripts/official_probe_patch.mjs`。third_party は不変）。生の prefix・スクリーンショット・stopped-state はディスクに作らない。
+- 台帳は予約→応募の順で、同時 1（flock）。決着不明の枠は消費したまま戻さない。数える上限は 100（`HARD_LIMIT`）。
+  先行 2 件（game 1・2）は「戦う」を押していない未応募で実対局 0 のため、台帳の固定イベントと完全一致したときだけ数えない
+  （台帳番号の最大は 102、`--budget 102`）。台帳番号と実対局数は別。
+- 専用プロフィールは同じアカウントのまま使う。個人アカウントは使わない。
+
+**実機で確認できたこと（台帳 `runs/ranked100/ledger.jsonl`、game 3〜9）**
+- 標準の経路は、ロビーの「2人個人戦」→ 画面の自分のレート数字が読めてから「戦う」→ 対局 → 終局後に「戦いを終わる」。
+  `--step 戦う` を使う。押す前のレート数字は同じ値が連続 2 回読めるまで待つ（`rating_screen_not_loaded` で止まる）。
+- 同じ専用アカウントのままレートが継続している。各局の押す前の画面レートが、直前の局の終局後の値と毎回一致した
+  （game 3 終了 1516 → game 4 開始 raw 16 = 1516、以降 1501、1484、1500、1483、1501。局ごとにプロセスを起動し直している）。
+- 受信の `rating` / `ratingGain` は**内部値で、表示 = 1500 + 内部値**（公式公開 JS で確認）。自分の席は game 3 と game 7 で
+  生値が欠損し、欠損 = 0 とみなして開始 1500 になる。game 4〜6・8・9 は生値あり。表示値は台帳の `rating_*_display_*` と
+  由来 `…_src`（wire / wire_absent_zero / screen / unknown）に、生値は `rating_*_first/last/gain` に分けて残す。
+- 1 局ずつの再起動は、対戦終了直後に `visible_state_timeout` を出すことがあり、15〜30 秒待つと復旧する
+  （game 8・9 で 1 回ずつ。`ranked_drive.py` が 25 秒空けて再試行）。
+
+**戦績（数える 100 局完了、game 3〜102、2026-11-20〜21）**:
+- 完走 **91 / 100 局**（**57 勝 33 敗 1 分**）、決着不明 **9 局**。全 100 局の相手種別 enum は `human`、集計の不一致・警告は 0。
+- 勝率（95% Wilson 区間）: 完走 91 局（引分は勝ちに数えない）**62.6%** [52.4%, 71.9%]、決着のみ（57/90）**63.3%** [53.0%, 72.6%]。
+  決着不明 9 局を両端に振った 100 局基準: 全敗扱い **57.0%** [47.2%, 66.3%] 〜 全勝扱い **66.0%** [56.3%, 74.5%]。
+- 相手レート帯別（完走 91 局）: `<1500` 13勝6敗 (68.4%)、`1500–1599` 16勝12敗 (57.1%)、`1600–1699` 14勝8敗 (63.6%)、
+  `1700–1799` 9勝4敗 (69.2%)、`1800+` 5勝3敗1分 (55.6%)。先手 33勝18敗1分 (63.5%)、後手 24勝15敗 (61.5%)。
+- 自分レート表示: **1500 → 1771**（+271、最高 **1794**、最低 1483、既知増減合計 +271 と一致）。相手 99 名の開始レート平均 **1610.2**（1327〜1897）。
+- 完走 91 局の判断数: 計 2,642（平均 29.0、範囲 2〜133）、所要時間: 平均 195.8 秒（範囲 24〜1,087 秒）。
+- 条件は m-xit1（ckpt_sha8 f2bd3ea3）、段階別 greedy、探索なし、`--dream allow`、code_rev 39bfa212（実行時は未commitの変更あり）。
+- **決着不明 9 局の内訳（アダプタ不具合の記録）**:
+  - 途中から `official_ranked.py` に `unsupported_receive` の固定許可リスト内訳（`ur_*`、生データや未知キー名は一切出さない）と
+    `conflicting_update` の公開投影差分パス分類（`ur_cu_*`）を追加した（game 37 以降で `ur_*`、game 46 以降で `ur_cu_*`）。
+  - 内訳: `unsupported_receive`（導入前）3 件（game 13・21・36）、`ur_conflicting_update` 1 件（game 45）、
+    **`ur_cu_events` 2 件**（game 79・95）、**`ur_redirect_requires_history` 1 件**（game 96）、`visible_gf_changed` 1 件（game 15）、
+    `process_restart` 1 件（game 14、セッション引き継ぎ中断）。
+  - 実戦アダプタ起因の停止は 8/99 局（8.1%）。内訳導入後の未対応受信 4 件中 3 件が `conflicting_update`（うち細分化後 2/2 が
+    `events` 差分）、1 件が反射履歴欠落。また、ほぼ全局で 25 秒空けた初回入場が `visible_state_timeout` となり 30 秒後の再試行で成功した。
+- 最終集計 JSON は `measurements/ranked100_20261121/campaign.json`（匿名・数値と固定 enum のみ）。
+  game 1〜3 の補足は `measurements/ranked_game3_20261120/`（`game3_rating.json`、台帳の控え）。
+
+**運転と集計**
+- `ranked_drive.py`: 台帳 `runs/ranked100` に固定。数える局 10 で関門（完走・勝敗・レート 4 値・符号・集計の不一致なし・
+  条件 1 種類）を確認し、異常なら停止、確認後に `--gate-ack <gate_id>`（本 run では異常なしで通過）。1 局ごとに 25 秒空けて再入場（`--reenter`）。
+  予約前の一時的な失敗だけ 30・60・120 秒で最大 3 回再試行。予約後に結果がなければ停止し、再開には
+  `--accept-unresolved-through <局番号>`。
+- `ranked_campaign.py`: 台帳を読むだけ（ロックなし）で、勝敗・決着不明・Wilson 区間・レート履歴を JSON で出す。
+- 終局後の退出: 台帳の finish 行の fsync 後にだけ「戦いを終わる」を最大 1 回押す（`RankedSession.leave_end_screen`。
+  結果 JSON の `end_screen` enum のみ、台帳は不変）。
+
+**テスト**: `tests/python/test_official_ranked.py`・`test_ranked_campaign.py`・`test_ranked_drive.py`・
+`test_official_probe_memory.py`（139 passed）および `test_official_bot.py`（220 passed）の計 359 passed を確認済み。
+
+**未確認・残課題**: 結果画面の表示レート・増減の文言（`rating_screen_check` は全局 `unavailable`、`rating_gain_cross` は `unknown`）、
+`ur_cu_events`（同一 `updateCount` 再受信時の `events` 差分）および `ur_redirect_requires_history` の原因調査と修正、
+初回入場 `visible_state_timeout` の解消。
+
+### 5.23 順次フォローアップ（応答予測・公式との差・終盤の教師、11-20）
+
+詳細は `measurements/ordered_followup_20261120/`（README と各段階の README）。
+
+- **応答予測と攻撃選択（段階1）**: 通常局面で m-xit1 greedy が通常武器攻撃を選ぶ根から、公開合法木の
+  方策確率つき上位4候補を強制し、公開結果（与ダメージ・自分への反射・相手の応答使用枚数）を教師に、
+  公開特徴のリッジ回帰と、既存 belief（16世界）＋相手方策の予測を比べた（配牌シードで train/val/test を分離、
+  test 1,365 根・4,423 候補）。dmg の RMSE は 全体平均 4.55、名目威力 6.71、公開リッジ 3.82、belief 3.65
+  （belief−リッジの二乗誤差 −1.28 [−2.53, −0.11]）。応答使用枚数は予測できず。公開正味ダメージの順位は
+  リッジ 70.0%・belief 74.4%（対応差 +4.4 [+2.6, +6.2]）だが、終局ロールアウト 4 本（標準誤差 0.35）の
+  順位とはほぼ偶然水準（51〜53%）。既存探索の Q は 57%。効用を val で当てはめた候補選択を独立 500 配牌ペア
+  （1,000 局）で現行 greedy と比べ **49.4% [48.3, 50.5]**（乗り換え 198/2,046 根、対照は厳密 50.00%）。
+  改善は確認できない。
+- **公式との差（段階2）**: 過去の CPU 練習 288 局（決定行 6,885）を安全な集計器で数えた（件数のみ）。完走 239、
+  停止 49（`unsupported_receive` 20、`selected_cards_mismatch` 14、`acceptance_timeout` 8 ほか）。方策のみで
+  打った決定は探索対象 5,092 の約23%。記録に HP などの数値がなく、解決後の数値・状態遷移の一致率は**測定不能**
+  （真のルール相違は判定できない）。損失の順位は 停止（UI 側が大半）＞共有絵柄の夢札の残存＞探索欠落（1ポイント未満）
+  ＞非 Decision 履歴の欠落（0.1〜0.3）。
+- **終盤の教師 2SL（段階3）**: 自分の通常武器攻撃＋相手の全合法応答の強制勝ちを、空手札と全 236 種の1枚手札で
+  反証する公開証明器を作った。エンジンの許容手札規則にカードごとの枚数上限がなく、復活 1 枚で必ず反証されるため、
+  **全許容手札での強制勝ちを証明できる局面は構造的に 0**（60 ペア、攻撃根 1,680、名目致死の根 110、候補 184 全件が
+  反証）。名目致死を実際の相手に強制すると実現率は 5.4% [0.0, 22.2]。greedy の取りこぼしは調べた攻撃局面
+  1,000 あたり 4.8（8 根）で少数のため診断のみで打ち止め。
+- 以上で、予測の質、探索の質、終盤の局所問題のいずれからも、勝率の上積みにつながる根拠は得られなかった。
+
 ## 6. 結果の置き場所
 
 | 場所 | 内容 | git |
@@ -458,6 +554,10 @@ ml-L の完成手を打つ m-xit1」を素の m-xit1 と比べた。47,429判断
 | `measurements/marginal_attack_20261120/` | 通常攻撃の追加札1枚増減の手順、コード、相手別・層別の終局集計 | 管理外 |
 | `measurements/hand_order_20261120/` | 手札順の比較手順、スロット置換と公開合法木照合のスクリプト、完成手の集計 `result.json` | 管理外 |
 | `measurements/model_disagreement_20261120/` | 3モデルの完成手の不一致パネルと多数手採用の評価（`disagreement.py`・`adopt_eval.py`、`holdout.json`・`control.json`、大きい `panel.json`、ml-L 単独差の公開条件ゲート `ml_l_gate.py`・`gate_train.json`・`gate_test.json`・`gate_control.json`、日本語 `README.md` に再現コマンド） | 管理外 |
+| `runs/ranked100/` | ランク戦の台帳 `ledger.jsonl`・専用ブラウザプロフィール `profile/`・一時 `scratch/`（受信の生データは終了時に削除） | 管理外（`runs/`） |
+| `measurements/ranked100_20261121/` | 公式ランク戦 100 局完了の匿名集計 JSON `campaign.json`（数値と固定 enum のみ） | 管理外 |
+| `measurements/ranked_game3_20261120/` | ランク戦 game 3 のレート補足（`game3_rating.json`：両者の正しい値と根拠・限定）と元台帳の控え `ledger_snapshot.jsonl`（受信の生データは含まない） | 管理外 |
+| `measurements/ordered_followup_20261120/` | 順次フォローアップ（段階1 応答予測と攻撃選択 `stage1/`、段階2 公式との差の安全な集計 `stage2/`、段階3 終盤の教師 `stage3/`、`run_stage1.sh`・`run_all.sh`、各 README・結果 JSON。`stage1/data/*.pkl` は根ごとの生パネル） | 管理外 |
 | TSUBAME `~/godfield-rl-ataraxos/runs/` | チェックポイント（`hp-lr1e5/ckpt-4500.pt` など）と生データ | — |
 | 手元 `runs/play/` | bot 用モデル `m-xit1.pt`、`m-2166.pt`、`m-lr1e5-4500.pt`、belief | 管理外 |
 
