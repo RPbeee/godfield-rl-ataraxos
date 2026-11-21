@@ -33,7 +33,7 @@ import time
 
 from .ranked_campaign import (DEFAULT_SUPPLEMENT, DEFAULT_SUPPLEMENT_GAME, ROOT, build_report, read_events,
                               read_supplement)
-from .ranked_ledger import HARD_LIMIT, fold_games, unapplied_preliminary
+from .ranked_ledger import HARD_LIMIT, MAX_CAMPAIGN_LIMIT, fold_games, unapplied_preliminary
 
 STATE_DIR = ROOT / 'runs/ranked100'
 APPROVED = 10                                # games the user approved before the review gate
@@ -61,7 +61,7 @@ RATING_ITEMS = ('self_before', 'self_after', 'opp_before', 'opp_after')
 # dream, playwright, resume/unresolved/birth handling and always adds --reenter.
 FORWARD_VALUE = frozenset(('--name', '--device', '--threads', '--match-wait', '--turn-wait', '--rating-wait',
                            '--rating-screen-wait', '--timeout', '--settle-timeout', '--chance-delay', '--step'))
-FORWARD_FLAG = frozenset(('--strict-events', '--watch-screen'))
+FORWARD_FLAG = frozenset(('--strict-events', '--watch-screen', '--trace'))
 
 
 class Finish(Exception):
@@ -278,7 +278,7 @@ class Driver:
                  max_games=None, accept_unresolved_through=0, gate_ack=None, child_timeout=CHILD_TIMEOUT,
                  supplement=DEFAULT_SUPPLEMENT, supplement_game=DEFAULT_SUPPLEMENT_GAME, launcher=None,
                  process_lister=list_processes, clock=time.time, sleep=time.sleep, emit=print_line,
-                 backoff=BACKOFF):
+                 backoff=BACKOFF, target=HARD_LIMIT, fresh=False):
         self.playwright, self.checkpoint = playwright, checkpoint
         self.state_dir = Path(state_dir).absolute()
         self.ledger_path = self.state_dir / 'ledger.jsonl'
@@ -288,7 +288,13 @@ class Driver:
         self.gap, self.max_games = gap, max_games
         self.accept_through, self.gate_ack = accept_unresolved_through, gate_ack
         self.child_timeout = child_timeout
-        self.supplement_path, self.supplement_game = supplement, supplement_game
+        self.fresh = bool(fresh)
+        self.target = target
+        self.exempt_games = frozenset() if self.fresh else EXEMPT_GAMES
+        self.stage1_budget = min(APPROVED, target) + len(self.exempt_games)
+        self.full_budget = target + len(self.exempt_games)
+        self.supplement_path = None if self.fresh else supplement
+        self.supplement_game = supplement_game
         self.launcher = launcher or self.subprocess_launcher
         self.process_lister, self.clock, self.sleep, self.emit_line = process_lister, clock, sleep, emit
         self.backoff = tuple(backoff)
@@ -316,23 +322,29 @@ class Driver:
 
     # ---- reading ----
     def read(self):
-        try:
-            events, diagnostics = read_events(self.ledger_path)
-        except OSError:
-            raise refuse('ledger_missing') from None
+        if self.fresh and not self.ledger_path.exists():
+            events = []
+            diagnostics = dict(bytes_read=0, lines=0, sha256=hashlib.sha256(b'').hexdigest(),
+                               ignored_tail_bytes=0, invalid_lines=[])
+        else:
+            try:
+                events, diagnostics = read_events(self.ledger_path, max_game=self.full_budget)
+            except OSError:
+                raise refuse('ledger_missing') from None
         if diagnostics['invalid_lines']:
             raise stop('ledger_invalid_lines')
         if diagnostics['ignored_tail_bytes']:
             raise stop('ledger_unterminated_tail')
-        if unapplied_preliminary(events) != EXEMPT_GAMES:
+        if not self.fresh and unapplied_preliminary(events) != EXEMPT_GAMES:
             raise refuse('ledger_not_the_campaign_ledger')
         supplement = None
         if self.supplement_path and Path(self.supplement_path).is_file():
             supplement = read_supplement(self.supplement_path, self.supplement_game)
-        return events, build_report(events, diagnostics, supplement)
+        return events, build_report(events, diagnostics, supplement,
+                                    hard_limit=self.target, expect_preliminary=not self.fresh)
 
     def counted(self, events):
-        return len(fold_games(events)) - len(EXEMPT_GAMES)
+        return len(fold_games(events)) - len(self.exempt_games)
 
     def check_conditions(self, events):
         try:
@@ -368,6 +380,8 @@ class Driver:
         argv = [sys.executable, str(ROOT / 'scripts/ranked_bot.py'), '--budget', str(budget),
                 '--playwright', str(self.playwright), '--checkpoint', str(self.checkpoint),
                 '--state-dir', str(self.state_dir), '--reenter']
+        if self.target != HARD_LIMIT:
+            argv += ['--hard-limit', str(self.target)]
         if accept_unresolved:
             argv.append('--accept-unresolved')
         return argv + self.forwarded
@@ -435,13 +449,13 @@ class Driver:
             unresolved = unresolved_counted(events)
             if first:
                 first = False
-                self.emit(ev='start', counted=counted, remaining=max(0, HARD_LIMIT - counted),
+                self.emit(ev='start', counted=counted, remaining=max(0, self.target - counted),
                           unresolved=unresolved, accept_unresolved_through=self.accept_through,
                           code_revs=len({e.get('code_rev') for e in events if e['ev'] == 'reserve'}),
                           gap_s=self.gap, max_games=self.max_games)
             if any(game > self.accept_through for game in unresolved):
                 raise stop('unresolved_game', games=unresolved)
-            if counted >= HARD_LIMIT:
+            if counted >= self.target:
                 raise Finish('done', 'target_reached')
             if counted >= APPROVED:
                 self.open_gate(report)
@@ -465,10 +479,11 @@ class Driver:
             raise Finish('gate_hold', 'gate_anomalies', gate_id=identity, anomalies=anomalies)
 
     def play_one(self, events, counted):
-        budget = STAGE1_BUDGET if counted < APPROVED else FULL_BUDGET
+        budget = self.stage1_budget if counted < APPROVED else self.full_budget
         # ranked_bot refuses to reserve after a game without a recorded result unless told to; the
         # unresolved counted games were acknowledged by the checks in ``loop`` (never silently).
-        accept = fold_games(events)[-1].get('terminal') != 'completed'
+        prior_rows = fold_games(events)
+        accept = bool(prior_rows) and prior_rows[-1].get('terminal') != 'completed'
         retries = 0
         while True:
             self.emit(ev='launch', game=len(fold_games(events)) + 1, budget=budget, attempt=retries)
@@ -532,6 +547,12 @@ def build_parser():
                     'Other ranked_bot.py flags (--name --device --threads --step ...) are forwarded.')
     parser.add_argument('--playwright', type=Path, required=True)
     parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/play/m-xit1.pt')
+    parser.add_argument('--state-dir', type=Path, default=None,
+                        help='Campaign directory (default runs/ranked100; non-default starts/continues a fresh campaign)')
+    parser.add_argument('--target', type=int, default=HARD_LIMIT,
+                        help=f'Counted-game target for this campaign (1..{MAX_CAMPAIGN_LIMIT}, default {HARD_LIMIT})')
+    parser.add_argument('--fresh', action='store_true',
+                        help='Treat ledger as a fresh campaign without preliminary-game exemptions')
     parser.add_argument('--gap', type=int, default=DEFAULT_GAP,
                         help=f'Seconds between the end of a game and the next entry (>= {MIN_GAP})')
     parser.add_argument('--max-games', type=int, default=None, help='Play at most this many games in this run')
@@ -547,16 +568,19 @@ def main(argv=None, *, state_dir=STATE_DIR, **injected):
     args, rest = build_parser().parse_known_args(argv)
     try:
         if args.gap < MIN_GAP or (args.max_games is not None and args.max_games < 1) \
-                or args.accept_unresolved_through < 0 or args.child_timeout < 1:
+                or args.accept_unresolved_through < 0 or args.child_timeout < 1 \
+                or not 1 <= args.target <= MAX_CAMPAIGN_LIMIT:
             raise refuse('invalid_arguments')
         forwarded = validate_forwarded(rest)
     except Finish as end:
         print_line(json.dumps(dict(ev='end', status=end.status, code=end.code), sort_keys=True))
         return Finish.RC[end.status]
-    driver = Driver(playwright=args.playwright, checkpoint=args.checkpoint, state_dir=state_dir,
+    chosen_dir = args.state_dir if args.state_dir is not None else state_dir
+    fresh = args.fresh or (args.state_dir is not None and args.state_dir.absolute() != STATE_DIR.absolute())
+    driver = Driver(playwright=args.playwright, checkpoint=args.checkpoint, state_dir=chosen_dir,
                     forwarded=forwarded, gap=args.gap, max_games=args.max_games,
                     accept_unresolved_through=args.accept_unresolved_through, gate_ack=args.gate_ack,
-                    child_timeout=args.child_timeout, **injected)
+                    child_timeout=args.child_timeout, target=args.target, fresh=fresh, **injected)
     if not injected:
         driver.install_signals()
     return driver.run()

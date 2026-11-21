@@ -24,8 +24,9 @@ import time
 
 from .official import ROOT, OfficialSession, OfficialStreams, exception_detail
 from .official_ui import UIUnsupported, require
-from .ranked_ledger import (GAME_NUMBER_MAX, HARD_LIMIT, Ledger, LedgerRefused, OPEN_PHASES, SNAKE,
-                            WIRE_DISPLAY_OFFSET, derive_ratings, gain_cross, screen_check)
+from .ranked_ledger import (GAME_NUMBER_MAX, HARD_LIMIT, MAX_CAMPAIGN_LIMIT, MAX_GAME_NUMBER_CAP,
+                            Ledger, LedgerRefused, OPEN_PHASES, SNAKE, WIRE_DISPLAY_OFFSET,
+                            derive_ratings, gain_cross, screen_check)
 
 RANKED_BUTTON = '2人個人戦'
 # Buttons that may appear on a screen between the single RANKED_BUTTON click and the game
@@ -429,7 +430,8 @@ class RankedSession:
     def __init__(self, ledger, conditions, *, name, match_wait=900, rating_wait=10, timeout=20,
                  settle_timeout=30, resume=False, allow_birth=False, accept_unresolved=False,
                  strict_events=False, marker=None, reenter=False, profile=None, steps=(),
-                 screen_file=None, clock=time.time, rating_screen_wait=30, wire_offset=WIRE_DISPLAY_OFFSET, leave_wait=5):
+                 screen_file=None, clock=time.time, rating_screen_wait=30, wire_offset=WIRE_DISPLAY_OFFSET,
+                 leave_wait=5, trace=None):
         steps = tuple(steps)
         self.leave_wait = leave_wait
         self.rating_screen_wait = rating_screen_wait
@@ -473,6 +475,8 @@ class RankedSession:
         self.first_mover = None
         self.started_wall = None
         self.tap = RatingTap()
+        self.trace = trace
+        self._pending_policy_stats = None
         self.finished = False
         self.resumed = False
 
@@ -670,6 +674,19 @@ class RankedSession:
         self.gf = public['gf']
         if self.first_mover is None and not self.resumed and public.get('owner') is not None:
             self.first_mover = 'self' if public['owner'] == self.viewer else 'opponent'
+        if self.trace is not None:
+            self.trace.record_update(self.game, public)
+
+    def set_policy_stats(self, stats):
+        self._pending_policy_stats = stats
+
+    def record_decision(self, public, advice):
+        self.decisions += 1
+        stats = self._pending_policy_stats
+        self._pending_policy_stats = None
+        if self.trace is not None:
+            self.trace.record_decision(self.game, public, advice,
+                                       decision_idx=self.decisions, policy_stats=stats)
 
     def rating_fields(self):
         mine = self.tap.seat_ratings(self.viewer)
@@ -846,8 +863,12 @@ def build_parser():
     parser.add_argument('--budget', type=int, default=1,
                         help='Total game numbers (slots) this ledger may ever hold, preliminary ones included '
                              f'(1, then 10, then up to {HARD_LIMIT}; up to {GAME_NUMBER_MAX} only while the two '
-                             f'never-applied preliminary games stay verified in the ledger). At most {HARD_LIMIT} '
+                             f'never-applied preliminary games stay verified in the ledger). At most --hard-limit '
                              'games ever count, whatever the budget')
+    parser.add_argument('--hard-limit', type=int, default=HARD_LIMIT,
+                        help=f'Counted-game cap for this ledger (1..{MAX_CAMPAIGN_LIMIT}, default {HARD_LIMIT})')
+    parser.add_argument('--trace', action='store_true',
+                        help='Record anonymous numeric-only turn/decision traces to <state-dir>/anon_turns.jsonl')
     parser.add_argument('--name', default=MODEL_NAME, help='Dedicated account name (never logged)')
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--threads', type=int, default=4)
@@ -894,17 +915,19 @@ def emit(line):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if not 1 <= args.budget <= GAME_NUMBER_MAX or not 0 < args.timeout < float('inf') \
+    if not 1 <= args.hard_limit <= MAX_CAMPAIGN_LIMIT \
+            or not 1 <= args.budget <= min(MAX_GAME_NUMBER_CAP, args.hard_limit + 2) \
+            or not 0 < args.timeout < float('inf') \
             or not 0 < args.match_wait < float('inf') or not 0 < args.turn_wait < float('inf') \
             or not 0 < args.rating_screen_wait < float('inf') or len(set(args.step)) != len(args.step):
         emit('error:invalid_arguments'); return 2
     state_dir = args.state_dir.absolute()
     try:
         ensure_ignored(state_dir)
-        ledger = Ledger(state_dir, args.budget)
+        ledger = Ledger(state_dir, args.budget, hard_limit=args.hard_limit)
     except (LedgerRefused, UIUnsupported) as error:
         emit('error:' + safe_reason(getattr(error, 'code', None) or str(error))); return 2
-    session = probe = None
+    session = probe = trace = None
     try:
         if args.status:
             emit(json.dumps(dict(status='ledger', **ledger.summary()), sort_keys=True)); return 0
@@ -918,6 +941,9 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, terminate)
         conditions = None if args.discover else checkpoint_conditions(args.checkpoint, args.dream)
         profile = state_dir / 'profile'
+        if args.trace and not args.discover:
+            from .ranked_trace import RankedTrace
+            trace = RankedTrace(state_dir)
         session = RankedSession(ledger, conditions, name=args.name, match_wait=args.match_wait,
                                 rating_wait=args.rating_wait, timeout=args.timeout,
                                 settle_timeout=args.settle_timeout, resume=args.resume,
@@ -926,7 +952,8 @@ def main(argv=None):
                                 reenter=args.reenter, profile=profile,
                                 rating_screen_wait=args.rating_screen_wait, leave_wait=args.leave_wait,
                                 steps=[FIGHT_BUTTON] + [x for x in args.step if x != FIGHT_BUTTON],
-                                screen_file=state_dir / 'screen-state.json' if args.watch_screen else None)
+                                screen_file=state_dir / 'screen-state.json' if args.watch_screen else None,
+                                trace=trace)
         # Raw receive bytes never touch the disk in a ranked run: the probe keeps them in
         # memory and hands them over the stdout pipe (GFRL_MEMORY_ONLY, Probe(memory=True)).
         # A `scratch/` left by an older version of this runner is deleted unread.
@@ -949,13 +976,22 @@ def main(argv=None):
                 from .actor import Actor
                 from .evaluation import load_policy_model, _policy_rng
                 from .official_advisor import advise_supported
+                from .ranked_trace import TracingActor
                 torch.set_num_threads(args.threads)
                 model = load_policy_model(args.checkpoint, args.device)
                 agent = None
+                tracer = None
                 def advisor(result):
-                    nonlocal agent
+                    nonlocal agent, tracer
                     if agent is None:
                         agent = Actor(model, result['env'], args.device, sample=False)
+                        if trace is not None:
+                            tracer = TracingActor(agent)
+                    if tracer is not None:
+                        tracer.reset_stats()
+                        out = advise_supported(result, tracer, search=False, dream=args.dream)
+                        session.set_policy_stats(tracer.pop_stats())
+                        return out
                     return advise_supported(result, agent, search=False, dream=args.dream)
                 with _policy_rng(0, ()):
                     outcome = run(probe, advisor, NullJournal(), name=args.name, games=1, mode='ranked',
@@ -979,6 +1015,8 @@ def main(argv=None):
                     probe.close()
             except BaseException:
                 pass
+        if trace is not None:
+            trace.close()
         ledger.close()
 
 

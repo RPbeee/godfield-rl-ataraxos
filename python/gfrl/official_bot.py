@@ -746,7 +746,10 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                     result = advanced.result
                 current_record.update(status='accepted', accepted=True, received_update=result['public']['update'])
                 if mode == 'ranked':
-                    ranked.decisions += 1
+                    if hasattr(ranked, 'record_decision'):
+                        ranked.record_decision(public, advice)
+                    else:
+                        ranked.decisions += 1
                 # A disguised/ambiguous defense's actual ability is unknown.
                 # Conservatively use the existing visible stability check next
                 # time; never infer absence of reflection from its public face.

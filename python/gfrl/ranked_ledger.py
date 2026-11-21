@@ -19,7 +19,8 @@ import time
 
 from .official_ui import UIUnsupported
 
-HARD_LIMIT = 100  # Games that count against the user's cap (applied or undecided); never exceeded.
+HARD_LIMIT = 100  # Default per-campaign cap (initial 100-game run); kept for backwards compatibility.
+MAX_CAMPAIGN_LIMIT = 1000  # Upper bound for explicitly approved extended campaigns (AGENTS.md §2).
 SCHEMA = 1  # Unchanged: the exemption below writes nothing new, old ledgers stay valid as they are.
 
 # Raw wire rating -> official display rating (official client: display = 1500 + raw; an absent
@@ -51,6 +52,7 @@ PRELIMINARY_UNAPPLIED = {
 }
 # Largest game number / budget a ledger can ever reach (only with both exemptions verified).
 GAME_NUMBER_MAX = HARD_LIMIT + len(PRELIMINARY_UNAPPLIED)
+MAX_GAME_NUMBER_CAP = MAX_CAMPAIGN_LIMIT + len(PRELIMINARY_UNAPPLIED)
 
 OUTCOMES = ('win', 'loss', 'draw', 'unknown')
 TERMINALS = ('completed', 'stopped', 'unresolved')
@@ -108,7 +110,7 @@ FIELDS = {
     'policy': _enum(('greedy',)),
     'search': lambda v: type(v) is bool,
     'dream': _enum(DREAM_MODES),
-    'budget': _int(1, GAME_NUMBER_MAX),
+    'budget': _int(1, MAX_GAME_NUMBER_CAP),
     # Game facts.
     'seat_id': _int(0, 8),
     'first_mover': _opt(_enum(FIRST_MOVERS)),
@@ -148,14 +150,16 @@ FIELDS = {
 EVENT_KEYS = frozenset(('v', 'ev', 'game')) | frozenset(FIELDS)
 
 
-def validate_event(event):
+def validate_event(event, *, max_game=GAME_NUMBER_MAX):
     """Return a copy containing only allowlisted keys with valid values."""
     if not isinstance(event, dict) or set(event) - EVENT_KEYS:
         raise ValueError('ledger_unknown_key')
     if event.get('v') != SCHEMA or event.get('ev') not in EVENTS:
         raise ValueError('ledger_bad_event')
-    if not _int(1, GAME_NUMBER_MAX)(event.get('game')):
+    if not _int(1, max_game)(event.get('game')):
         raise ValueError('ledger_bad_game')
+    if 'budget' in event and not _int(1, max_game)(event['budget']):
+        raise ValueError('ledger_bad_value')
     for key, value in event.items():
         if key in FIELDS and not FIELDS[key](value):
             raise ValueError('ledger_bad_value')  # key name intentionally omitted from messages
@@ -223,11 +227,15 @@ def fold_games(events):
 
 
 class Ledger:
-    def __init__(self, directory, budget=1, *, clock=time.time):
+    def __init__(self, directory, budget=1, *, hard_limit=HARD_LIMIT, clock=time.time):
         # ``budget`` = total game NUMBERS (slots) this ledger may ever hold, as before. Above
-        # HARD_LIMIT it is accepted only up to the verified preliminary exemptions (checked after
-        # loading); the cap on counted games is enforced separately in ``reserve``.
-        if type(budget) is not int or not 1 <= budget <= GAME_NUMBER_MAX:
+        # ``hard_limit`` it is accepted only up to the verified preliminary exemptions (checked
+        # after loading); the cap on counted games is enforced separately in ``reserve``.
+        if type(hard_limit) is not int or not 1 <= hard_limit <= MAX_CAMPAIGN_LIMIT:
+            raise LedgerRefused('invalid_budget')
+        self.hard_limit = hard_limit
+        self.max_game = hard_limit + len(PRELIMINARY_UNAPPLIED)
+        if type(budget) is not int or not 1 <= budget <= self.max_game:
             raise LedgerRefused('invalid_budget')
         self.budget = budget
         self.clock = clock
@@ -247,7 +255,7 @@ class Ledger:
         self.fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             self.events = self._load()
-            if self.budget > HARD_LIMIT + len(self.exempt_games()):
+            if self.budget > self.hard_limit + len(self.exempt_games()):
                 raise LedgerRefused('invalid_budget')
         except BaseException:
             self.close()
@@ -259,7 +267,7 @@ class Ledger:
             source.seek(0)
             for line in source:
                 if line.strip():
-                    events.append(validate_event(json.loads(line)))
+                    events.append(validate_event(json.loads(line), max_game=self.max_game))
         return events
 
     def close(self):
@@ -290,10 +298,10 @@ class Ledger:
         finished = [g for g in games if g['phase'] == 'finished']
         count = lambda outcome: sum(g.get('outcome') == outcome for g in finished)
         undecided = lambda g: g['phase'] in ('unresolved', 'stopped') and g.get('outcome') in (None, 'unknown')
-        # consumed = every game number (slot) in the ledger; counted = those against HARD_LIMIT.
-        return dict(budget=self.budget, hard_limit=HARD_LIMIT, consumed=len(games),
+        # consumed = every game number (slot) in the ledger; counted = those against hard_limit.
+        return dict(budget=self.budget, hard_limit=self.hard_limit, consumed=len(games),
                     counted=counted, exempt_unapplied=sorted(exempt),
-                    remaining=max(0, min(self.budget - len(games), HARD_LIMIT - counted)),
+                    remaining=max(0, min(self.budget - len(games), self.hard_limit - counted)),
                     finished=len(finished), wins=count('win'), losses=count('loss'),
                     draws=count('draw'),
                     unresolved=sum(undecided(g) for g in games),
@@ -302,7 +310,7 @@ class Ledger:
 
     # ---- writing -------------------------------------------------------
     def _append(self, event):
-        event = validate_event(dict(event, v=SCHEMA, t=int(self.clock())))
+        event = validate_event(dict(event, v=SCHEMA, t=int(self.clock())), max_game=self.max_game)
         data = (json.dumps(event, sort_keys=True, allow_nan=False) + '\n').encode()
         os.write(self.fd, data)
         os.fsync(self.fd)
@@ -333,9 +341,9 @@ class Ledger:
         games = self.games()
         if self.open_game() is not None:
             raise LedgerRefused('another_game_open')
-        # Two independent caps: game numbers (budget) and games that count (HARD_LIMIT; every
+        # Two independent caps: game numbers (budget) and games that count (hard_limit; every
         # reserved game except the verified preliminary never-applied ones, undecided included).
-        if len(games) >= self.budget or len(games) - len(self.exempt_games()) >= HARD_LIMIT:
+        if len(games) >= self.budget or len(games) - len(self.exempt_games()) >= self.hard_limit:
             raise LedgerRefused('budget_exhausted')
         if games and games[-1].get('terminal') != 'completed' and not accept_unresolved:
             raise LedgerRefused('previous_game_unresolved')

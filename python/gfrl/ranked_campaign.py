@@ -16,8 +16,9 @@ from pathlib import Path
 import sys
 import time
 
-from .ranked_ledger import (GAME_NUMBER_MAX, HARD_LIMIT, OPEN_PHASES, WIRE_DISPLAY_OFFSET, fold_games,
-                            unapplied_preliminary, validate_event)
+from .ranked_ledger import (GAME_NUMBER_MAX, HARD_LIMIT, MAX_CAMPAIGN_LIMIT, MAX_GAME_NUMBER_CAP,
+                            OPEN_PHASES, WIRE_DISPLAY_OFFSET, fold_games, unapplied_preliminary,
+                            validate_event)
 
 REPORT_SCHEMA = 1
 Z95 = 1.959963984540054
@@ -52,7 +53,7 @@ def wilson(k, n, z=Z95):
 
 # ---- reading ---------------------------------------------------------------------------------
 
-def read_events(path):
+def read_events(path, *, max_game=GAME_NUMBER_MAX):
     """Complete, valid ledger events plus read diagnostics. Never writes, never locks.
 
     Only bytes up to the last newline are used (the loop may be mid-append); an unterminated tail
@@ -67,7 +68,7 @@ def read_events(path):
         if not line.strip():
             continue
         try:
-            events.append(validate_event(json.loads(line)))
+            events.append(validate_event(json.loads(line), max_game=max_game))
         except (ValueError, RecursionError):
             issues.append(number)
     return events, dict(bytes_read=len(consumed), lines=consumed.count(b'\n'),
@@ -182,9 +183,11 @@ def classify(row, exempt):
     return 'undecided_after_start' if started else 'undecided_unmatched'
 
 
-def build_report(events, diagnostics=None, supplement=None):
+def build_report(events, diagnostics=None, supplement=None, *, hard_limit=HARD_LIMIT, expect_preliminary=None):
     rows = fold_games(events)
     exempt = unapplied_preliminary(events)
+    if expect_preliminary is None:
+        expect_preliminary = hard_limit == HARD_LIMIT
     by_game = {row['game']: row for row in rows}
     games, mismatches, previous_after = [], [], {}
     for row in rows:
@@ -244,9 +247,9 @@ def build_report(events, diagnostics=None, supplement=None):
         warnings.append('mixed_conditions')
     if [g['game'] for g in games] != list(range(1, len(games) + 1)):
         warnings.append('game_numbers_not_contiguous')
-    if len(counted) > HARD_LIMIT:
+    if len(counted) > hard_limit:
         warnings.append('over_hard_limit')
-    if any(g['game'] in (1, 2) and g['game'] not in exempt for g in games):
+    if expect_preliminary and any(g['game'] in (1, 2) and g['game'] not in exempt for g in games):
         warnings.append('preliminary_games_not_verified')
     if any(g['klass'] in ('in_progress', 'open_unmatched') for g in games):
         warnings.append('game_in_progress')
@@ -268,11 +271,12 @@ def build_report(events, diagnostics=None, supplement=None):
         warnings.append('rating_mismatch')
     opp_before = [s['opp_before'] for s in series if s['opp_before'] is not None]
     exempt_rows = [g for g in games if not g['counted']]
+    game_max = hard_limit + len(exempt) if not expect_preliminary else hard_limit + 2
     return dict(
         report_schema=REPORT_SCHEMA,
         source=dict(diagnostics or {}, events=len(events)),
-        cap=dict(hard_limit=HARD_LIMIT, game_number_max=GAME_NUMBER_MAX, counted=len(counted),
-                 remaining=max(0, HARD_LIMIT - len(counted)), game_numbers=len(games),
+        cap=dict(hard_limit=hard_limit, game_number_max=game_max, counted=len(counted),
+                 remaining=max(0, hard_limit - len(counted)), game_numbers=len(games),
                  highest_game_number=max((g['game'] for g in games), default=0),
                  budgets_recorded=sorted({e['budget'] for e in events if e['ev'] == 'reserve'})),
         preliminary_unapplied=dict(
@@ -308,10 +312,12 @@ def build_report(events, diagnostics=None, supplement=None):
         warnings=warnings)
 
 
-def report_from_path(path, supplement_path=None, supplement_game=DEFAULT_SUPPLEMENT_GAME):
-    events, diagnostics = read_events(path)
+def report_from_path(path, supplement_path=None, supplement_game=DEFAULT_SUPPLEMENT_GAME, *,
+                     hard_limit=HARD_LIMIT, expect_preliminary=None):
+    events, diagnostics = read_events(path, max_game=min(MAX_GAME_NUMBER_CAP, hard_limit + 2))
     supplement = read_supplement(supplement_path, supplement_game) if supplement_path else None
-    report = build_report(events, diagnostics, supplement)
+    report = build_report(events, diagnostics, supplement, hard_limit=hard_limit,
+                          expect_preliminary=expect_preliminary)
     if supplement_path:
         report['source']['supplement'] = dict(game=supplement_game, usable=supplement is not None)
     return report
@@ -332,7 +338,9 @@ def write_report(path, text, ledger_path):
 def build_parser():
     parser = argparse.ArgumentParser(description='Read-only anonymous campaign report of the ranked ledger')
     parser.add_argument('--ledger', type=Path, default=DEFAULT_LEDGER, help='ledger.jsonl (read only, no lock)')
-    parser.add_argument('--supplement', type=Path, default=DEFAULT_SUPPLEMENT,
+    parser.add_argument('--hard-limit', type=int, default=HARD_LIMIT,
+                        help=f'Counted-game cap for this campaign (1..{MAX_CAMPAIGN_LIMIT}, default {HARD_LIMIT})')
+    parser.add_argument('--supplement', type=Path, default=None,
                         help='hand-written display-rating supplement for one game (numbers only)')
     parser.add_argument('--supplement-game', type=int, default=DEFAULT_SUPPLEMENT_GAME)
     parser.add_argument('--no-supplement', action='store_true')
@@ -343,10 +351,15 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if not 1 <= args.hard_limit <= MAX_CAMPAIGN_LIMIT:
+        print('error:invalid_arguments'); return 2
     if not args.ledger.is_file():
         print('error:ledger_missing'); return 2
-    supplement = None if args.no_supplement or not args.supplement.is_file() else args.supplement
-    report = report_from_path(args.ledger, supplement, args.supplement_game)
+    is_default = args.ledger.absolute() == DEFAULT_LEDGER.absolute()
+    sup_path = args.supplement if args.supplement is not None else (DEFAULT_SUPPLEMENT if is_default else None)
+    supplement = None if args.no_supplement or sup_path is None or not sup_path.is_file() else sup_path
+    report = report_from_path(args.ledger, supplement, args.supplement_game,
+                              hard_limit=args.hard_limit, expect_preliminary=is_default)
     report['generated_at'] = int(time.time())
     text = json.dumps(report, sort_keys=True, allow_nan=False, indent=args.indent) + '\n'
     if args.out is not None:
