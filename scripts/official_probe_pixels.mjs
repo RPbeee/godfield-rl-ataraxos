@@ -75,7 +75,7 @@ export async function visibleOverlays(page, body, texts) {
     }
   }
   let arrow = null;
-  if (texts.filter(r => r.y >= 55 && r.y <= 95 && r.x >= 195 && r.x < 840).length === 2) {
+  if (texts.filter(r => r.y >= 48 && r.y <= 95 && r.x >= 195 && r.x < 840).length === 2) {
     const png = await page.screenshot({clip:{x:500,y:48,width:40,height:40}, scale:'css'});
     arrow = targetArrow(png);
   }

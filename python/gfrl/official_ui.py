@@ -41,7 +41,7 @@ REFLECT_MODELS = frozenset(c['id'] for c in json.loads(
 def band_texts(state):
     # Top name/target bands are semantic, including for the pixel arrow probe.
     # Include the central pane's text below them when checking animation settling.
-    return [r for r in state.get('texts', []) if 55 <= r['y'] < 480
+    return [r for r in state.get('texts', []) if 48 <= r['y'] < 480
             and 195 <= r['x'] < 840]
 
 
@@ -122,10 +122,10 @@ def hand_images(state):
 
 
 def pane_x(state, name):
-    # Top names, below the header and above the first selected card. The body
-    # also contains header/status names; those must never identify the pane.
+    # Top names, below the header (y+h <= 40) and above the first selected card.
+    # Noto CJK on Linux renders at y=53; Hiragino on macOS at y>=55.
     bands = [r for r in state.get('texts', []) if r['text'] == name
-             and 55 <= r['y'] <= 95 and 195 <= r['x'] < 840]
+             and 48 <= r['y'] <= 95 and 195 <= r['x'] < 840]
     sides = {350 if r['x'] + r['w']/2 < 520 else 690 for r in bands}
     require(len(bands) == len(sides) == 1, 'own_name_band_not_unique', band_detail(bands))
     return sides.pop()
@@ -147,7 +147,7 @@ def verify_target(state, public, action, name, x):
     if own_fog(public) and public['phase'] == 0 and action['target'] not in (None, public['viewer']):
         return  # Fog chooses a uniform enemy at launch; no visible arrow is required.
     target = action['target']
-    bands = [r for r in state.get('texts', []) if 55 <= r['y'] <= 95
+    bands = [r for r in state.get('texts', []) if 48 <= r['y'] <= 95
              and 195 <= r['x'] < 840
              and min(abs(r['x'] + r['w']/2 - c) for c in (350, 690)) <= 140]
     expected = 'self' if target == public['viewer'] else 'none' if target is None else 'opponent'
@@ -180,7 +180,7 @@ def target_point(state, public, action, name):
 
 def verify_switched_target(state, public, action, name, x):
     verify_target(state, public, action, name, x)
-    bands = [r for r in state.get('texts', []) if 55 <= r['y'] <= 95 and 195 <= r['x'] < 840]
+    bands = [r for r in state.get('texts', []) if 48 <= r['y'] <= 95 and 195 <= r['x'] < 840]
     require(len(bands) == 2 and state.get('targetArrow') == ('right' if x == 350 else 'left'),
             'target_switch_failed', dict(stage='arrow_and_bands', **band_detail(bands)))
 
@@ -473,7 +473,7 @@ def verify(state, public, name, plan, expected):
         verify_attack(state, public, plan['pane'])
     if plan.get('target_switched'):
         bands = [r for r in state.get('texts', []) if r['text'] == name
-                 and 55 <= r['y'] <= 95 and 195 <= r['x'] < 840
+                 and 48 <= r['y'] <= 95 and 195 <= r['x'] < 840
                  and (350 if r['x']+r['w']/2 < 520 else 690) == plan['pane']]
         require(len(bands) == 1, 'own_pane_changed')
     else:
