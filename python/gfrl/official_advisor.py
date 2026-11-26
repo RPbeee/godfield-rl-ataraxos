@@ -182,7 +182,8 @@ def advise_supported(result, agent, *, search=False, max_samples=16, dream='allo
         raise ValueError('invalid_dream_mode')
     budget = dict(remaining=2, blocked_reason=None)
     advice = _advise_supported(result, agent, search=search, max_samples=max_samples,
-                              search_budget=budget, allow_dream=dream == 'allow')
+                              search_budget=budget, allow_dream=dream == 'allow',
+                              allow_ambiguous=dream == 'allow')
     exclusions = advice.get('mask_exclusions', [])
     if not advice.get('selection_exhausted') or not any(e['reason'] in DREAM_RELAXABLE_REASONS for e in exclusions):
         return advice

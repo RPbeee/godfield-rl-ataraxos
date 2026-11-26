@@ -9,7 +9,7 @@ import json
 import re
 import time
 
-from .official import ROOT, OBSERVED_UI_KINDS, ambiguous_disguised_ids
+from .official import ROOT, OBSERVED_UI_KINDS
 from . import MatchConfig, _core
 
 
@@ -32,6 +32,7 @@ def item_paths():
 
 
 PATHS = item_paths()
+FAKE_PATH = '/images/items/fake.webp'
 PUBLIC_PATHS = frozenset(PATHS.values())
 REFLECT_MODELS = frozenset(c['id'] for c in json.loads(
     (ROOT / 'third_party/goodfield/data/official-v2/cards.json').read_text())
@@ -64,6 +65,7 @@ def selection_checks(state, before, public, name, plan, expected):
                  band_texts=(band_texts(before), band_texts(state)))
     checks = dict(verify=verified, **{k: a == b for k, (a, b) in pairs.items()},
                   targetArrow=state.get('targetArrow') == before.get('targetArrow'))
+    checks['hand_images'] &= hand_fake_overlays(before) == hand_fake_overlays(state)
     counts = {k: dict(before=len(a), after=len(b)) for k, (a, b) in pairs.items()}
     return dict(checks=checks, counts=counts)
 
@@ -111,14 +113,22 @@ def is_card_face(image):
     # Dream's fake.webp is an overlay on a face, including in selected panes.
     # Keep unknown item paths: they must still fail the exact card comparison.
     return (image['path'].startswith('/images/items/')
-            and image['path'] != '/images/items/fake.webp')
+            and image['path'] != FAKE_PATH)
+
+
+def in_hand_region(image):
+    x, y, w, h = (image[k] for k in ('x', 'y', 'w', 'h'))
+    return w == h == 80 and 180 <= x and x+w <= 930 and 480 <= y and y+h <= 700
 
 
 def hand_images(state):
-    return sorted([r for r in state['images'] if is_card_face(r)
-                   and r['w'] == r['h'] == 80
-                   and 180 <= r['x'] and r['x']+r['w'] <= 930
-                   and 480 <= r['y'] and r['y']+r['h'] <= 700], key=lambda r: (r['y'], r['x']))
+    return sorted([r for r in state['images'] if is_card_face(r) and in_hand_region(r)],
+                  key=lambda r: (r['y'], r['x']))
+
+
+def hand_fake_overlays(state):
+    return sorted([r for r in state['images'] if r['path'] == FAKE_PATH and in_hand_region(r)],
+                  key=lambda r: (r['y'], r['x']))
 
 
 def pane_x(state, name):
@@ -377,6 +387,22 @@ def used_positions(state, public):
     return result
 
 
+def disguised_positions(overlays, faces):
+    """Match overlays one-to-one and reject misaligned overlays over these slots."""
+    positions = set()
+    for overlay in overlays:
+        nearby = [(r['x'], r['y']) for r in faces
+                  if abs(overlay['x'] - r['x']) < 80 and abs(overlay['y'] - r['y']) < 80]
+        if not nearby:
+            continue
+        x, y = nearby[0]
+        require(len(nearby) == 1 and abs(overlay['x'] - x) <= 1
+                and abs(overlay['y'] - y) <= 1 and (x, y) not in positions,
+                'disguised_overlay_mismatch')
+        positions.add((x, y))
+    return positions
+
+
 def prepare(state, public, action, name, *, allow_dream=False, dream_last_resort=False):
     """Validate whole semantic command before the first UI mutation."""
     require((action['expected_update'], action['expected_gf'], action['viewer']) ==
@@ -427,29 +453,45 @@ def prepare(state, public, action, name, *, allow_dream=False, dream_last_resort
         return dict(cards=[], stages=[], attempted=[], card_paths=[], allocation=[],
                     confirm=confirm, pane=x, commands=[confirm])
     own = {h['id']: h for h in public['hand']}
-    ambiguous = ambiguous_disguised_ids(public['hand'])
     ids = [c['item_id'] for c in action['cards']]
     require(len(ids) == len(set(ids)), 'duplicate_selected_id')
-    available = hand_images(state); clicks = []; expected = Counter(); stages = []
+    images = hand_images(state); available = list(images)
+    overlays = hand_fake_overlays(state)
+    clicks = []; expected = Counter(); stages = []
     for card in action['cards']:
         h = own.get(card['item_id'])
         require(h is not None and h['face'] == card['model'], 'card_not_in_public_hand')
         require(not h['used'] or PATHS.get(h['face'], '').startswith('/images/items/miracles/'),
                 'card_not_in_public_hand')
-        require(dream_last_resort or (h['id'] not in ambiguous and (allow_dream or not h['disguised'])),
+        require(not h['disguised'] or allow_dream or dream_last_resort,
                 'ambiguous_disguised_face')
         path = PATHS.get(card['model'])
         matches = [r for r in available if r['path'] == path]
         require(path and matches, 'card_image_missing')
         copies = [i for i in public['hand'] if i['face'] == h['face']]
-        all_matches = [r for r in hand_images(state) if r['path'] == path]
+        all_matches = [r for r in images if r['path'] == path]
         require(len(all_matches) == len(copies), 'visible_hand_mismatch',
                 card_detail(Counter({path: len(copies)}), Counter({path: len(all_matches)})))
+        used = []
         if {i['used'] for i in copies} == {False, True}:
             used = [r for r in used_positions(state, public) if r['path'] == path]
             require(len(used) == 1, 'ambiguous_used_card_position')
             matches = [r for r in matches if (r == used[0]) == h['used']]
             require(matches, 'ambiguous_used_card_position')
+        disguised = disguised_positions(overlays, all_matches)
+        disguised_count = sum(i['disguised'] for i in copies)
+        # An entirely disguised face needs no overlay to identify its copies.
+        # Mixed faces need an overlay witness for every disguised copy.
+        require(len(disguised) == disguised_count or (not disguised and disguised_count == len(copies)),
+                'disguised_overlay_mismatch',
+                dict(expected=disguised_count, actual=len(disguised)))
+        if 0 < disguised_count < len(copies):
+            if used:
+                used_is_disguised = (used[0]['x'], used[0]['y']) in disguised
+                require(used_is_disguised == any(i['used'] and i['disguised'] for i in copies),
+                        'disguised_overlay_mismatch')
+            matches = [r for r in matches if ((r['x'], r['y']) in disguised) == h['disguised']]
+            require(matches, 'disguised_overlay_mismatch')
         r = matches[0]; available.remove(r)
         clicks.append(point(r['x']+40, r['y']+40))
         expected[path] += 1; stages.append(dict(expected))

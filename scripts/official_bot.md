@@ -26,17 +26,19 @@
 再構成できる通常応答も探索する。対応範囲は下記。複数局は `--games N`。
 出力先の `moves.jsonl` は上書きしないので、毎回新しいディレクトリを使う。
 
-`--dream allow|last-resort` の既定は **allow**。Dream の偽装カードは、同じ公開面を
-持つ別の手札がない場合に限り、方策・探索が選んだ手をそのまま使う。
-偽装カードと同じ公開面を共有するカードは、偽装の有無にかかわらず両モードで
-`ambiguous_disguised_face` として除外して選び直し、他に実行できる手が
-なくなった場合だけ除外を戻す。UI も `dream_last_resort` なしでは曖昧なクリックを拒否する。
-許可した `dream_actual_execution_not_verified_from_public_faces` / `ambiguous_disguised_face` は
-助言と `moves.jsonl` 行の `warnings` に残し、該当カードを使う手には助言と行に
-`dream_played: true` を付ける。曖昧な同一面のコピーは可視画像で区別できないため、
-記録の item ID は助言上の選択を表し、実際に使われたコピーの識別を保証しない。
-`--dream last-resort` は従来通り、公開面が一意な偽装カードも除外して選び直す。
-最後の手段で除外を戻した場合は、両モードで `dream_last_resort: true` も残す。
+`--dream allow|last-resort` の既定は **allow**。同じ絵柄の偽装カードが複数あっても、
+方策・探索が選んだ手を使える。`--dream last-resort` はすべての偽装カードを選択から除外し、
+他に実行できる手が尽きた場合に限り除外を戻して `dream_last_resort: true` を残す。
+通常カードは同じ絵柄に偽装カードがあっても両モードで選べる。
+
+偽装カードを使う手には、助言と `moves.jsonl` の行に `dream_played: true` を付け、
+`warnings` に `dream_actual_execution_not_verified_from_public_faces` を残す。
+絵柄と使用済み状態が同じ偽装カードが複数ある場合は `ambiguous_disguised_face` も残す。
+この場合、記録の item ID は助言上の選択を表し、画面上では該当する偽装スロットのいずれかをクリックする。
+
+同じ絵柄に通常カードと偽装カードが混在するときは、手札上の `/images/items/fake.webp` の位置と枚数を
+公開手札に照合し、指定された側のスロットをクリックする。表示が不足、重複、位置ずれなどで一致しなければ、
+クリック前に再読込を待つ。不一致が続けば `disguised_overlay_mismatch` で停止する。
 どちらのモードも discard・sacrifice、敵を既定対象とするカードの自分指定、94+232 の
 制限は維持する。
 
@@ -87,8 +89,8 @@ pixel probe の矢印検出に使う上部名前帯を演出として除外し�
 両替の増減操作は再送しない。再試行後も反映されなければ直近の不一致理由で停止し、画面を保存する。
 
 - catalog の category/imageName から model の画像 path を作る。手札の80×80画像を
-  2段の手札領域だけで探し、自己 item ID/face/未使用状態と必要枚数を照合する。
-  同じ face の偽装品がある場合も、Dream を許可した助言に限り可視面をクリックする。
+  2段の手札領域だけで探し、自己 item ID/face/使用済み状態と必要枚数を照合する。
+  同じ絵柄の通常カードと偽装カードは `fake.webp` の重なりで区別する。
 - probe に可視テキストの矩形を追加した。上部 y=55〜95 にある自分の名前帯から
   左350／右690の欄を決める。ヘッダや右側の status、フッタの名前を使わない。
 - カードごとに自分の欄の画像 path と枚数を再確認する。GF と両者の可視資源も
@@ -281,7 +283,7 @@ Nodeもブラウザも起動せず、元資料は変更しない。5つの自分
 - 霧の帯は半透明なので、内側の RGB 範囲と R/G 差で判定する。左側の丸みを避けた x=870–1194、上下 5px を除く領域を検査する。帯内に名前・数字がないことは引き続き `texts` で確認する。回帰テストは実測色に基づく合成 PNG のみを使う。
 - Earth/Moon の所持自体は決定を止めない。公開の guardian identity は観測に入るが、将来の一般神器・奇跡の抽選は現在の合法手を決める入力ではない。`earth_moon_general_execution` は助言の警告に残す。受信済み攻撃は v33 typed payload の native `guardian_payload_legal` でモデル列の domain を検査し、対応範囲だけ通常の公開応答カーソルへ渡す。動的威力・redirect 等の既存停止条件は維持する。
 - native の Earth120/Moon26 の各単品と Earth の複合列から作った応答について、公開観測・mask を照合する。205/206 の公開 amount も native と同じ 3/2 にする。守護神なし・Earth・Moon・Mars の main/通常応答では、native と公開選択木の全接頭辞を比較する。
-- Dream の選択は見かけと個体 ID に基づくが、goodfield の `docs/official-execution-subset.md` の v28/v32 は互換クラス外の実体不適合入力について公式 server の受理規約を確定していない。従来の除外・最終手段の動作は `--dream last-resort` で利用できる。既定の `allow` は公開面が一意な偽装カードの未検証理由を警告として選択を許可し、共有面の曖昧なカードは最後の手段に限る。受理は従来通り公開受信で確認する。
+- Dream の選択は見かけと個体 ID に基づく。goodfield の `docs/official-execution-subset.md` の v28/v32 は互換クラス外の実体不適合入力について公式 server の受理規約を確定していない。既定の `allow` では偽装カードを選べる。受理は従来通り公開受信で確認する。
 - auto39 の最終停止行は GF38/main。除外 5 件の後、最後の除外で公開選択が尽きると、その除外を戻して再抽選していた。これをやめ、最後の除外も `mask_exclusions` に残し、`selection_exhausted` で停止する。安全な候補がある場合は除外後の mask で選び直す。同一 face の先頭コピーを除外したとき、canonical な重複省略で後続コピーまで選べなくならないよう、除外中だけ全順序の選択木を使う。学習・収集・評価用の選択木は変更しない。
 
 ### 2s 実機停止の調査（オフライン）
@@ -314,11 +316,8 @@ Nodeもブラウザも起動せず、元資料は変更しない。5つの自分
   初回を含め最大2探索。以降の retry は方策を使う。非対応・公開マスク不一致は
   従来の fallback 状態と `search_fallback_reason` を残し、`search_seconds` は累積する。
   世界内の後続決定には UI 除外を持ち越さない。計測条件・結果は `official_advisor.md` 参照。
-- 両モードで安全な mask が尽きた場合に限り、Dream 関連の除外だけを戻す。その他のカード・対象の
-  除外は維持し、discard・sacrifice は常に禁止する。Dream の未検証理由は警告に下げ、
-  `moves.jsonl` の行と助言に `dream_last_resort: true` と `dream_played: true`、`warnings` に
-  `dream_actual_execution_not_verified_from_public_faces` または `ambiguous_disguised_face` を残す。
-  停止時にも固定の警告を残す。UI は Dream を許可した助言で見えている面をクリックする。
+- `last-resort` で安全な mask が尽きた場合に限り、Dream 関連の除外だけを戻す。その他のカード・対象の
+  除外は維持し、discard・sacrifice は常に禁止する。停止時にも Dream の固定の警告を残す。
 - 受理は従来通り受信の updateCount の前進を必須とし、受理されなければ停止する。
   `OfficialSession.ingest()` は受信 game の公開状態を盤面に投影するため、使用結果の実体が
   偽装の面と異なっても、選択した面から盤面を推測して上書きしない。合成受信と probe で

@@ -10,7 +10,7 @@ import sys
 import pytest
 
 from gfrl.official import OfficialSession, OfficialStreams, parser_module, project_game
-from gfrl.official_ui import PATHS, UIUnsupported, prepare, execute, point, allocation_steps, ready
+from gfrl.official_ui import FAKE_PATH, PATHS, UIUnsupported, prepare, execute, point, allocation_steps, ready
 from gfrl.official_bot import Journal, Probe, private_directory, run
 
 GAMES = json.loads((Path(__file__).parent/'fixtures/official_training.json').read_text())
@@ -72,24 +72,29 @@ def recorded_action(public):
 # Observed hand coordinates, independently of wire inventory order.
 LAYOUT = {3: [(230,533),(312,533),(394,533)], 29: [(476,533)], 48: [(558,533)],
           130: [(640,533)], 146: [(722,533)], 200: [(804,533)], 218: [(230,635)],
-          189: [(804,533)], 4: [(394,533)], 5: [(230,635)], 32: [(558,533)], 206: [(886,533)], 191: [(312,635)]}
+          189: [(804,533)], 4: [(394,533)], 5: [(230,635)], 32: [(558,533)], 206: [(886,533)], 191: [(312,635)],
+          6: [(886,635),(804,635),(722,635)], 176: [(886,635),(804,635),(722,635)]}
 
 
 def visible(public, name='SyntheticName'):
     x = 690 if public['update'] in (2,5,6) else 350
     images = []; counts = {}
     for h in public['hand']:
+        m = h['face']
         if h['used']:
-            images.append(dict(path=PATHS[h['face']], x=846, y=595, w=80, h=80))
-            continue
-        m = h['face']; n = counts.get(m,0); counts[m] = n+1
-        coords = LAYOUT.get(m, [(886,635)])
-        cx, cy = coords[min(n,len(coords)-1)]
-        if public['update'] == 1 and m == 218:
-            cx, cy = 886,533
-        if public['update'] >= 3 and m == 200:
-            cx, cy = 886,533
-        images.append(dict(path=PATHS[m], x=cx-40, y=cy-40, w=80, h=80))
+            cx, cy = 886,635
+        else:
+            n = counts.get(m,0); counts[m] = n+1
+            coords = LAYOUT.get(m, [(886,635)])
+            cx, cy = coords[min(n,len(coords)-1)]
+            if public['update'] == 1 and m == 218:
+                cx, cy = 886,533
+            if public['update'] >= 3 and m == 200:
+                cx, cy = 886,533
+        rect = dict(x=cx-40, y=cy-40, w=80, h=80)
+        images.append(dict(path=PATHS[m], **rect))
+        if h['disguised']:
+            images.append(dict(path=FAKE_PATH, **rect))
     resources = ''.join(f"\nHP\n{p['status']['hp']}\nMP\n{p['status']['mp']}\n¥\n{p['status']['cp']}" for p in public['players'])
     if public['phase'] == 1:
         images += [dict(path=PATHS[m], x=1040-x-145, y=103+100*i, w=80, h=80)
@@ -552,6 +557,49 @@ class LagProbe(FakeProbe):
             path.write_bytes(b'synthetic screenshot')
             return dict(screenshot=str(path))
         return super().send(c)
+
+
+@pytest.mark.parametrize('overlay_arrives', [False, True])
+def test_bot_waits_for_missing_mixed_face_overlay_before_click(tmp_path, settle_clock, overlay_arrives):
+    games = deepcopy(GAMES)
+    games[2]['players'][0].update(curses=['dream'], items=[
+        dict(id=18, modelId=6, used=False),
+        dict(id=99, modelId=218, fakeModelId=6, used=False)])
+
+    class DreamLagProbe(FakeProbe):
+        reads = 0
+        clicks = []
+
+        def send(self, command):
+            main = self.phase == 'battle' and self.index == 2
+            if main and command['kind'] == 'clickPoint':
+                self.clicks.append((self.reads, command))
+            response = super().send(command)
+            if main and command['kind'] == 'state':
+                self.reads += 1
+                if self.reads == 1 or not overlay_arrives:
+                    state = response['state']
+                    state['images'] = [r for r in state['images'] if r['path'] != FAKE_PATH]
+            return response
+
+    def choose(result):
+        p = result['public']
+        if p['update'] == 3:
+            return dict(status='advice', action=action(p, 'play', [6], target=2))
+        return advisor(result)
+
+    probe = DreamLagProbe(tmp_path, games=games)
+    journal = Journal(private_directory(tmp_path/'log'))
+    report = run(probe, choose, journal, name='SyntheticName', settle_timeout=1)
+    journal.close()
+    assert probe.reads >= 2 and settle_clock.sleeps
+    if overlay_arrives:
+        assert report['status'] == 'complete'
+        assert [command for _, command in probe.clicks] == [point(886, 635), point(350, 193)]
+        assert probe.clicks[0][0] == 2
+    else:
+        assert report['reason'] == 'disguised_overlay_mismatch'
+        assert not probe.clicks
 
 
 def test_bot_waits_for_opening_and_each_click_without_reclicking(tmp_path, settle_clock):

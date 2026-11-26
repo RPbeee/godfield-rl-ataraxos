@@ -667,10 +667,10 @@ def run(probe, advisor, journal, *, name, games=1, mode='training', password=Non
                     try:
                         plan = preflight(state)
                     except UIUnsupported as error:
-                        if str(error) != 'ambiguous_used_card_position':
+                        if str(error) not in ('ambiguous_used_card_position', 'disguised_overlay_mismatch'):
                             raise
-                        # No mutation has happened. Let a moving used suffix
-                        # settle; never restart a partially applied plan.
+                        # Let the hand positions and Dream overlays settle
+                        # before the first click.
                         state = wait_visible(probe, state, preflight,
                                              timeout=settle_timeout, refresh=refresh)
                         plan = preflight(state)

@@ -25,10 +25,9 @@ DTYPES = dict(obs_type=np.int8, obs_aux_card=np.int16, obs_valid=bool,
 
 
 def ambiguous_disguised_ids(hand):
-    """Items whose shared public face cannot identify a Dream click."""
-    counts = Counter(h['face'] for h in hand)
-    faces = {h['face'] for h in hand if h['disguised'] and counts[h['face']] > 1}
-    return {h['id'] for h in hand if h['face'] in faces}
+    """Disguised items sharing a public face and used state with another disguised copy."""
+    counts = Counter((h['face'], h['used']) for h in hand if h['disguised'])
+    return {h['id'] for h in hand if h['disguised'] and counts[(h['face'], h['used'])] > 1}
 
 
 def parser_module(duel_fields=False):

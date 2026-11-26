@@ -10,12 +10,10 @@ import numpy as np
 import pytest
 
 from gfrl.official import OfficialDecision
-from gfrl.official_ui import (PATHS, UIUnsupported, card_detail, execute,
-                              hand_images, point, prepare, ready, selected,
+from gfrl.official_ui import (FAKE_PATH as FAKE, PATHS, UIUnsupported, card_detail, execute,
+                              hand_fake_overlays, hand_images, point, prepare, ready, selected,
                               verify, verify_attack)
-from test_official_bot import action, results
-
-FAKE = '/images/items/fake.webp'
+from test_official_bot import action, results, visible
 
 
 def image(path, x, y, w=80, h=80):
@@ -133,6 +131,80 @@ def test_hand_overlay_does_not_hide_real_mismatches(bad):
         s['images'].append(image(PATHS[199] if bad=='extra' else '/images/items/unknown.webp',354,595))
     with pytest.raises(UIUnsupported,match='visible_hand_mismatch'):
         ready(s,p,'SyntheticName')
+
+
+def test_hand_fake_overlays_filter_and_sort_visible_rectangles():
+    first = image(FAKE, 180, 480)
+    second = image(FAKE, 850, 620)
+    state = dict(images=[second, image(FAKE, 179, 480), image(FAKE, 851, 620),
+                         image(FAKE, 180, 479), image(FAKE, 850, 621),
+                         image(FAKE, 190, 493, 79, 80), image(PATHS[6], 190, 493),
+                         image(FAKE, 205, 103), first])
+    assert hand_fake_overlays(state) == [first, second]
+
+
+@pytest.mark.parametrize('bad', ['missing', 'extra', 'stacked', 'misaligned', 'unmatched'])
+@pytest.mark.parametrize('select_disguised', [False, True])
+def test_mixed_face_bad_overlays_fail_before_click(bad, select_disguised):
+    p = deepcopy(results()[2]['public'])
+    p['hand'] = [dict(id=18, face=6, used=False, disguised=select_disguised),
+                 dict(id=99, face=6, used=False, disguised=not select_disguised)]
+    s = visible(p)
+    overlay, = hand_fake_overlays(s)
+    if bad == 'missing':
+        s['images'].remove(overlay)
+    elif bad == 'extra':
+        s['images'].append(image(FAKE, 764 if select_disguised else 846, 595))
+    elif bad == 'stacked':
+        s['images'].append(dict(overlay))
+    elif bad == 'misaligned':
+        overlay['y'] += 2
+    else:
+        s['images'].append(dict(overlay, y=overlay['y'] + 2))
+    ready(s, p, 'SyntheticName')
+    class NoClicks:
+        def send(self, command):
+            pytest.fail(f'unexpected UI command: {command}')
+    with pytest.raises(UIUnsupported, match='^disguised_overlay_mismatch$'):
+        execute(NoClicks(), s, p, action(p, 'play', [6], target=2), 'SyntheticName',
+                allow_dream=select_disguised, settle_timeout=0)
+
+
+@pytest.mark.parametrize('disguised', [False, True])
+@pytest.mark.parametrize('covered', [0, 1, 2])
+def test_uniform_face_overlay_coverage(disguised, covered):
+    p = deepcopy(results()[2]['public'])
+    p['hand'] = [dict(id=i, face=6, used=False, disguised=disguised) for i in (18, 99)]
+    s = visible(p)
+    s['images'] = hand_images(s)
+    s['images'] += [dict(r, path=FAKE) for r in s['images'][:covered]]
+    a = action(p, 'play', [6], target=2)
+    if covered == 0 or (disguised and covered == 2):
+        assert prepare(s, p, a, 'SyntheticName', allow_dream=disguised)['cards'] == [point(804, 635)]
+    else:
+        with pytest.raises(UIUnsupported, match='^disguised_overlay_mismatch$'):
+            prepare(s, p, a, 'SyntheticName', allow_dream=disguised)
+
+
+@pytest.mark.parametrize('used_disguised', [False, True])
+@pytest.mark.parametrize('select_used', [False, True])
+def test_mixed_face_overlays_and_used_suffix_agree(used_disguised, select_used):
+    p = deepcopy(results()[2]['public'])
+    p['hand'] = [dict(id=18, face=218, used=False, disguised=not used_disguised),
+                 dict(id=99, face=218, used=True, disguised=used_disguised)]
+    s = visible(p)
+    a = action(p, 'play', [218], target=2)
+    if select_used:
+        a['cards'][0]['item_id'] = a['operations'][1]['item_id'] = 99
+    overlay, = hand_fake_overlays(s)
+    overlay['x'] += 1
+    overlay['y'] -= 1
+    assert prepare(s, p, a, 'SyntheticName', allow_dream=True)['cards'] == [
+        point(886 if select_used else 230, 635)]
+    # The total is right but the overlay contradicts the identified used slot.
+    overlay['x'] = 190 if used_disguised else 846
+    with pytest.raises(UIUnsupported, match='^disguised_overlay_mismatch$'):
+        prepare(s, p, a, 'SyntheticName', allow_dream=True)
 
 
 @pytest.mark.parametrize('flash', [False,True])
